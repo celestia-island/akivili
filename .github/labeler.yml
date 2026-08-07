@@ -1,0 +1,21 @@
+# Auto-labeler configuration
+# Labels PRs based on changed file paths
+
+plugin-host:
+  - packages/plugin_host/**
+
+iepl:
+  - packages/iepl/**
+
+docs:
+  - docs/**
+  - "*.md"
+  - "**/*.md"
+
+ci:
+  - .github/**
+
+dependencies:
+  - Cargo.toml
+  - Cargo.lock
+  - "**/Cargo.toml"
