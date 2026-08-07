@@ -1,10 +1,22 @@
-//! Agent plugin host — Boa TypeScript plugin runtime.
+//! Agent plugin host — IEPL TypeScript runtime + tool router.
 //!
-//! This crate is the standalone home of the plugin host extracted from
-//! entelecheia `packages/shared/plugin_host` (PLAN.md §11). The TS plugin
-//! runtime, plugin router and host state will land here in the migration
-//! wave; the workspace skeleton is bootstrapped first.
+//! Extracted from entelecheia `packages/shared/plugin_host` (PLAN.md §11).
+//! Replaces the former WASM-based plugin system. Agent packages are composed
+//! of IEPL TypeScript tool definitions, skill prompts, and optional binary
+//! backends. This crate provides:
+//!
+//! - [`TsPlugin`]: Executes IEPL TypeScript tool code in the Boa JS sandbox.
+//! - [`PluginRouter`]: Central registry that dispatches MCP tool calls to
+//!   the correct agent package by tool name.
+//! - [`PluginState`]: Host API surface exposed to TS tools.
+#![allow(clippy::type_complexity)]
 
-pub fn placeholder() -> &'static str {
-    "akivili-plugin-host"
-}
+pub mod guard;
+pub mod plugin_router;
+pub mod plugin_state;
+pub mod ts_plugin;
+
+pub use plugin_router::PluginRouter;
+pub use plugin_state::{
+    HostApiProvider, HostFunctions, RegisteredMcpTool, TriggerDispatcherHolder,
+};

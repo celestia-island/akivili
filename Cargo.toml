@@ -30,11 +30,15 @@ boa_gc = "^0.21"
 boa_runtime = "^0.21"
 parking_lot = "^0.12"
 reqwest = { version = "^0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
+rustls = { version = "^0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 serde = { version = "^1", features = ["derive"] }
 serde_json = "^1"
+swc_core = "^40"
 tempfile = "^3"
+thiserror = "^2"
 tokio = { version = "^1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "io-util", "fs", "sync", "signal", "process"] }
 tracing = { version = "^0.1", features = ["log"] }
+url = "^2"
 
 [profile.dev]
 debug = 1
