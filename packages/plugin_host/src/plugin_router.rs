@@ -2,11 +2,12 @@ use anyhow::{Error, Result, anyhow};
 use parking_lot::Mutex;
 use std::{collections::HashMap, sync::Arc};
 
+use tokio::time::timeout;
 use tracing::{debug, error, info};
 
 use crate::{
     plugin_state::{HostFunctions, RegisteredMcpTool, install_crypto_provider},
-    ts_plugin::{TsLanguage, TsPlugin, TsPluginData},
+    ts_plugin::{TsLanguage, TsPlugin, TsPluginData, plugin_compute_timeout},
 };
 
 enum PluginKind {
@@ -36,15 +37,20 @@ impl PluginRouter {
         tokio::task::block_in_place(|| {
             let handle = tokio::runtime::Handle::current();
             handle.block_on(async {
-                tokio::task::spawn_blocking(move || {
+                let join_handle = tokio::task::spawn_blocking(move || {
                     let plugin = TsPlugin::create_and_load(api, &init_data)?;
                     let tools = plugin.take_mcp_tools();
                     debug!(plugin = %pname, tools = tools.len(), "TS plugin init complete");
                     Ok::<(), Error>(())
-                })
-                .await
+                });
+                let output = timeout(plugin_compute_timeout(), join_handle)
+                    .await
+                    .map_err(|_| {
+                        anyhow!("plugin load timed out after {:?}", plugin_compute_timeout())
+                    })?;
+                output.map_err(|e| anyhow!("plugin load task failed: {e}"))?
             })
-        })??;
+        })?;
 
         self.plugins
             .lock()
@@ -97,13 +103,21 @@ impl PluginRouter {
                 tokio::task::block_in_place(|| {
                     let handle = tokio::runtime::Handle::current();
                     handle.block_on(async {
-                        tokio::task::spawn_blocking(move || {
+                        let join_handle = tokio::task::spawn_blocking(move || {
                             let mut ts_plugin = TsPlugin::create_and_load(api, &data)?;
                             ts_plugin.handle_request(&method, &path, &headers, &body)
-                        })
-                        .await
+                        });
+                        let output = timeout(plugin_compute_timeout(), join_handle)
+                            .await
+                            .map_err(|_| {
+                                anyhow!(
+                                    "plugin execution timed out after {:?}",
+                                    plugin_compute_timeout()
+                                )
+                            })?;
+                        output.map_err(|e| anyhow!("plugin execution task failed: {e}"))?
                     })
-                })?
+                })
             }
         }
     }
@@ -140,13 +154,21 @@ impl PluginRouter {
                 tokio::task::block_in_place(|| {
                     let handle = tokio::runtime::Handle::current();
                     handle.block_on(async {
-                        tokio::task::spawn_blocking(move || {
+                        let join_handle = tokio::task::spawn_blocking(move || {
                             let mut ts_plugin = TsPlugin::create_and_load(api, &data)?;
                             ts_plugin.on_message(&platform, &message)
-                        })
-                        .await
+                        });
+                        let output = timeout(plugin_compute_timeout(), join_handle)
+                            .await
+                            .map_err(|_| {
+                                anyhow!(
+                                    "plugin execution timed out after {:?}",
+                                    plugin_compute_timeout()
+                                )
+                            })?;
+                        output.map_err(|e| anyhow!("plugin execution task failed: {e}"))?
                     })
-                })?
+                })
             }
         }
     }
@@ -249,7 +271,7 @@ mod tests {
             router.load_ts_plugin(
                 "test-webhook",
                 r#"
-globalThis.handleRequest = function(method, path, headers, body) {
+var handleRequest = function(method, path, headers, body) {
     return JSON.stringify({ method: method, received: true });
 };
 "#,
@@ -298,7 +320,7 @@ globalThis.handleRequest = function(method, path, headers, body) {
 
             router.load_ts_plugin(
                 "temp-plugin",
-                r#"globalThis.handleRequest = function(m,p,h,b) { return "{}"; };"#,
+                r#"var handleRequest = function(m,p,h,b) { return "{}"; };"#,
                 TsLanguage::JavaScript,
             )?;
 
@@ -332,7 +354,8 @@ globalThis.handleRequest = function(method, path, headers, body) {
     #[test]
     fn scan_loads_js_file() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let js_code = r#"globalThis.handleRequest = function(m,p,h,b) { return JSON.stringify({scanned: true}); };"#;
+        let js_code =
+            r#"var handleRequest = function(m,p,h,b) { return JSON.stringify({scanned: true}); };"#;
         std::fs::write(dir.path().join("my-plugin.js"), js_code)?;
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -364,7 +387,7 @@ globalThis.handleRequest = function(method, path, headers, body) {
             router.load_ts_plugin(
                 "bot-plugin",
                 r#"
-globalThis.onMessage = function(platform, message) {
+var onMessage = function(platform, message) {
     return JSON.stringify({ platform: platform, text: message });
 };
 "#,
@@ -380,5 +403,64 @@ globalThis.onMessage = function(platform, message) {
             Ok::<(), Error>(())
         })?;
         Ok(())
+    }
+
+    /// C5: a dead-looping plugin handler must be cut off by a wall clock —
+    /// the abandoned plugin instance is discarded and the router keeps
+    /// serving other plugins with fresh instances.
+    #[test]
+    fn dispatch_infinite_loop_times_out() -> Result<()> {
+        use std::time::{Duration, Instant};
+        unsafe {
+            std::env::set_var("CELESTIA_PLUGIN_COMPUTE_TIMEOUT_MS", "800");
+        }
+        let result = (|| -> Result<()> {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async {
+                let host_api = make_host_api();
+                let router = PluginRouter::new(host_api);
+
+                router.load_ts_plugin(
+                    "spinner",
+                    r#"
+var handleRequest = function(m, p, h, b) {
+    var spin = function(){ for(var i=0;i<1000000;i++){} };
+    var deadline = Date.now() + 3000;
+    while (Date.now() < deadline) { spin(); }
+    return "{}";
+};
+"#,
+                    TsLanguage::JavaScript,
+                )?;
+
+                let started = Instant::now();
+                let result = router.dispatch_webhook("spinner", "POST", "/", "{}", "{}");
+                assert!(
+                    result.is_err(),
+                    "dead-looping plugin must time out on the wall clock"
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "plugin timeout must be enforced quickly, took {:?}",
+                    started.elapsed()
+                );
+
+                router.load_ts_plugin(
+                    "fine",
+                    r#"var handleRequest = function(m,p,h,b) { return JSON.stringify({ ok: true }); };"#,
+                    TsLanguage::JavaScript,
+                )?;
+                let ok = router.dispatch_webhook("fine", "POST", "/", "{}", "{}")?;
+                let parsed: serde_json::Value = serde_json::from_str(&ok)?;
+                assert_eq!(parsed["ok"], true);
+                Ok::<(), Error>(())
+            })
+        })();
+        unsafe {
+            std::env::remove_var("CELESTIA_PLUGIN_COMPUTE_TIMEOUT_MS");
+        }
+        result
     }
 }
