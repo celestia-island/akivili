@@ -47,6 +47,7 @@ plugin.ts ──► IeplEngine.transpile() (SWC TS→JS + AST 安全校验)
 ```
 scepter PluginRouter (宿主装配)
    ├─ load_ts_plugin / scan_and_load_dir(PLUGIN_DIR)   注册
+   ├─ scan_amphoreus_agents(.amphoreus)                .amphoreus/<agent>/plugin.ts 注册（scepter 启动激活）
    ├─ dispatch_webhook → HTTP POST /webhook/{name} → Boa handleRequest
    ├─ dispatch_bot_message → TriggerDispatcher → onMessage
    └─ all_mcp_tools → cosmos McpRouter 命名空间工具（未命中回退 webhook）
