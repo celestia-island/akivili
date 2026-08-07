@@ -1,0 +1,19 @@
+pub const JS_EVAL: &str = "eval";
+pub const JS_FUNCTION: &str = "Function";
+pub const JS_CONSTRUCTOR: &str = "constructor";
+pub const JS_PROTO: &str = "__proto__";
+pub const JS_REQUIRE: &str = "require";
+
+pub const VIOLATION_EVAL_CALL: &str = "eval_call";
+pub const VIOLATION_INDIRECT_EVAL: &str = "indirect_eval";
+pub const VIOLATION_FUNCTION_CONSTRUCTOR: &str = "function_constructor";
+pub const VIOLATION_REQUIRE_CALL: &str = "require_call";
+pub const VIOLATION_PROTO_ACCESS: &str = "proto_access";
+pub const VIOLATION_CONSTRUCTOR_ACCESS: &str = "constructor_access";
+pub const VIOLATION_CONSTRUCTOR_CHAIN_CALL: &str = "constructor_chain_call";
+pub const VIOLATION_FORBIDDEN_GLOBAL_ACCESS: &str = "forbidden_global_access";
+pub const VIOLATION_FORBIDDEN_GLOBAL_CALL: &str = "forbidden_global_call";
+pub const VIOLATION_DYNAMIC_IMPORT: &str = "dynamic_import";
+pub const VIOLATION_IMPORT_META: &str = "import_meta";
+pub const VIOLATION_WITH_STATEMENT: &str = "with_statement";
+pub const VIOLATION_TIMER_STRING_ARG: &str = "timer_string_arg";
