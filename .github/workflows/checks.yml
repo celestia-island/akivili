@@ -1,0 +1,58 @@
+name: Code Checks
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: false
+
+jobs:
+  check:
+    name: Code Checks
+    runs-on: [self-hosted, linux, x64, local]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        # akivili has no git mirror yet; keep the default rewrite rules off.
+        fetch-depth: 0
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt
+
+    - name: Setup sccache
+      uses: mozilla/sccache-action@v0.0.4
+
+    - name: Cache Cargo (sources only)
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ env.CARGO_HOME }}/registry
+          ${{ env.CARGO_HOME }}/git
+        key: ${{ runner.os }}-cargo-sources-${{ hashFiles('**/Cargo.toml') }}
+
+    - name: Format check
+      run: cargo fmt --all -- --check
+
+    - name: Compile check
+      run: cargo check --workspace --all-targets
+
+    - name: Clippy
+      run: cargo clippy --workspace --lib --bins -- -D warnings
+
+    - name: Tests
+      run: cargo test --workspace

@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+
+default-members = [
+    "packages/plugin_host",
+]
+
+members = [
+    "packages/plugin_host",
+    "packages/iepl",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+authors = ["langyo <langyo.china@gmail.com>"]
+license-file = "LICENSE"
+license = "LicenseRef-sysl-1.0"
+description = "Plugin SDK for celestia-island — agent plugin host and TypeScript execution pipeline"
+repository = "https://github.com/celestia-island/akivili"
+keywords = ["plugin", "agent", "wasm", "typescript", "ai-agent"]
+categories = ["development-tools"]
+
+[workspace.dependencies]
+anyhow = "^1"
+async-trait = "^0.1"
+boa_engine = "^0.21"
+boa_gc = "^0.21"
+boa_runtime = "^0.21"
+parking_lot = "^0.12"
+reqwest = { version = "^0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
+serde = { version = "^1", features = ["derive"] }
+serde_json = "^1"
+tempfile = "^3"
+tokio = { version = "^1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "io-util", "fs", "sync", "signal", "process"] }
+tracing = { version = "^0.1", features = ["log"] }
+
+[profile.dev]
+debug = 1
+opt-level = 0
+incremental = true
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.release]
+lto = "thin"

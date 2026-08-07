@@ -1,0 +1,16 @@
+/target
+Cargo.lock
+*.swp
+*.swo
+*~
+.DS_Store
+__pycache__/
+*.pyc
+
+dist/
+
+# celestia-devtools: staged-on-demand shared justfile recipes (just fetch)
+/.just/
+/celestia-devtools.just
+.cargo/config.toml
+node_modules/
