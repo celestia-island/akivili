@@ -6,6 +6,7 @@ pub const JS_REQUIRE: &str = "require";
 
 pub const VIOLATION_EVAL_CALL: &str = "eval_call";
 pub const VIOLATION_INDIRECT_EVAL: &str = "indirect_eval";
+pub const VIOLATION_EVAL_ALIAS: &str = "eval_alias";
 pub const VIOLATION_FUNCTION_CONSTRUCTOR: &str = "function_constructor";
 pub const VIOLATION_REQUIRE_CALL: &str = "require_call";
 pub const VIOLATION_PROTO_ACCESS: &str = "proto_access";
@@ -17,3 +18,10 @@ pub const VIOLATION_DYNAMIC_IMPORT: &str = "dynamic_import";
 pub const VIOLATION_IMPORT_META: &str = "import_meta";
 pub const VIOLATION_WITH_STATEMENT: &str = "with_statement";
 pub const VIOLATION_TIMER_STRING_ARG: &str = "timer_string_arg";
+pub const VIOLATION_MEMORY_BOMB_LITERAL: &str = "memory_bomb_literal";
+
+/// Any single numeric literal above this threshold passed as an allocation
+/// size (Array/typed-array constructors, `String.prototype.repeat`, ...) is
+/// rejected as a memory bomb. 1e7 elements is ~80MB for 8-byte cells — well
+/// beyond anything a legitimate agent script needs.
+pub const MEMORY_BOMB_LITERAL_THRESHOLD: f64 = 10_000_000.0;

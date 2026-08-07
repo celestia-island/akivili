@@ -68,6 +68,24 @@ impl PluginResult {
 const COMPUTE_TIMEOUT: Duration = Duration::from_secs(120);
 const ABSOLUTE_CEILING: Duration = Duration::from_secs(600);
 
+/// Wall-clock budget for a single plugin evaluation (script load or handler
+/// dispatch). The plugin instance runs inside a `spawn_blocking` task, so a
+/// dead-looping plugin is abandoned when this budget elapses — the instance
+/// is discarded and the next dispatch builds a fresh one. Overridable for
+/// tests via `CELESTIA_PLUGIN_COMPUTE_TIMEOUT_MS`.
+pub const PLUGIN_COMPUTE_TIMEOUT: Duration = Duration::from_secs(120);
+
+pub fn plugin_compute_timeout() -> Duration {
+    if let Some(ms) = std::env::var("CELESTIA_PLUGIN_COMPUTE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        && ms > 0
+    {
+        return Duration::from_millis(ms);
+    }
+    PLUGIN_COMPUTE_TIMEOUT
+}
+
 thread_local! {
     static CURRENT_HOST_API: RefCell<Option<(Arc<HostFunctions>, String)>> = const { RefCell::new(None) };
 }
@@ -412,9 +430,17 @@ impl TsPlugin {
                     clear_dispatch();
                     anyhow!("TS transpilation failed: {}", e)
                 })?;
+                Self::validate_js(&transpiled.js_code).inspect_err(|_| {
+                    clear_dispatch();
+                })?;
                 transpiled.js_code
             }
-            TsLanguage::JavaScript => code.to_string(),
+            TsLanguage::JavaScript => {
+                Self::validate_js(code).inspect_err(|_| {
+                    clear_dispatch();
+                })?;
+                code.to_string()
+            }
         };
 
         let result = self.eval_with_timeout(&js_code);
@@ -423,6 +449,31 @@ impl TsPlugin {
 
         info!(plugin = %self.plugin_name, "TS plugin script loaded");
         Ok(())
+    }
+
+    /// Runs the AST security validator on JavaScript (raw for JS plugins,
+    /// post-transpile output for TS plugins so swc lowering cannot smuggle
+    /// forbidden constructs into the emitted code). Rejects on any violation.
+    fn validate_js(code: &str) -> Result<()> {
+        match akivili_iepl::ast_validator::validate_js_ast(code) {
+            Ok(violations) if violations.is_empty() => Ok(()),
+            Ok(violations) => {
+                let details: Vec<String> = violations
+                    .iter()
+                    .map(|v| {
+                        format!(
+                            "[{}] {} (line {}, col {})",
+                            v.kind, v.message, v.line, v.column
+                        )
+                    })
+                    .collect();
+                Err(anyhow!(
+                    "plugin code rejected by AST security validation:\n{}",
+                    details.join("\n")
+                ))
+            }
+            Err(e) => Err(anyhow!("plugin code failed security validation: {}", e)),
+        }
     }
 
     pub fn handle_request(
@@ -607,7 +658,7 @@ mod tests {
             let data = TsPluginData::new(
                 "test-plugin",
                 r#"
-globalThis.handleRequest = function(method, path, headers, body) {
+var handleRequest = function(method, path, headers, body) {
     return JSON.stringify({ method: method, path: path, status: "ok" });
 };
 "#,
@@ -635,7 +686,7 @@ globalThis.handleRequest = function(method, path, headers, body) {
             let data = TsPluginData::new(
                 "log-plugin",
                 r#"
-globalThis.handleRequest = function(method, path, headers, body) {
+var handleRequest = function(method, path, headers, body) {
     dispatch("log", { level: "info", message: "hello from plugin" });
     return JSON.stringify({ logged: true });
 };
@@ -662,7 +713,7 @@ globalThis.handleRequest = function(method, path, headers, body) {
             let data = TsPluginData::new(
                 "kv-plugin",
                 r#"
-globalThis.handleRequest = function(method, path, headers, body) {
+var handleRequest = function(method, path, headers, body) {
     dispatch("kv-set", { key: "k1", value: "v1" });
     var result = dispatch("kv-get", { key: "k1" });
     return JSON.stringify(result);
@@ -693,7 +744,7 @@ globalThis.handleRequest = function(method, path, headers, body) {
                 "tool-plugin",
                 r#"
 registerMcpTool("my_tool", "A test tool", '{"type":"object"}');
-globalThis.handleRequest = function(m,p,h,b) {
+var handleRequest = function(m,p,h,b) {
     return JSON.stringify({ registered: true });
 };
 "#,
@@ -753,6 +804,34 @@ globalThis.handleRequest = function(m,p,h,b) {
     }
 
     #[test]
+    fn js_plugin_with_eval_fails_load() -> Result<()> {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
+            let host_api = make_host_api();
+            let data = TsPluginData::new(
+                "evil",
+                r#"var handleRequest = function() { return eval("1"); };"#,
+                TsLanguage::JavaScript,
+            );
+            let err_msg = tokio::task::spawn_blocking(move || {
+                match TsPlugin::create_and_load(host_api, &data) {
+                    Ok(_) => None,
+                    Err(e) => Some(e.to_string()),
+                }
+            })
+            .await?;
+            let err_msg = err_msg.expect("plugin with eval() should have been rejected");
+            assert!(
+                err_msg.contains("AST security validation"),
+                "got: {}",
+                err_msg
+            );
+            Ok::<(), Error>(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
     fn on_message_handler() -> Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
@@ -760,7 +839,7 @@ globalThis.handleRequest = function(m,p,h,b) {
             let data = TsPluginData::new(
                 "bot-plugin",
                 r#"
-globalThis.onMessage = function(platform, message) {
+var onMessage = function(platform, message) {
     return JSON.stringify({ platform: platform, echo: message });
 };
 "#,
