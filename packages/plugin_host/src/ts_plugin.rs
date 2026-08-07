@@ -331,6 +331,10 @@ pub struct TsPluginData {
     pub code: String,
     pub language: TsLanguage,
     pub plugin_name: String,
+    /// Lazily transpiled JS for TypeScript plugins; reused across dispatches
+    /// so the SWC pipeline runs at most once per plugin. Arc so clones share
+    /// the cache across dispatch threads.
+    compiled_js: std::sync::Arc<std::sync::OnceLock<String>>,
 }
 
 impl TsPluginData {
@@ -339,11 +343,24 @@ impl TsPluginData {
             code: code.to_string(),
             language,
             plugin_name: plugin_name.to_string(),
+            compiled_js: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
 
     pub fn plugin_name(&self) -> &str {
         &self.plugin_name
+    }
+
+    fn transpiled_js(&self) -> Result<&str> {
+        if let Some(cached) = self.compiled_js.get() {
+            return Ok(cached);
+        }
+        let engine = akivili_iepl::IeplEngine::new();
+        let transpiled = engine
+            .transpile(&self.code)
+            .map_err(|e| anyhow!("TS transpilation failed: {}", e))?;
+        let _ = self.compiled_js.set(transpiled.js_code);
+        Ok(self.compiled_js.get().expect("compiled js just set"))
     }
 }
 
@@ -360,7 +377,7 @@ impl TsPlugin {
         data: &TsPluginData,
     ) -> Result<Self> {
         let mut plugin = Self::new_inner(host_api, &data.plugin_name)?;
-        plugin.load_script(&data.code, &data.language)?;
+        plugin.load_script(data)?;
         Ok(plugin)
     }
 
@@ -406,7 +423,7 @@ impl TsPlugin {
         })
     }
 
-    fn load_script(&mut self, code: &str, language: &TsLanguage) -> Result<()> {
+    fn load_script(&mut self, data: &TsPluginData) -> Result<()> {
         set_dispatch(&self.host_api, &self.plugin_name);
 
         self.context
@@ -423,23 +440,15 @@ impl TsPlugin {
                 anyhow!("tool registration init failed: {}", e)
             })?;
 
-        let js_code = match language {
+        let js_code = match &data.language {
             TsLanguage::TypeScript => {
-                let engine = akivili_iepl::IeplEngine::new();
-                let transpiled = engine.transpile(code).map_err(|e| {
-                    clear_dispatch();
-                    anyhow!("TS transpilation failed: {}", e)
-                })?;
-                Self::validate_js(&transpiled.js_code).inspect_err(|_| {
-                    clear_dispatch();
-                })?;
-                transpiled.js_code
+                let js = data.transpiled_js().inspect_err(|_| clear_dispatch())?;
+                Self::validate_js(js).inspect_err(|_| clear_dispatch())?;
+                js.to_string()
             }
             TsLanguage::JavaScript => {
-                Self::validate_js(code).inspect_err(|_| {
-                    clear_dispatch();
-                })?;
-                code.to_string()
+                Self::validate_js(&data.code).inspect_err(|_| clear_dispatch())?;
+                data.code.clone()
             }
         };
 
@@ -673,6 +682,38 @@ var handleRequest = function(method, path, headers, body) {
             assert_eq!(parsed["method"], "POST");
             assert_eq!(parsed["path"], "/test");
             assert_eq!(parsed["status"], "ok");
+            Ok::<(), Error>(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn ts_transpile_is_cached() -> Result<()> {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
+            let host_api = make_host_api();
+            let data = TsPluginData::new(
+                "cached-ts-plugin",
+                r#"
+const greeting: string = "hello";
+function build(): string {
+    return greeting;
+}
+build();
+"#,
+                TsLanguage::TypeScript,
+            );
+            let cloned = data.clone();
+            tokio::task::spawn_blocking(move || {
+                let plugin = TsPlugin::create_and_load(host_api, &cloned)?;
+                drop(plugin);
+                Ok::<_, Error>(())
+            })
+            .await??;
+            assert!(
+                data.compiled_js.get().is_some(),
+                "transpile should be cached"
+            );
             Ok::<(), Error>(())
         })?;
         Ok(())
