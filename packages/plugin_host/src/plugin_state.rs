@@ -23,6 +23,29 @@ pub(crate) fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Builds the plugin HTTP client with the egress guard applied: connection
+/// timeout and a redirect policy capped at the guard's hop limit, re-checking
+/// every hop URL against the guard allow-list (mirrors the legacy adapter's
+/// `ReqwestHttpClient`).
+fn build_http_client(guard: &NetworkGuard) -> reqwest::Client {
+    let timeout = std::time::Duration::from_secs(guard.policy().connect_timeout_secs);
+    let max_hops = guard.max_redirect_hops() as usize;
+    let guard_clone = guard.clone();
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= max_hops
+                || guard_clone.check_url(attempt.url().as_str()).is_err()
+            {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RegisteredMcpTool {
     pub tool_name: String,
@@ -120,12 +143,14 @@ impl Default for HostFunctions {
 impl HostFunctions {
     pub fn new() -> Self {
         install_crypto_provider();
+        let guard = NetworkGuard::with_default_policy();
+        let http_client = build_http_client(&guard);
         Self {
             kv_store: Arc::new(RwLock::new(HashMap::new())),
             config: Arc::new(RwLock::new(HashMap::new())),
             mcp_registry: Arc::new(PluginMcpRegistry::new()),
-            http_client: reqwest::Client::new(),
-            network_guard: Arc::new(NetworkGuard::with_default_policy()),
+            http_client,
+            network_guard: Arc::new(guard),
             pubsub_bus: None,
             llm_service: None,
             trigger_dispatcher: None,

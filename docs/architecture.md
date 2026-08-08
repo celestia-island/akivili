@@ -9,10 +9,9 @@
 
 ### 2.1 生效契约：TS 全局 API（实际执行）
 
-插件源码通过 `globalThis` 导出三个函数：
+插件源码通过 `globalThis` 导出处理函数（插件名取自注册名/文件名，不读取全局 `name`）：
 
 ```ts
-function name(): string;                       // 插件名
 function handleRequest(method, path, headers, body): string;  // webhook 处理
 function onMessage(platform, message): string | null;         // bot 消息处理
 ```
