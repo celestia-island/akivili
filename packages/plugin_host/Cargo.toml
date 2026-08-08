@@ -17,7 +17,6 @@ plana_infra_utils = { git = "https://github.com/celestia-island/plana.git", tag 
 plana_state_sync = { git = "https://github.com/celestia-island/plana.git", tag = "v0.1.9" }
 
 anyhow.workspace = true
-async-trait.workspace = true
 boa_engine.workspace = true
 boa_gc.workspace = true
 boa_runtime.workspace = true
