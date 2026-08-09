@@ -12,9 +12,9 @@ categories.workspace = true
 
 [dependencies]
 akivili_iepl = { path = "../iepl" }
-plana_domain_skills = { git = "https://github.com/celestia-island/plana.git", tag = "v0.1.9" }
-plana_infra_utils = { git = "https://github.com/celestia-island/plana.git", tag = "v0.1.9" }
-plana_state_sync = { git = "https://github.com/celestia-island/plana.git", tag = "v0.1.9" }
+plana_domain_skills = { git = "https://github.com/celestia-island/plana.git", branch = "master" }
+plana_infra_utils = { git = "https://github.com/celestia-island/plana.git", branch = "master" }
+plana_state_sync = { git = "https://github.com/celestia-island/plana.git", branch = "master" }
 
 anyhow.workspace = true
 boa_engine.workspace = true
