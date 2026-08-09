@@ -24,11 +24,6 @@ function onMessage(platform, message): string | null;         // bot 消息处�
 | `registerMcpTool(name, desc, schema)` | 注册 MCP 工具到宿主命名空间 |
 | `__plugin_state` | 插件状态访问 |
 
-### 2.2 遗留 WIT 契约（`wit/plugin.wit`）
-
-WASM 时代的历史规格（world `amphoreus`：import `host-api`，export `webhook-handler`
-与 `bot-handler`）。当前宿主是 TS 引擎，WIT 作为契约文档保留，代码中零引用。
-
 ## 3. 执行管线
 
 ```
@@ -39,14 +34,13 @@ plugin.ts ──► IeplEngine.transpile() (SWC TS→JS + AST 安全校验)
 
 - 引擎：boa_engine ^0.21；资源上限经 `RuntimeLimits` 强制。
 - Promise 轮询：`context.run_jobs()`，120s 超时 / 600s 绝对上限（同步阻塞）。
-- 注意：每次 dispatch 都重建 Boa 上下文（性能模型待优化，见 PLAN §11.3 阶段 5）。
+- Boa 上下文按插件常驻复用（每插件 worker 线程 + 实例池，状态跨请求保持）。
 
 ## 4. 插件注册与分发链路
 
 ```
-scepter PluginRouter (宿主装配)
+PluginRouter (宿主装配)
    ├─ load_ts_plugin / scan_and_load_dir(PLUGIN_DIR)   注册
-   ├─ scan_amphoreus_agents(.amphoreus)                .amphoreus/<agent>/plugin.ts 注册（scepter 启动激活）
    ├─ dispatch_webhook → HTTP POST /webhook/{name} → Boa handleRequest
    ├─ dispatch_bot_message → TriggerDispatcher → onMessage
    └─ all_mcp_tools → cosmos McpRouter 命名空间工具（未命中回退 webhook）
