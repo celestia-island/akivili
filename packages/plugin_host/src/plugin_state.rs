@@ -71,11 +71,12 @@ impl PluginMcpRegistry {
     }
 
     fn register(&self, plugin_name: &str, tool: RegisteredMcpTool) {
-        self.tools
-            .lock()
-            .entry(plugin_name.to_string())
-            .or_default()
-            .push(tool);
+        let mut guard = self.tools.lock();
+        let tools = guard.entry(plugin_name.to_string()).or_default();
+        if tools.iter().any(|t| t.tool_name == tool.tool_name) {
+            return;
+        }
+        tools.push(tool);
     }
 
     fn all_tools(&self) -> Vec<(String, RegisteredMcpTool)> {
