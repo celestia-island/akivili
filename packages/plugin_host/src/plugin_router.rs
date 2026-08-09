@@ -291,42 +291,6 @@ impl PluginRouter {
         Ok(count)
     }
 
-    pub fn scan_amphoreus_agents(&self, amphoreus_dir: &std::path::Path) -> Result<usize> {
-        if !amphoreus_dir.exists() {
-            info!(dir = %amphoreus_dir.display(), ".amphoreus directory does not exist, skipping");
-            return Ok(0);
-        }
-        let mut count = 0;
-        for entry in std::fs::read_dir(amphoreus_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) if !n.starts_with('.') => n.to_string(),
-                _ => continue,
-            };
-            if !path.join("agent.toml").exists() {
-                continue;
-            }
-            for file_entry in std::fs::read_dir(&path)? {
-                let file_entry = file_entry?;
-                let file_path = file_entry.path();
-                let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if ext == "ts" {
-                    match self.load_ts_plugin_from_file(&file_path) {
-                        Ok(()) => count += 1,
-                        Err(e) => {
-                            error!(plugin = %name, error = %e, "failed to load .amphoreus TS plugin");
-                        }
-                    }
-                }
-            }
-        }
-        info!(dir = %amphoreus_dir.display(), loaded = count, ".amphoreus agent plugin scan complete");
-        Ok(count)
-    }
 }
 
 #[cfg(test)]

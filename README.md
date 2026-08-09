@@ -13,8 +13,9 @@ host and the TypeScript execution pipeline that powers Layer-3 community agents.
   capabilities injected via `dispatch` / `registerMcpTool`.
 - **TypeScript execution pipeline** (`packages/iepl`) — TS→JS transpilation with SWC
   plus AST safety validation, shared with the IEPL engine consumers.
-- **Plugin contract** — `wit/plugin.wit` (historical WASM contract) plus the effective
-  TS global API contract documented in `docs/architecture.md`.
+- **Plugin contract** — the effective TS global API contract
+  (`handleRequest` / `onMessage` / `dispatch` / `registerMcpTool` /
+  `__plugin_state`) documented in `docs/architecture.md`.
 
 ## Where plugins live
 
