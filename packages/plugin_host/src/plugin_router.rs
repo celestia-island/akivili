@@ -10,12 +10,108 @@ use crate::{
     ts_plugin::{TsLanguage, TsPlugin, TsPluginData, plugin_compute_timeout},
 };
 
-enum PluginKind {
-    Ts(TsPluginData),
+/// A per-plugin execution worker owning the pooled Boa contexts. Boa 0.21
+/// contexts must be dropped on the thread that created them, so every
+/// instance lives and dies inside this worker's thread; dispatches arrive
+/// over a channel and run strictly one at a time, preserving in-script
+/// global state (`__plugin_state`, module-level vars) across requests.
+/// A request that times out only drops the caller's reply channel: the
+/// worker still finishes the run and keeps the (now idle) instance in the
+/// pool, so a slow plugin never poisons the pool.
+pub struct TsPluginPool {
+    tx: std::sync::mpsc::Sender<PoolRequest>,
+    data: TsPluginData,
+}
+
+enum PoolRequest {
+    Webhook {
+        method: String,
+        path: String,
+        headers: String,
+        body: String,
+        reply: tokio::sync::oneshot::Sender<Result<String>>,
+    },
+    BotMessage {
+        platform: String,
+        message: String,
+        reply: tokio::sync::oneshot::Sender<Result<Option<String>>>,
+    },
+}
+
+impl TsPluginPool {
+    fn new(host_api: Arc<HostFunctions>, data: TsPluginData) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_data = data.clone();
+        std::thread::Builder::new()
+            .name(format!("plugin-worker-{}", data.plugin_name()))
+            .spawn(move || worker_loop(host_api, worker_data, rx))
+            .expect("plugin worker thread spawn failed");
+        Self { tx, data }
+    }
+
+    fn plugin_name(&self) -> &str {
+        self.data.plugin_name()
+    }
+}
+
+fn worker_loop(
+    host_api: Arc<HostFunctions>,
+    data: TsPluginData,
+    rx: std::sync::mpsc::Receiver<PoolRequest>,
+) {
+    let mut idle: Vec<TsPlugin> = Vec::new();
+    while let Ok(req) = rx.recv() {
+        let mut plugin = match idle.pop() {
+            Some(p) => p,
+            None => match TsPlugin::create_and_load(host_api.clone(), &data) {
+                Ok(p) => p,
+                Err(e) => {
+                    let err = anyhow!("plugin instance creation failed: {}", e);
+                    match req {
+                        PoolRequest::Webhook { reply, .. } => {
+                            let _ = reply.send(Err(err));
+                        }
+                        PoolRequest::BotMessage { reply, .. } => {
+                            let _ = reply.send(Err(err));
+                        }
+                    }
+                    continue;
+                }
+            },
+        };
+        match req {
+            PoolRequest::Webhook {
+                method,
+                path,
+                headers,
+                body,
+                reply,
+            } => {
+                let r = plugin.handle_request(&method, &path, &headers, &body);
+                let reusable = r.is_ok();
+                let _ = reply.send(r);
+                if reusable {
+                    idle.push(plugin);
+                }
+            }
+            PoolRequest::BotMessage {
+                platform,
+                message,
+                reply,
+            } => {
+                let r = plugin.on_message(&platform, &message);
+                let reusable = r.is_ok();
+                let _ = reply.send(r);
+                if reusable {
+                    idle.push(plugin);
+                }
+            }
+        }
+    }
 }
 
 pub struct PluginRouter {
-    plugins: Mutex<HashMap<String, PluginKind>>,
+    plugins: Mutex<HashMap<String, Arc<TsPluginPool>>>,
     host_api: Arc<HostFunctions>,
 }
 
@@ -52,9 +148,8 @@ impl PluginRouter {
             })
         })?;
 
-        self.plugins
-            .lock()
-            .insert(name.to_string(), PluginKind::Ts(data));
+        let pool = Arc::new(TsPluginPool::new(self.host_api.clone(), data));
+        self.plugins.lock().insert(name.to_string(), pool);
 
         info!(plugin = name, "TS plugin registered");
         Ok(())
@@ -83,53 +178,44 @@ impl PluginRouter {
         headers: &str,
         body: &str,
     ) -> Result<String> {
-        let mut plugins = self.plugins.lock();
-        let plugin = plugins
-            .get_mut(plugin_name)
+        let pool = self
+            .plugins
+            .lock()
+            .get(plugin_name)
+            .cloned()
             .ok_or_else(|| anyhow!("plugin not found: {}", plugin_name))?;
 
-        match plugin {
-            // WASM plugin support removed — use TS plugins only
-            PluginKind::Ts(data) => {
-                let api = self.host_api.clone();
-                let data = data.clone();
-                let method = method.to_string();
-                let path = path.to_string();
-                let headers = headers.to_string();
-                let body = body.to_string();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        pool.tx
+            .send(PoolRequest::Webhook {
+                method: method.to_string(),
+                path: path.to_string(),
+                headers: headers.to_string(),
+                body: body.to_string(),
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow!("plugin worker stopped: {}", plugin_name))?;
 
-                drop(plugins);
-
-                tokio::task::block_in_place(|| {
-                    let handle = tokio::runtime::Handle::current();
-                    handle.block_on(async {
-                        let join_handle = tokio::task::spawn_blocking(move || {
-                            let mut ts_plugin = TsPlugin::create_and_load(api, &data)?;
-                            ts_plugin.handle_request(&method, &path, &headers, &body)
-                        });
-                        let output = timeout(plugin_compute_timeout(), join_handle)
-                            .await
-                            .map_err(|_| {
-                                anyhow!(
-                                    "plugin execution timed out after {:?}",
-                                    plugin_compute_timeout()
-                                )
-                            })?;
-                        output.map_err(|e| anyhow!("plugin execution task failed: {e}"))?
-                    })
-                })
-            }
-        }
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(timeout(plugin_compute_timeout(), reply_rx))
+        })
+        .map_err(|_| {
+            anyhow!(
+                "plugin execution timed out after {:?}",
+                plugin_compute_timeout()
+            )
+        })?
+        .map_err(|e| anyhow!("plugin execution failed: {e}"))?
     }
 
     pub fn get_plugin_name(&self, plugin_name: &str) -> Result<String> {
-        let mut plugins = self.plugins.lock();
-        let plugin = plugins
-            .get_mut(plugin_name)
+        let pool = self
+            .plugins
+            .lock()
+            .get(plugin_name)
+            .cloned()
             .ok_or_else(|| anyhow!("plugin not found: {}", plugin_name))?;
-        match plugin {
-            PluginKind::Ts(data) => Ok(data.plugin_name().to_string()),
-        }
+        Ok(pool.plugin_name().to_string())
     }
 
     pub fn dispatch_bot_message(
@@ -138,39 +224,32 @@ impl PluginRouter {
         platform: &str,
         message: &str,
     ) -> Result<Option<String>> {
-        let mut plugins = self.plugins.lock();
-        let plugin = plugins
-            .get_mut(plugin_name)
+        let pool = self
+            .plugins
+            .lock()
+            .get(plugin_name)
+            .cloned()
             .ok_or_else(|| anyhow!("plugin not found: {}", plugin_name))?;
-        match plugin {
-            PluginKind::Ts(data) => {
-                let api = self.host_api.clone();
-                let data = data.clone();
-                let platform = platform.to_string();
-                let message = message.to_string();
 
-                drop(plugins);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        pool.tx
+            .send(PoolRequest::BotMessage {
+                platform: platform.to_string(),
+                message: message.to_string(),
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow!("plugin worker stopped: {}", plugin_name))?;
 
-                tokio::task::block_in_place(|| {
-                    let handle = tokio::runtime::Handle::current();
-                    handle.block_on(async {
-                        let join_handle = tokio::task::spawn_blocking(move || {
-                            let mut ts_plugin = TsPlugin::create_and_load(api, &data)?;
-                            ts_plugin.on_message(&platform, &message)
-                        });
-                        let output = timeout(plugin_compute_timeout(), join_handle)
-                            .await
-                            .map_err(|_| {
-                                anyhow!(
-                                    "plugin execution timed out after {:?}",
-                                    plugin_compute_timeout()
-                                )
-                            })?;
-                        output.map_err(|e| anyhow!("plugin execution task failed: {e}"))?
-                    })
-                })
-            }
-        }
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(timeout(plugin_compute_timeout(), reply_rx))
+        })
+        .map_err(|_| {
+            anyhow!(
+                "plugin execution timed out after {:?}",
+                plugin_compute_timeout()
+            )
+        })?
+        .map_err(|e| anyhow!("plugin execution failed: {e}"))?
     }
 
     pub fn list_plugins(&self) -> Vec<String> {
@@ -370,6 +449,111 @@ var handleRequest = function(method, path, headers, body) {
             let response = router.dispatch_webhook("my-plugin", "POST", "/", "{}", "{}")?;
             let parsed: serde_json::Value = serde_json::from_str(&response)?;
             assert_eq!(parsed["scanned"], true);
+            Ok::<(), Error>(())
+        })?;
+        Ok(())
+    }
+
+    /// Instances are pooled, so in-script state survives across dispatches:
+    /// the second call must observe the counter mutated by the first.
+    #[test]
+    fn plugin_state_preserved_across_dispatches() -> Result<()> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async {
+            let host_api = make_host_api();
+            let router = PluginRouter::new(host_api);
+
+            router.load_ts_plugin(
+                "counter",
+                r#"
+var count = 0;
+var handleRequest = function(m, p, h, b) {
+    count = count + 1;
+    return JSON.stringify({ count: count });
+};
+"#,
+                TsLanguage::JavaScript,
+            )?;
+
+            let first = router.dispatch_webhook("counter", "POST", "/", "{}", "{}")?;
+            let first_val: serde_json::Value = serde_json::from_str(&first)?;
+            assert_eq!(first_val["count"], 1);
+
+            let second = router.dispatch_webhook("counter", "POST", "/", "{}", "{}")?;
+            let second_val: serde_json::Value = serde_json::from_str(&second)?;
+            assert_eq!(second_val["count"], 2);
+            Ok::<(), Error>(())
+        })?;
+        Ok(())
+    }
+
+    /// __plugin_state survives across dispatches via the pooled context.
+    #[test]
+    fn plugin_state_global_survives_dispatches() -> Result<()> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async {
+            let host_api = make_host_api();
+            let router = PluginRouter::new(host_api);
+
+            router.load_ts_plugin(
+                "stateful",
+                r#"
+var handleRequest = function(m, p, h, b) {
+    var st = JSON.parse(__plugin_state);
+    st.hits = (st.hits || 0) + 1;
+    __plugin_state = JSON.stringify(st);
+    return JSON.stringify(st);
+};
+"#,
+                TsLanguage::JavaScript,
+            )?;
+
+            let first: serde_json::Value = serde_json::from_str(
+                &router.dispatch_webhook("stateful", "POST", "/", "{}", "{}")?,
+            )?;
+            assert_eq!(first["hits"], 1);
+
+            let second: serde_json::Value = serde_json::from_str(
+                &router.dispatch_webhook("stateful", "POST", "/", "{}", "{}")?,
+            )?;
+            assert_eq!(second["hits"], 2);
+            Ok::<(), Error>(())
+        })?;
+        Ok(())
+    }
+
+    /// The script body runs once per load, so MCP tools registered by the
+    /// plugin must appear exactly once even after many dispatches.
+    #[test]
+    fn mcp_tools_registered_once() -> Result<()> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async {
+            let host_api = make_host_api();
+            let router = PluginRouter::new(host_api);
+
+            router.load_ts_plugin(
+                "tooler",
+                r#"
+registerMcpTool("echo", "Echoes input", "{}");
+var handleRequest = function(m, p, h, b) { return "{}"; };
+"#,
+                TsLanguage::JavaScript,
+            )?;
+
+            for _ in 0..3 {
+                router.dispatch_webhook("tooler", "POST", "/", "{}", "{}")?;
+            }
+
+            let all = router.all_mcp_tools();
+            let mine: Vec<_> = all.iter().filter(|(p, _)| p == "tooler").collect();
+            assert_eq!(mine.len(), 1, "tool must be registered exactly once");
+            assert_eq!(mine[0].1.tool_name, "echo");
             Ok::<(), Error>(())
         })?;
         Ok(())
