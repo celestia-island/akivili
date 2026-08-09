@@ -24,7 +24,6 @@ categories = ["development-tools"]
 
 [workspace.dependencies]
 anyhow = "^1"
-async-trait = "^0.1"
 boa_engine = "^0.21"
 boa_gc = "^0.21"
 boa_runtime = "^0.21"

@@ -163,6 +163,9 @@ impl HostFunctions {
     }
 
     pub fn with_network_guard(mut self, guard: NetworkGuard) -> Self {
+        // Rebuild the client so both the pre-request check and the redirect
+        // policy use the new guard (the redirect closure captures it).
+        self.http_client = build_http_client(&guard);
         self.network_guard = Arc::new(guard);
         self
     }

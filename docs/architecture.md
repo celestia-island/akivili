@@ -60,5 +60,6 @@ akivili 只消费其 schema，不重复实现。
 `.amphoreus/subscribe.toml`：从 `official` / `github` 源订阅 Layer3 agents，
 声明 `version` 约束、`trusted_sources`、`verify_signature`。
 
-**已知缺口**：`verify_signature` / `trusted_sources` 当前仅解析未实施
-（纸面安全）；akivili 独立后在 SDK 内实施真实签名验证（PLAN §11.3 阶段 5）。
+**实施状态**：`trusted_sources` 白名单与 `agent.sig` Ed25519 包签名验证已在
+`plana_custom_agent` 强制生效（订阅与同步/自动更新两条路径一致；PLAN §11.3）；
+签名工具链见 `celestia-devtools sign-agent`。本地 `.amphoreus` agent 豁免。
