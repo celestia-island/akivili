@@ -11,7 +11,7 @@
 //! - [`PluginState`]: Host API surface exposed to TS tools.
 #![allow(clippy::type_complexity)]
 
-pub mod guard;
+pub use akivili_guard as guard;
 pub mod plugin_router;
 pub mod plugin_state;
 pub mod ts_plugin;
