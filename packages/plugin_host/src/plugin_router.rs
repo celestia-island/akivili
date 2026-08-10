@@ -290,7 +290,6 @@ impl PluginRouter {
         info!(dir = %dir.display(), loaded = count, "plugin scan complete");
         Ok(count)
     }
-
 }
 
 #[cfg(test)]
@@ -504,7 +503,7 @@ var handleRequest = function(m, p, h, b) {
             router.load_ts_plugin(
                 "tooler",
                 r#"
-registerMcpTool("echo", "Echoes input", "{}");
+registerMcpTool("tooler.echo", "Echoes input", "{}");
 var handleRequest = function(m, p, h, b) { return "{}"; };
 "#,
                 TsLanguage::JavaScript,
@@ -517,7 +516,7 @@ var handleRequest = function(m, p, h, b) { return "{}"; };
             let all = router.all_mcp_tools();
             let mine: Vec<_> = all.iter().filter(|(p, _)| p == "tooler").collect();
             assert_eq!(mine.len(), 1, "tool must be registered exactly once");
-            assert_eq!(mine[0].1.tool_name, "echo");
+            assert_eq!(mine[0].1.tool_name, "tooler.echo");
             Ok::<(), Error>(())
         })?;
         Ok(())

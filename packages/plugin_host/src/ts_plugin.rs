@@ -784,7 +784,7 @@ var handleRequest = function(method, path, headers, body) {
             let data = TsPluginData::new(
                 "tool-plugin",
                 r#"
-registerMcpTool("my_tool", "A test tool", '{"type":"object"}');
+registerMcpTool("tool-plugin.my_tool", "A test tool", '{"type":"object"}');
 var handleRequest = function(m,p,h,b) {
     return JSON.stringify({ registered: true });
 };
@@ -801,7 +801,7 @@ var handleRequest = function(m,p,h,b) {
             let parsed: serde_json::Value = serde_json::from_str(&result.0)?;
             assert_eq!(parsed["registered"], true);
             assert_eq!(result.1.len(), 1);
-            assert_eq!(result.1[0].tool_name, "my_tool");
+            assert_eq!(result.1[0].tool_name, "tool-plugin.my_tool");
             assert_eq!(result.1[0].description, "A test tool");
             let all = host_api_clone.all_mcp_tools();
             assert_eq!(all.len(), 1);

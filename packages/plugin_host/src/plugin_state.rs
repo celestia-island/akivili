@@ -23,6 +23,13 @@ pub(crate) fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Maximum MCP tools a single plugin may register. Prevents one plugin from
+/// dominating the shared tool surface (C8 amplification cap).
+pub const MAX_TOOLS_PER_PLUGIN: usize = 32;
+
+/// Maximum MCP tools across all plugins in the registry.
+pub const MAX_MCP_TOOLS_GLOBAL: usize = 256;
+
 /// Builds the plugin HTTP client with the egress guard applied: connection
 /// timeout and a redirect policy capped at the guard's hop limit, re-checking
 /// every hop URL against the guard allow-list (mirrors the legacy adapter's
@@ -63,13 +70,57 @@ struct PluginMcpRegistry {
     tools: Mutex<HashMap<String, Vec<RegisteredMcpTool>>>,
 }
 
+/// Enforces the MCP tool namespace policy: a plugin may only register tools
+/// under its own `<plugin_name>.` prefix, and the local part must be a plain
+/// identifier. This turns the shared tool surface into a per-plugin whitelist
+/// (no cross-plugin impersonation, no global name squatting) and keeps the
+/// registered name aligned with the `<agent>.<tool>` convention used by the
+/// downstream namespace/`allowed_filter` machinery.
+fn validate_tool_namespace(plugin_name: &str, tool_name: &str) -> Result<()> {
+    if plugin_name.is_empty() {
+        bail!("plugin name must not be empty");
+    }
+
+    if tool_name.is_empty() {
+        bail!("tool name must not be empty");
+    }
+
+    if tool_name.contains(' ') || tool_name.contains('\n') || tool_name.contains('\t') {
+        bail!("tool name '{}' contains whitespace", tool_name);
+    }
+
+    let prefix = format!("{}.", plugin_name);
+    let local = tool_name.strip_prefix(&prefix).ok_or_else(|| {
+        anyhow!(
+            "tool name '{}' must be namespaced with the plugin prefix '{}…'",
+            tool_name,
+            prefix
+        )
+    })?;
+
+    if local.is_empty() {
+        bail!("tool name '{}' has an empty local part", tool_name);
+    }
+
+    if !local
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        bail!(
+            "tool name '{}' local part contains invalid characters (only [A-Za-z0-9_-])",
+            tool_name
+        );
+    }
+
+    Ok(())
+}
+
 impl PluginMcpRegistry {
     fn new() -> Self {
         Self {
             tools: Mutex::new(HashMap::new()),
         }
     }
-
     fn register(&self, plugin_name: &str, tool: RegisteredMcpTool) {
         let mut guard = self.tools.lock();
         let tools = guard.entry(plugin_name.to_string()).or_default();
@@ -332,13 +383,7 @@ impl HostApiProvider for HostFunctions {
         description: String,
         schema: String,
     ) -> Result<()> {
-        if tool_name.is_empty() {
-            bail!("tool name must not be empty");
-        }
-
-        if tool_name.contains(' ') || tool_name.contains('\n') || tool_name.contains('\t') {
-            bail!("tool name '{}' contains whitespace", tool_name);
-        }
+        validate_tool_namespace(plugin_name, &tool_name)?;
 
         {
             let all = self.mcp_registry.all_tools();
@@ -349,6 +394,21 @@ impl HostApiProvider for HostFunctions {
                     existing_plugin
                 );
             }
+        }
+
+        if self.mcp_registry.tools_for_plugin(plugin_name).len() >= MAX_TOOLS_PER_PLUGIN {
+            bail!(
+                "plugin '{}' exceeds the per-plugin MCP tool cap of {}",
+                plugin_name,
+                MAX_TOOLS_PER_PLUGIN
+            );
+        }
+
+        if self.mcp_registry.all_tools().len() >= MAX_MCP_TOOLS_GLOBAL {
+            bail!(
+                "MCP tool registry reached the global cap of {}",
+                MAX_MCP_TOOLS_GLOBAL
+            );
         }
 
         if !schema.is_empty()
@@ -387,5 +447,91 @@ impl HostApiProvider for HostFunctions {
         } else {
             bail!("trigger dispatcher not configured")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn register(api: &HostFunctions, plugin: &str, tool: &str) -> anyhow::Result<()> {
+        api.register_mcp_tool(
+            plugin,
+            tool.to_string(),
+            "desc".to_string(),
+            "{}".to_string(),
+        )
+    }
+
+    #[test]
+    fn tool_name_must_be_namespaced() {
+        let api = HostFunctions::new();
+        assert!(register(&api, "tool-plugin", "my_tool").is_err());
+        assert!(register(&api, "tool-plugin", "tool-plugin.my_tool").is_ok());
+    }
+
+    #[test]
+    fn cross_plugin_tool_collision_is_rejected() {
+        let api = HostFunctions::new();
+        assert!(register(&api, "plugin-a", "plugin-a.shared_tool").is_ok());
+        let err = register(&api, "plugin-b", "plugin-a.shared_tool").unwrap_err();
+        assert!(
+            err.to_string().contains("plugin-a"),
+            "squatting another plugin's namespace must be rejected, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn tool_name_local_part_must_be_valid_identifier() {
+        let api = HostFunctions::new();
+        assert!(register(&api, "p", "p.").is_err());
+        assert!(register(&api, "p", "p.sp ace").is_err());
+        assert!(register(&api, "p", "p.dotted.name").is_err());
+        assert!(register(&api, "p", "p.ok_name-1").is_ok());
+    }
+
+    #[test]
+    fn per_plugin_registration_cap_is_enforced() {
+        let api = HostFunctions::new();
+        for i in 0..MAX_TOOLS_PER_PLUGIN {
+            register(&api, "cap-plugin", &format!("cap-plugin.tool_{}", i)).unwrap();
+        }
+        let err = register(
+            &api,
+            "cap-plugin",
+            &format!("cap-plugin.tool_{}", MAX_TOOLS_PER_PLUGIN),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cap"), "got: {}", err);
+    }
+
+    #[test]
+    fn global_registration_cap_is_enforced() {
+        let api = HostFunctions::new();
+        let mut plugin = 0usize;
+        let mut tool = 0usize;
+        let mut registered = 0usize;
+        while registered < MAX_MCP_TOOLS_GLOBAL {
+            register(
+                &api,
+                &format!("g{}", plugin),
+                &format!("g{}.t{}", plugin, tool),
+            )
+            .unwrap();
+            registered += 1;
+            tool += 1;
+            if tool >= MAX_TOOLS_PER_PLUGIN {
+                tool = 0;
+                plugin += 1;
+            }
+        }
+        let err = register(
+            &api,
+            &format!("g{}", plugin),
+            &format!("g{}.overflow", plugin),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("global cap"), "got: {}", err);
     }
 }
