@@ -1,6 +1,8 @@
 use std::{
     collections::HashSet,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs},
+    sync::Arc,
+    time::Duration,
 };
 
 use super::{AdapterError, AdapterResult};
@@ -26,6 +28,34 @@ const SENSITIVE_HEADER_NAMES: &[&str] = &[
 const DEFAULT_MAX_REDIRECT_HOPS: u32 = 3;
 const DEFAULT_MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// Cap for the wall-clock time a single hostname resolution may take before
+/// the guard treats it as unresolved (fail closed).
+const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Resolves a hostname to its addresses. The guard rejects the request if
+/// any resolved address violates the IP policy, so resolvers must return the
+/// full answer set (A and AAAA records) to keep DNS-rebinding-style SSRF out.
+pub type DnsResolverFn = dyn Fn(&str) -> Vec<IpAddr> + Send + Sync;
+
+/// Default resolver: the system getaddrinfo (same answer the underlying HTTP
+/// stack observes) run under a wall-clock cap on a detached thread, so a slow
+/// DNS server cannot stall a plugin worker indefinitely.
+fn system_dns_resolve(host: &str) -> Vec<IpAddr> {
+    let host = host.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("akivili-dns-resolve".to_string())
+        .spawn(move || {
+            let _ = tx.send(
+                (host.as_str(), 0)
+                    .to_socket_addrs()
+                    .map(|addrs| addrs.map(|sa| sa.ip()).collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            );
+        });
+    rx.recv_timeout(DNS_RESOLVE_TIMEOUT).unwrap_or_default()
+}
 
 #[derive(Debug, Clone)]
 pub struct NetworkGuardPolicy {
@@ -94,14 +124,32 @@ impl NetworkGuardPolicy {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NetworkGuard {
     policy: NetworkGuardPolicy,
+    resolve: Arc<DnsResolverFn>,
+}
+
+impl std::fmt::Debug for NetworkGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetworkGuard")
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
+    }
 }
 
 impl NetworkGuard {
     pub fn new(policy: NetworkGuardPolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            resolve: Arc::new(system_dns_resolve),
+        }
+    }
+
+    /// Overrides the hostname resolver (tests inject canned answers).
+    pub fn with_resolver(mut self, resolve: Arc<DnsResolverFn>) -> Self {
+        self.resolve = resolve;
+        self
     }
 
     pub fn with_default_policy() -> Self {
@@ -165,8 +213,31 @@ impl NetworkGuard {
         }
 
         let ip_str = host.trim_start_matches('[').trim_end_matches(']');
-        if let Ok(ip) = ip_str.parse::<IpAddr>() {
-            self.check_ip(ip)?;
+        match ip_str.parse::<IpAddr>() {
+            Ok(ip) => self.check_ip(ip)?,
+            Err(_) => {
+                // Hostname: resolve and validate every answer. Without this,
+                // attacker-controlled DNS (a name resolving to 127.0.0.1, a
+                // private subnet, the cloud metadata endpoint, or numeric
+                // encodings like 2130706433) would bypass the guard — the
+                // string checks alone cannot see where the name actually
+                // points. Any blocked answer rejects the whole request.
+                let resolved = (self.resolve)(host);
+                if resolved.is_empty() {
+                    return Err(AdapterError::Security(format!(
+                        "hostname '{}' could not be resolved",
+                        host
+                    )));
+                }
+                for ip in resolved {
+                    self.check_ip(ip).map_err(|e| {
+                        AdapterError::Security(format!(
+                            "hostname '{}' resolves to blocked address: {}",
+                            host, e
+                        ))
+                    })?;
+                }
+            }
         }
 
         Ok(parsed)
@@ -328,9 +399,18 @@ mod tests {
         NetworkGuard::with_default_policy()
     }
 
+    fn public_dns() -> Arc<DnsResolverFn> {
+        Arc::new(|_: &str| vec!["93.184.216.34".parse().unwrap()])
+    }
+
+    fn guard_with_dns(addrs: Vec<IpAddr>) -> NetworkGuard {
+        NetworkGuard::new(NetworkGuardPolicy::default())
+            .with_resolver(Arc::new(move |_: &str| addrs.clone()))
+    }
+
     #[test]
     fn allows_https_url() -> Result<()> {
-        let guard = default_guard();
+        let guard = default_guard().with_resolver(public_dns());
         let url = guard.check_url("https://example.com/path")?;
         assert_eq!(url.host_str(), Some("example.com"));
         Ok(())
@@ -338,7 +418,7 @@ mod tests {
 
     #[test]
     fn allows_http_url() -> Result<()> {
-        let guard = default_guard();
+        let guard = default_guard().with_resolver(public_dns());
         assert!(guard.check_url("http://example.com/").is_ok());
         Ok(())
     }
@@ -485,7 +565,8 @@ mod tests {
         let guard = NetworkGuard::new(
             NetworkGuardPolicy::default()
                 .with_allowed_hosts(HashSet::from(["api.example.com".to_string()])),
-        );
+        )
+        .with_resolver(public_dns());
         assert!(guard.check_url("https://api.example.com/v1").is_ok());
         assert!(guard.check_url("https://other.example.com/v1").is_err());
         Ok(())
@@ -581,6 +662,82 @@ mod tests {
         assert!(guard.is_response_size_allowed(50));
         assert!(guard.is_response_size_allowed(100));
         assert!(!guard.is_response_size_allowed(101));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_hostname_resolving_to_loopback() -> Result<()> {
+        let guard = guard_with_dns(vec!["127.0.0.1".parse().unwrap()]);
+        let err = guard.check_url("http://rebind.example.com/").unwrap_err();
+        assert!(err.to_string().contains("blocked"), "got: {}", err);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_hostname_resolving_to_private_ip() -> Result<()> {
+        let guard = guard_with_dns(vec!["10.0.0.1".parse().unwrap()]);
+        let err = guard
+            .check_url("http://internal-rebind.example.com/")
+            .unwrap_err();
+        assert!(err.to_string().contains("blocked"), "got: {}", err);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_hostname_resolving_to_cloud_metadata() -> Result<()> {
+        let guard = guard_with_dns(vec!["169.254.169.254".parse().unwrap()]);
+        assert!(guard.check_url("http://rebind.example.com/").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_hostname_with_any_blocked_answer() -> Result<()> {
+        let guard = guard_with_dns(vec![
+            "93.184.216.34".parse().unwrap(),
+            "192.168.1.1".parse().unwrap(),
+        ]);
+        let err = guard.check_url("http://mixed.example.com/").unwrap_err();
+        assert!(err.to_string().contains("blocked"), "got: {}", err);
+        Ok(())
+    }
+
+    #[test]
+    fn allows_hostname_with_only_public_answers() -> Result<()> {
+        let guard = guard_with_dns(vec![
+            "93.184.216.34".parse().unwrap(),
+            "8.8.8.8".parse().unwrap(),
+        ]);
+        assert!(guard.check_url("http://public.example.com/").is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unresolvable_hostname() -> Result<()> {
+        let guard = guard_with_dns(vec![]);
+        let err = guard.check_url("http://nowhere.example.com/").unwrap_err();
+        assert!(
+            err.to_string().contains("could not be resolved"),
+            "got: {}",
+            err
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_numeric_encoded_loopback_via_dns() -> Result<()> {
+        let guard = guard_with_dns(vec!["127.0.0.1".parse().unwrap()]);
+        let err = guard
+            .check_url("http://2130706433/")
+            .expect_err("decimal-encoded loopback must be rejected");
+        assert!(err.to_string().contains("blocked"), "got: {}", err);
+        Ok(())
+    }
+
+    #[test]
+    fn permissive_policy_accepts_hostname_resolving_to_private() -> Result<()> {
+        let guard = NetworkGuard::new(NetworkGuardPolicy::permissive())
+            .with_resolver(Arc::new(|_: &str| vec!["10.0.0.1".parse().unwrap()]));
+        assert!(guard.check_url("http://internal.example.com/").is_ok());
         Ok(())
     }
 }
