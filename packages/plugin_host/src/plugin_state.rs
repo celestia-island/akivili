@@ -33,13 +33,15 @@ pub const MAX_MCP_TOOLS_GLOBAL: usize = 256;
 /// Builds the plugin HTTP client with the egress guard applied: connection
 /// timeout and a redirect policy capped at the guard's hop limit, re-checking
 /// every hop URL against the guard allow-list (mirrors the legacy adapter's
-/// `ReqwestHttpClient`).
+/// `ReqwestHttpClient`). The client's DNS resolution runs through the guard
+/// itself, so connect-time addresses are validated (no rebinding window).
 fn build_http_client(guard: &NetworkGuard) -> reqwest::Client {
     let timeout = std::time::Duration::from_secs(guard.policy().connect_timeout_secs);
     let max_hops = guard.max_redirect_hops() as usize;
     let guard_clone = guard.clone();
     reqwest::Client::builder()
         .timeout(timeout)
+        .dns_resolver(guard.clone())
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= max_hops
                 || guard_clone.check_url(attempt.url().as_str()).is_err()
@@ -533,5 +535,48 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("global cap"), "got: {}", err);
+    }
+
+    /// End-to-end pinning proof: the plugin HTTP client must connect through
+    /// the guard's resolver. The hostname `local.test` does not resolve via
+    /// the system DNS, so a successful request to it — mapped to 127.0.0.1
+    /// by the injected resolver — can only happen if the connector used the
+    /// guard-validated answer (IP pinning), not a second unguarded lookup.
+    #[test]
+    fn http_client_connects_through_guard_resolver() -> anyhow::Result<()> {
+        use std::net::IpAddr;
+        use std::sync::Arc;
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let addr = listener.local_addr()?;
+            let server = tokio::task::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let (mut socket, _) = listener.accept().await?;
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\npong")
+                    .await?;
+                Ok::<(), std::io::Error>(())
+            });
+
+            let guard =
+                crate::guard::NetworkGuard::new(crate::guard::NetworkGuardPolicy::permissive())
+                    .with_resolver(Arc::new(move |_: &str| {
+                        vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]
+                    }));
+            let api = HostFunctions::new().with_network_guard(guard);
+            let url = format!("http://local.test:{}/", addr.port().to_string());
+            let resp = api.http_request("GET".into(), url, "{}".into(), String::new())?;
+            assert!(resp.contains("pong"), "got: {}", resp);
+
+            server.await??;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(())
     }
 }

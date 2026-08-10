@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     sync::Arc,
     time::Duration,
 };
@@ -222,25 +222,41 @@ impl NetworkGuard {
                 // encodings like 2130706433) would bypass the guard — the
                 // string checks alone cannot see where the name actually
                 // points. Any blocked answer rejects the whole request.
-                let resolved = (self.resolve)(host);
-                if resolved.is_empty() {
-                    return Err(AdapterError::Security(format!(
-                        "hostname '{}' could not be resolved",
-                        host
-                    )));
-                }
-                for ip in resolved {
-                    self.check_ip(ip).map_err(|e| {
-                        AdapterError::Security(format!(
-                            "hostname '{}' resolves to blocked address: {}",
-                            host, e
-                        ))
-                    })?;
-                }
+                self.resolve_and_validate(host)?;
             }
         }
 
         Ok(parsed)
+    }
+
+    /// Resolves a host and validates every resolved address against the IP
+    /// policy. Used both by the string-level [`Self::check_url`] guard and by
+    /// the reqwest DNS resolver ([`reqwest::dns::Resolve`] below), so the
+    /// addresses actually used for the connection are exactly the ones that
+    /// passed validation — no second, unguarded resolution at connect time
+    /// (closes the check-vs-connect DNS rebinding TOCTOU window).
+    fn resolve_and_validate(&self, host: &str) -> AdapterResult<Vec<IpAddr>> {
+        let ip_str = host.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = ip_str.parse::<IpAddr>() {
+            self.check_ip(ip)?;
+            return Ok(vec![ip]);
+        }
+        let resolved = (self.resolve)(host);
+        if resolved.is_empty() {
+            return Err(AdapterError::Security(format!(
+                "hostname '{}' could not be resolved",
+                host
+            )));
+        }
+        for ip in &resolved {
+            self.check_ip(*ip).map_err(|e| {
+                AdapterError::Security(format!(
+                    "hostname '{}' resolves to blocked address: {}",
+                    host, e
+                ))
+            })?;
+        }
+        Ok(resolved)
     }
 
     fn check_ip(&self, ip: IpAddr) -> AdapterResult<()> {
@@ -360,6 +376,40 @@ impl NetworkGuard {
 
     pub fn max_redirect_hops(&self) -> u32 {
         self.policy.max_redirect_hops
+    }
+}
+
+/// Connect-time DNS resolution through the guard: reqwest asks THIS resolver
+/// for the addresses to open the socket against, and every answer must pass
+/// the IP policy before it is handed to the connector. Because validation
+/// and connection share the same resolution, an attacker-controlled DNS
+/// server can no longer serve a benign answer to `check_url` and a hostile
+/// one at connect time (DNS-rebinding TOCTOU) — the connect-time answer is
+/// itself the validated one, i.e. the connection is pinned to the checked
+/// addresses.
+impl reqwest::dns::Resolve for NetworkGuard {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let guard = self.clone();
+        Box::pin(async move {
+            let host = name.as_str().to_string();
+            let result = tokio::task::spawn_blocking(move || guard.resolve_and_validate(&host))
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    Box::new(std::io::Error::other(format!(
+                        "plugin egress DNS resolution task failed: {}",
+                        e
+                    )))
+                })?;
+            let addrs = result.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(std::io::Error::other(format!(
+                    "plugin egress DNS blocked: {}",
+                    e
+                )))
+            })?;
+            let iter: Box<dyn Iterator<Item = SocketAddr> + Send> =
+                Box::new(addrs.into_iter().map(|ip| SocketAddr::new(ip, 0)));
+            Ok(iter)
+        })
     }
 }
 
@@ -738,6 +788,75 @@ mod tests {
         let guard = NetworkGuard::new(NetworkGuardPolicy::permissive())
             .with_resolver(Arc::new(|_: &str| vec!["10.0.0.1".parse().unwrap()]));
         assert!(guard.check_url("http://internal.example.com/").is_ok());
+        Ok(())
+    }
+
+    fn block_on_resolve(guard: &NetworkGuard, host: &str) -> Result<Vec<IpAddr>> {
+        use std::str::FromStr;
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
+            let name = reqwest::dns::Name::from_str(host)?;
+            let addrs = reqwest::dns::Resolve::resolve(guard, name)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            Ok(addrs.map(|a| a.ip()).collect())
+        })
+    }
+
+    #[test]
+    fn connect_resolver_blocks_hostname_resolving_to_loopback() -> Result<()> {
+        let guard = guard_with_dns(vec!["127.0.0.1".parse().unwrap()]);
+        let err = block_on_resolve(&guard, "rebind.example.com").unwrap_err();
+        assert!(err.to_string().contains("blocked"), "got: {}", err);
+        Ok(())
+    }
+
+    #[test]
+    fn connect_resolver_blocks_hostname_resolving_to_private() -> Result<()> {
+        let guard = guard_with_dns(vec!["10.0.0.1".parse().unwrap()]);
+        let err = block_on_resolve(&guard, "rebind.example.com").unwrap_err();
+        assert!(err.to_string().contains("blocked"), "got: {}", err);
+        Ok(())
+    }
+
+    #[test]
+    fn connect_resolver_rejects_unresolvable_hostname() -> Result<()> {
+        let guard = guard_with_dns(vec![]);
+        let err = block_on_resolve(&guard, "nowhere.example.com").unwrap_err();
+        assert!(
+            err.to_string().contains("could not be resolved"),
+            "got: {}",
+            err
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn connect_resolver_allows_public_hostname() -> Result<()> {
+        let guard = guard_with_dns(vec!["93.184.216.34".parse().unwrap()]);
+        let addrs = block_on_resolve(&guard, "public.example.com")?;
+        assert_eq!(addrs, vec!["93.184.216.34".parse::<IpAddr>().unwrap()]);
+        Ok(())
+    }
+
+    #[test]
+    fn connect_resolver_pins_all_validated_answers() -> Result<()> {
+        let guard = guard_with_dns(vec![
+            "93.184.216.34".parse().unwrap(),
+            "8.8.8.8".parse().unwrap(),
+        ]);
+        let addrs = block_on_resolve(&guard, "multi.example.com")?;
+        assert_eq!(addrs.len(), 2);
+        assert!(addrs.contains(&"93.184.216.34".parse().unwrap()));
+        assert!(addrs.contains(&"8.8.8.8".parse().unwrap()));
+        Ok(())
+    }
+
+    #[test]
+    fn connect_resolver_allows_ip_literal_without_dns() -> Result<()> {
+        let guard = guard_with_dns(vec![]);
+        let addrs = block_on_resolve(&guard, "93.184.216.34")?;
+        assert_eq!(addrs, vec!["93.184.216.34".parse::<IpAddr>().unwrap()]);
         Ok(())
     }
 }
