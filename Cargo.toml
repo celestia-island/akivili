@@ -6,6 +6,7 @@ default-members = [
 ]
 
 members = [
+    "packages/guard",
     "packages/plugin_host",
     "packages/iepl",
 ]

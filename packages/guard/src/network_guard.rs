@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use super::{AdapterError, AdapterResult};
+use crate::{AdapterError, AdapterResult};
 
 const ALLOWED_SCHEMES: &[&str] = &["http", "https"];
 const CLOUD_METADATA_HOSTS: &[&str] = &[

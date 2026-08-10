@@ -1,0 +1,20 @@
+[package]
+name = "akivili_guard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+license-file.workspace = true
+description = "Egress network guard — URL/IP policy enforcement with DNS-rebinding-safe resolution"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+reqwest.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

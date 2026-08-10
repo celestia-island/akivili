@@ -11,6 +11,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+akivili_guard = { path = "../guard" }
 akivili_iepl = { path = "../iepl" }
 plana_domain_skills = { git = "https://github.com/celestia-island/plana.git", branch = "master" }
 plana_infra_utils = { git = "https://github.com/celestia-island/plana.git", branch = "master" }
