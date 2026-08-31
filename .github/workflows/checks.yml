@@ -24,7 +24,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         # akivili has no git mirror yet; keep the default rewrite rules off.
         fetch-depth: 0
