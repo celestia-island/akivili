@@ -34,6 +34,52 @@
 //!    the disk store) via [`Registry::register_local`], the analogue of the
 //!    plugin host's `registerMcpTool` family.
 //!
+//! The host's whole startup, in three steps — open, feed an acceptance,
+//! then load each fed item and unload it when done:
+//!
+//! ```
+//! use std::fs;
+//! use akivili_registry::{HostAcceptance, Registry, ResourceKind};
+//!
+//! // A plugin store: one subdirectory per plugin, manifest inside.
+//! let dir = tempfile::tempdir().unwrap();
+//! let plugin = dir.path().join("acmestyle");
+//! fs::create_dir_all(&plugin).unwrap();
+//! fs::write(
+//!     plugin.join("akivili.plugin.toml"),
+//!     r#"
+//! id = "acmestyle"
+//! version = "1.0.0"
+//! provider = "acme"
+//!
+//! [[resources]]
+//! kind = "webui.style"
+//! order = 1
+//!
+//! [resources.payload.Inline]
+//! body = "serif"
+//! "#,
+//! )
+//! .unwrap();
+//!
+//! // 1) open: scan the store and start the audit log (fail-loud).
+//! let registry = Registry::open(dir.path(), &dir.path().join("audit.jsonl")).unwrap();
+//! // 2) feed the host's acceptance: an ordered, resolved resource series.
+//! let feed = registry
+//!     .feed(&HostAcceptance::new(
+//!         "webui",
+//!         vec![ResourceKind::new("webui.style").unwrap()],
+//!     ))
+//!     .unwrap();
+//! // 3) load each fed item, apply it, then unload.
+//! for item in feed.iter() {
+//!     let handle = registry.load(&item.plugin_id, item.entry_index).unwrap();
+//!     // ... apply the resource in the host ...
+//!     handle.unload().unwrap();
+//! }
+//! assert_eq!(feed.len(), 1);
+//! ```
+//!
 //! The v1 API is synchronous (`std::fs`) on purpose: the IO volume is tiny
 //! and avoiding tokio keeps the crate consumable from any runtime.
 

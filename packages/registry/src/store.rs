@@ -101,7 +101,7 @@ impl EnabledState {
 }
 
 /// Hex-encodes the SHA-256 digest of `bytes`.
-pub fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
     let digest = Sha256::digest(bytes);

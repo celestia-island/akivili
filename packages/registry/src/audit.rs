@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{RegistryError, RegistryResult};
 
 /// Seconds since the Unix epoch, the audit timestamp unit.
-pub fn unix_secs() -> u64 {
+pub(crate) fn unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
