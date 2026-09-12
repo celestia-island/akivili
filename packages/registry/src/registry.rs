@@ -70,7 +70,33 @@ impl Registry {
     /// persisted enable/disable state. Fail-loud: an unopenable audit log
     /// or an unreadable store root is an error, never a silent empty
     /// registry.
+    ///
+    /// The scan replay is the right default for host processes, which
+    /// open once: the replay leaves a trace of every scan that fed the
+    /// process. Read-only lookups that may run repeatedly (the CLI's
+    /// `list`) should prefer [`Registry::open_quiet`] so they do not
+    /// grow the audit log on every invocation.
     pub fn open(store_dir: &Path, audit_path: &Path) -> RegistryResult<Self> {
+        Self::open_impl(store_dir, audit_path, true)
+    }
+
+    /// Opens the registry quietly: the same scan, the same persisted
+    /// enable/disable state, and the same fail-loud errors as
+    /// [`Registry::open`] — but the scan is **not** replayed into the
+    /// audit log, so a read-only open appends nothing.
+    ///
+    /// Everything the returned registry does afterwards (toggle, feed,
+    /// load, unload, failures) audits exactly as with `open`; only the
+    /// open-time `discovered`/`validated`/`rejected` replay is skipped.
+    pub fn open_quiet(store_dir: &Path, audit_path: &Path) -> RegistryResult<Self> {
+        Self::open_impl(store_dir, audit_path, false)
+    }
+
+    fn open_impl(
+        store_dir: &Path,
+        audit_path: &Path,
+        audit_scan_replay: bool,
+    ) -> RegistryResult<Self> {
         let audit = AuditLog::open(audit_path)?;
         let inner = Arc::new(RegistryInner::from_audit(audit));
 
@@ -83,31 +109,35 @@ impl Registry {
         for result in scan {
             match result {
                 ScanResult::Accepted(record) => {
-                    inner.append_audit(AuditEvent::Discovered {
-                        ts: unix_secs(),
-                        source: record.dir.display().to_string(),
-                        plugin_id: Some(record.manifest.id.clone()),
-                    })?;
-                    inner.append_audit(AuditEvent::Validated {
-                        ts: unix_secs(),
-                        plugin_id: record.manifest.id.clone(),
-                        version: Some(record.manifest.version.clone()),
-                        resources: record.manifest.resources.len(),
-                    })?;
+                    if audit_scan_replay {
+                        inner.append_audit(AuditEvent::Discovered {
+                            ts: unix_secs(),
+                            source: record.dir.display().to_string(),
+                            plugin_id: Some(record.manifest.id.clone()),
+                        })?;
+                        inner.append_audit(AuditEvent::Validated {
+                            ts: unix_secs(),
+                            plugin_id: record.manifest.id.clone(),
+                            version: Some(record.manifest.version.clone()),
+                            resources: record.manifest.resources.len(),
+                        })?;
+                    }
                     records.push(record);
                 }
                 ScanResult::Rejected(rejection) => {
-                    inner.append_audit(AuditEvent::Discovered {
-                        ts: unix_secs(),
-                        source: rejection.dir.display().to_string(),
-                        plugin_id: rejection.plugin_id.clone(),
-                    })?;
-                    inner.append_audit(AuditEvent::Rejected {
-                        ts: unix_secs(),
-                        source: rejection.dir.display().to_string(),
-                        plugin_id: rejection.plugin_id.clone(),
-                        reason: rejection.reason.clone(),
-                    })?;
+                    if audit_scan_replay {
+                        inner.append_audit(AuditEvent::Discovered {
+                            ts: unix_secs(),
+                            source: rejection.dir.display().to_string(),
+                            plugin_id: rejection.plugin_id.clone(),
+                        })?;
+                        inner.append_audit(AuditEvent::Rejected {
+                            ts: unix_secs(),
+                            source: rejection.dir.display().to_string(),
+                            plugin_id: rejection.plugin_id.clone(),
+                            reason: rejection.reason.clone(),
+                        })?;
+                    }
                     rejections.push(rejection);
                 }
             }
@@ -604,6 +634,55 @@ body = "monospace"
     }
 
     #[test]
+    fn quiet_open_skips_the_scan_replay_but_still_scans() {
+        let store = TestStore::new();
+        store.add_plugin("alpha", ALPHA, &[("style.css", "body{}\n")]);
+        store.add_plugin("bad", "not = \"a manifest\"\n", &[]);
+
+        let registry = Registry::open_quiet(store.store_dir(), &store.audit_path()).unwrap();
+        // The scan itself still ran, rejections included.
+        assert_eq!(registry.plugins().len(), 1);
+        assert_eq!(registry.rejections().len(), 1);
+
+        // But the audit log carries no discovered/validated/rejected
+        // events for this open — nothing at all, in fact.
+        let events = store.audit_events();
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                AuditEvent::Discovered { .. }
+                    | AuditEvent::Validated { .. }
+                    | AuditEvent::Rejected { .. }
+            )),
+            "quiet open must not replay the scan: {events:?}"
+        );
+        assert!(events.is_empty(), "quiet open writes nothing: {events:?}");
+
+        // Later operations still audit as usual.
+        registry
+            .feed(&HostAcceptance::new("webui", style_style()))
+            .unwrap();
+        assert!(
+            store
+                .audit_events()
+                .iter()
+                .any(|e| matches!(e, AuditEvent::Fed { .. })),
+            "post-open operations must still audit"
+        );
+    }
+
+    #[test]
+    fn quiet_open_still_fails_loud_on_missing_store() {
+        let store = TestStore::new();
+        let missing = store.root.path().join("missing-store");
+        let err = Registry::open_quiet(&missing, &store.audit_path()).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot read plugin store"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
     fn feed_filters_by_accepted_kind() {
         let store = TestStore::new();
         store.add_plugin("alpha", ALPHA, &[("style.css", "body{}\n")]);
@@ -838,7 +917,7 @@ sha256 = "{}"
             .unwrap();
         let item = feed.iter().next().unwrap().clone();
         let handle = registry.load(&item.plugin_id, item.entry_index).unwrap();
-        let handle_id = handle.id();
+        let handle_id = handle.id().expect("live handle carries its id");
         handle.unload().unwrap();
 
         let events = store.audit_events();
@@ -862,7 +941,7 @@ sha256 = "{}"
 
         let registry = store.open();
         let handle = registry.load("beta", 0).unwrap();
-        let handle_id = handle.id();
+        let handle_id = handle.id().expect("live handle carries its id");
         drop(handle);
 
         let events = store.audit_events();

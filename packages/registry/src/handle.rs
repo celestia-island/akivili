@@ -66,20 +66,22 @@ impl ResourceHandle {
         }
     }
 
-    /// The handle's registry-unique id (monotonic, never reused).
-    pub fn id(&self) -> u64 {
-        self.info.as_ref().map(|i| i.id).unwrap_or(0)
+    /// The handle's registry-unique id (monotonic, never reused), or
+    /// `None` once the handle has been unloaded or dropped — the
+    /// identity is taken on release, and a spent handle reports no
+    /// dummy values.
+    pub fn id(&self) -> Option<u64> {
+        self.info.as_ref().map(|i| i.id)
     }
 
-    /// The plugin (or runtime provider) the resource belongs to.
-    pub fn plugin_id(&self) -> &str {
-        self.info
-            .as_ref()
-            .map(|i| i.plugin_id.as_str())
-            .unwrap_or("")
+    /// The plugin (or runtime provider) the resource belongs to, or
+    /// `None` once the handle has been unloaded or dropped.
+    pub fn plugin_id(&self) -> Option<&str> {
+        self.info.as_ref().map(|i| i.plugin_id.as_str())
     }
 
-    /// The resource kind.
+    /// The resource kind, or `None` once the handle has been unloaded
+    /// or dropped.
     pub fn kind(&self) -> Option<&ResourceKind> {
         self.info.as_ref().map(|i| &i.kind)
     }
@@ -181,8 +183,12 @@ mod tests {
         let inner = inner_with_log(&path);
 
         let handle = ResourceHandle::new(inner.clone(), sample_info(1));
-        assert_eq!(handle.id(), 1);
-        assert_eq!(handle.plugin_id(), "acme");
+        assert_eq!(handle.id(), Some(1));
+        assert_eq!(handle.plugin_id(), Some("acme"));
+        assert_eq!(
+            handle.kind(),
+            Some(&ResourceKind::new(crate::kinds::WEBUI_STYLE).unwrap())
+        );
         handle.unload().unwrap();
 
         let events = read_events(&path);
@@ -225,6 +231,32 @@ mod tests {
             }
             other => panic!("expected Unloaded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn spent_handle_accessors_report_none() {
+        // The exact state `unload`/`Drop` leave behind: the identity
+        // taken, the shell still dropping silently. A spent handle must
+        // not fabricate dummy values, and its final drop must not audit
+        // a second unload event.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jsonl");
+        let inner = inner_with_log(&path);
+
+        let spent = ResourceHandle {
+            info: None,
+            inner: inner.clone(),
+        };
+        assert_eq!(spent.id(), None);
+        assert_eq!(spent.plugin_id(), None);
+        assert!(spent.kind().is_none());
+        drop(spent);
+
+        let events = read_events(&path);
+        assert!(
+            events.is_empty(),
+            "dropping a spent handle must not audit: {events:?}"
+        );
     }
 
     #[test]

@@ -14,7 +14,10 @@
 //!
 //! `--store` defaults to `./plugins`; `--audit` defaults to
 //! `<store>/registry-audit.jsonl`. `check` exits non-zero exactly when the
-//! scan produced rejections.
+//! scan produced rejections. `list` opens the registry quietly (no scan
+//! replay into the audit log); `check`/`enable`/`disable` keep the full
+//! open, so management actions leave their scan trail. `audit` reads the
+//! log directly and never opens the registry at all.
 
 use std::path::{Path, PathBuf};
 
@@ -216,8 +219,10 @@ fn run_inner(args: &[String]) -> Result<i32, String> {
         .ok_or_else(|| "missing command".to_string())?;
     match command.as_str() {
         "list" => {
-            let registry =
-                Registry::open(&paths.store_dir, &paths.audit_path).map_err(|e| e.to_string())?;
+            // Read-only: quiet open scans without replaying scan events
+            // into the audit log, so listing does not grow the trail.
+            let registry = Registry::open_quiet(&paths.store_dir, &paths.audit_path)
+                .map_err(|e| e.to_string())?;
             print!("{}", format_plugin_table(registry.plugins()));
             Ok(0)
         }
@@ -446,6 +451,24 @@ primary = "#181825"
         // unknown command / missing command are usage errors
         assert_eq!(run(&args(&["frobnicate"])), 2);
         assert_eq!(run(&args(&[])), 2);
+    }
+
+    #[test]
+    fn run_list_is_read_only_on_the_audit_log() {
+        let fixture = Fixture::new();
+        fixture.add_plugin("acmetheme", GOOD);
+
+        let args = vec![
+            "--store".to_string(),
+            fixture.store_dir().display().to_string(),
+            "--audit".to_string(),
+            fixture.audit_path().display().to_string(),
+            "list".to_string(),
+        ];
+        assert_eq!(run(&args), 0);
+
+        let text = std::fs::read_to_string(fixture.audit_path()).unwrap_or_default();
+        assert!(text.is_empty(), "list must not write audit events: {text}");
     }
 
     #[test]

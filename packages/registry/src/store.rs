@@ -119,7 +119,8 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// parseable, id/version syntax valid, every `File` payload present in the
 /// plugin directory, every declared `sha256` matching the actual file
 /// content, and the plugin id not already taken by an earlier directory
-/// (subdirectories are visited in name order, so "first directory wins").
+/// (subdirectories are visited in name order, so the first **valid**
+/// directory wins — see the duplicate check in `validate_dir`).
 /// Any failure rejects that directory only — the scan always reports the
 /// whole store.
 pub fn scan(root: &Path, state: &EnabledState) -> RegistryResult<Vec<ScanResult>> {
@@ -184,6 +185,12 @@ fn validate_dir(dir: &Path, seen: &HashMap<String, PathBuf>) -> Result<PluginMan
         return Err(reject(Some(manifest.id), e.to_string()));
     }
 
+    // Duplicate-id rule: first **valid** wins. Only accepted directories
+    // register their id in `seen` (see the insert in `scan`), so an
+    // earlier directory rejected for its own faults never poisons the
+    // id — a later valid directory may still claim it. A directory whose
+    // id is already taken by a valid plugin is `Rejected`, with the
+    // reason naming the winning directory.
     if let Some(first) = seen.get(&manifest.id) {
         return Err(reject(
             Some(manifest.id.clone()),

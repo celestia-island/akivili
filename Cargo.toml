@@ -3,6 +3,7 @@ resolver = "2"
 
 default-members = [
     "packages/plugin_host",
+    "packages/registry",
 ]
 
 members = [
