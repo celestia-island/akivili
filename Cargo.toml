@@ -3,16 +3,18 @@ resolver = "2"
 
 default-members = [
     "packages/plugin_host",
+    "packages/registry",
 ]
 
 members = [
     "packages/guard",
     "packages/plugin_host",
     "packages/iepl",
+    "packages/registry",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.91"
 authors = ["langyo <langyo.china@gmail.com>"]
@@ -33,10 +35,12 @@ reqwest = { version = "^0.13", default-features = false, features = ["rustls-no-
 rustls = { version = "^0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 serde = { version = "^1", features = ["derive"] }
 serde_json = "^1"
+sha2 = "^0.10"
 swc_core = "^40"
 tempfile = "^3"
 thiserror = "^2"
 tokio = { version = "^1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "io-util", "fs", "sync", "signal", "process"] }
+toml = "^0.8"
 tracing = { version = "^0.1", features = ["log"] }
 url = "^2"
 
