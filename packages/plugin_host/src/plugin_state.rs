@@ -159,6 +159,15 @@ pub trait TriggerDispatcherHolder: Send + Sync {
     fn register_subscription(&self, sub: TriggerSubscription);
 }
 
+/// Host-side capabilities exposed to plugin scripts through the
+/// `dispatch(...)` tool.
+///
+/// Implementations are invoked from plugin evaluation threads —
+/// including the bare `TsPluginPool` workers, which run without any
+/// ambient tokio runtime. Blocking implementations must bridge async
+/// work through `HostFunctions::host_block_on` (or stay fully
+/// synchronous) and must never call `Handle::current()` or
+/// `block_in_place` directly.
 pub trait HostApiProvider: Send + Sync + 'static {
     fn http_request(
         &self,
@@ -295,7 +304,25 @@ impl HostFunctions {
     ///   drives the future from the calling thread. `Runtime::block_on`
     ///   is legal on any thread that is not itself inside an async
     ///   execution context, and several bare threads sharing this
-    ///   `HostFunctions` may enter it concurrently.
+    ///   `HostFunctions` may enter it concurrently — tokio documents
+    ///   concurrent `block_on` on the current-thread scheduler (the
+    ///   first caller owns the IO/timer drivers, later ones hook into
+    ///   them).
+    ///
+    /// Boundaries to respect when extending this:
+    ///
+    /// - Never call this from within a future it drives: the nested
+    ///   call would see the fallback runtime via `try_current`, take
+    ///   the `block_in_place` branch, and panic — that helper requires
+    ///   a multi-thread runtime.
+    /// - The fallback spawns no resident threads (the current-thread
+    ///   flavor has no workers); only DNS resolution, which the guard
+    ///   runs through `spawn_blocking`, creates transient pool threads
+    ///   that tokio retires after their keep-alive.
+    /// - The fallback runtime is dropped with the last `HostFunctions`
+    ///   `Arc`, and tokio panics when a runtime is dropped inside an
+    ///   async context — release the final `Arc` from synchronous code
+    ///   (pool workers and process teardown do exactly that).
     pub(crate) fn host_block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             return tokio::task::block_in_place(|| handle.block_on(fut));

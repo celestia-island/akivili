@@ -135,6 +135,11 @@ fn native_dispatch_wrapper(
     }
 }
 
+/// Routes one `dispatch(tool, params)` call from plugin script to the
+/// host API. Runs on whatever thread evaluates the plugin — bare
+/// `TsPluginPool` workers included — so any new arm needing async work
+/// must go through `api.host_block_on(...)` instead of
+/// `Handle::current()`/`block_in_place`.
 fn dispatch_host_fn(
     api: &Arc<HostFunctions>,
     plugin_name: &str,
@@ -1109,6 +1114,91 @@ var handleRequest = function(m, p, h, b) {{
             assert_eq!(resp["body"], "pong");
 
             server.join().expect("test server thread must not panic");
+            Ok(())
+        }
+
+        /// Pins the documented concurrency contract of the shared
+        /// current-thread fallback, including the IO-driver hand-off:
+        /// the server holds every response until four connections are
+        /// pending at once, which is only reachable when the four
+        /// bare-thread futures are driven concurrently — a serialized
+        /// fallback would recycle one keep-alive connection and never
+        /// open four.
+        #[test]
+        fn concurrent_bare_http_requests_share_the_fallback_runtime() -> Result<()> {
+            const CLIENTS: usize = 4;
+
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let port = listener.local_addr()?.port();
+            listener.set_nonblocking(true)?;
+            let server = std::thread::spawn(move || {
+                let mut streams = Vec::new();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while streams.len() < CLIENTS && std::time::Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((stream, _)) => streams.push(stream),
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("test server accept failed: {}", e),
+                    }
+                }
+                let concurrent_conns = streams.len();
+                for mut stream in streams {
+                    let _ = stream.set_nonblocking(false);
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\npong");
+                }
+                concurrent_conns
+            });
+
+            let guard =
+                crate::guard::NetworkGuard::new(crate::guard::NetworkGuardPolicy::permissive())
+                    .with_resolver(Arc::new(|_: &str| vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]));
+            let host_api = Arc::new(HostFunctions::new().with_network_guard(guard));
+
+            let threads: Vec<_> = (0..CLIENTS)
+                .map(|i| {
+                    let api = host_api.clone();
+                    let script = format!(
+                        r#"
+var handleRequest = function(m, p, h, b) {{
+    return JSON.stringify(dispatch("http-request", {{ method: "GET", url: "http://local.test:{}/" }}));
+}};
+"#,
+                        port
+                    );
+                    let plugin_name = format!("bare-concurrent-http-{}", i);
+                    std::thread::Builder::new()
+                        .name(plugin_name.clone())
+                        .spawn(move || {
+                            let data =
+                                TsPluginData::new(&plugin_name, &script, TsLanguage::JavaScript);
+                            let mut plugin = TsPlugin::create_and_load(api, &data)?;
+                            plugin.handle_request("POST", "/bare", "{}", "{}")
+                        })
+                        .expect("spawn concurrent bare http thread")
+                })
+                .collect();
+
+            for t in threads {
+                let out = t
+                    .join()
+                    .expect("concurrent bare http thread must not panic")?;
+                let parsed: Value = serde_json::from_str(&out)?;
+                assert_eq!(parsed["success"], true, "got: {}", out);
+                let resp: Value =
+                    serde_json::from_str(parsed["response"].as_str().unwrap_or_default())?;
+                assert_eq!(resp["status"], 200);
+                assert_eq!(resp["body"], "pong");
+            }
+
+            let concurrent_conns = server.join().expect("test server thread must not panic");
+            assert_eq!(
+                concurrent_conns, CLIENTS,
+                "the fallback runtime must drive the four bare-thread requests concurrently"
+            );
             Ok(())
         }
 
