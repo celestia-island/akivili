@@ -371,6 +371,21 @@ order = 40
 path = "env.json"
 "#;
 
+    /// zeta: an empty variable name (skipped entry) next to a valid one.
+    const ZETA: &str = r#"
+id = "zeta"
+version = "1.0.0"
+provider = "test"
+
+[[resources]]
+kind = "sandbox.env"
+order = 50
+
+[resources.payload.Inline]
+"" = "empty-name-value"
+AKIVILI_ZETA_OK = "yes"
+"#;
+
     #[test]
     fn multi_plugin_env_merges_with_feed_order_precedence() {
         let store = TestStore::new();
@@ -411,6 +426,25 @@ path = "env.json"
             "file payload must be skipped: {env:?}"
         );
         assert_eq!(env.len(), 3, "alpha's two + gamma's one: {env:?}");
+    }
+
+    #[test]
+    fn empty_name_variables_are_skipped_without_poisoning_the_batch() {
+        let store = TestStore::new();
+        store.add_plugin("alpha", ALPHA);
+        store.add_plugin("zeta", ZETA);
+
+        let feed = SandboxEnvFeed::open(store.store_dir(), &store.audit_path()).unwrap();
+        let env = feed.env();
+        assert!(
+            !env.contains_key(""),
+            "the empty-name variable must be skipped: {env:?}"
+        );
+        assert_eq!(
+            env["AKIVILI_ZETA_OK"], "yes",
+            "the valid entry in the same resource must survive"
+        );
+        assert_eq!(env.len(), 3, "alpha's two + zeta's one: {env:?}");
     }
 
     #[test]
