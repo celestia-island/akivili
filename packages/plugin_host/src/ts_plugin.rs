@@ -201,10 +201,7 @@ fn dispatch_host_fn(
         }
         "kv-get" => {
             let key = params["key"].as_str().unwrap_or("").to_string();
-            let result = tokio::task::block_in_place(|| {
-                let handle = tokio::runtime::Handle::current();
-                handle.block_on(api.kv_get(&key))
-            });
+            let result = api.host_block_on(api.kv_get(&key));
             match result {
                 Some(v) => PluginResult::with_value(serde_json::Value::String(v)),
                 None => PluginResult::with_value(serde_json::Value::Null),
@@ -213,10 +210,7 @@ fn dispatch_host_fn(
         "kv-set" => {
             let key = params["key"].as_str().unwrap_or("").to_string();
             let value = params["value"].as_str().unwrap_or("").to_string();
-            tokio::task::block_in_place(|| {
-                let handle = tokio::runtime::Handle::current();
-                handle.block_on(api.kv_set(&key, &value))
-            });
+            api.host_block_on(api.kv_set(&key, &value));
             PluginResult::ok()
         }
         "register-mcp-tool" => {
@@ -987,5 +981,252 @@ var onMessage = function(platform, message) {
             Ok::<(), Error>(())
         })?;
         Ok(())
+    }
+
+    /// Bare-thread host-API coverage (#19 follow-up): `TsPluginPool`
+    /// workers are plain `std::thread::Builder` threads with no ambient
+    /// tokio runtime, so every blocking host API must survive the full
+    /// plugin dispatch path on such a thread. Each test below drives one
+    /// of the `block_on`-backed host APIs through a real plugin
+    /// evaluation, exactly like `worker_loop` does (create, load, handle
+    /// one request), with no runtime entered anywhere in the process.
+    mod bare_thread_host_apis {
+        use super::*;
+        use async_trait::async_trait;
+        use plana_domain_skills::llm_subcall::{LlmSubcallResult, LlmSubcallService};
+        use plana_infra_utils::pubsub::{PubSubBus, PubSubEvent};
+        use plana_state_sync::{Agent, ModelTier};
+        use serde_json::Value;
+        use std::io::{Read, Write};
+        use std::net::{IpAddr, Ipv4Addr, TcpListener};
+        use tokio::sync::broadcast;
+
+        /// Runs one plugin dispatch on a bare `std::thread`, mirroring
+        /// `TsPluginPool`'s worker loop (`create_and_load` then
+        /// `handle_request`) — no tokio runtime is entered anywhere.
+        fn eval_on_bare_thread(
+            host_api: Arc<HostFunctions>,
+            plugin_name: &str,
+            script: &str,
+        ) -> Result<String> {
+            let data = TsPluginData::new(plugin_name, script, TsLanguage::JavaScript);
+            std::thread::Builder::new()
+                .name(format!("bare-worker-{}", plugin_name))
+                .spawn(move || {
+                    let mut plugin = TsPlugin::create_and_load(host_api, &data)?;
+                    plugin.handle_request("POST", "/bare", "{}", "{}")
+                })
+                .expect("bare worker thread spawn failed")
+                .join()
+                .expect("host API call on the bare worker thread must not panic")
+        }
+
+        struct RecordingBus {
+            published: Mutex<Vec<(String, Value)>>,
+        }
+
+        #[async_trait]
+        impl PubSubBus for RecordingBus {
+            async fn publish(&self, topic: &str, payload: Value) {
+                self.published
+                    .lock()
+                    .unwrap()
+                    .push((topic.to_string(), payload));
+            }
+
+            async fn subscribe(&self, _pattern: &str) -> broadcast::Receiver<PubSubEvent> {
+                broadcast::channel(1).1
+            }
+
+            fn subscriber_count(&self, _topic: &str) -> usize {
+                0
+            }
+        }
+
+        struct EchoLlm;
+
+        #[async_trait]
+        impl LlmSubcallService for EchoLlm {
+            async fn llm_chat(
+                &self,
+                _tier: ModelTier,
+                prompt: &str,
+                _system_prompt: Option<&str>,
+                _max_tokens: Option<u32>,
+                _temperature: Option<f32>,
+            ) -> LlmSubcallResult {
+                LlmSubcallResult {
+                    success: true,
+                    content: format!("echo:{}", prompt),
+                    model_name: None,
+                    token_usage: None,
+                }
+            }
+
+            fn record_token_usage(
+                &self,
+                _agent_id: &str,
+                _agent_type: Agent,
+                _model_name: Option<&str>,
+                _input_tokens: u32,
+                _output_tokens: u32,
+            ) {
+            }
+        }
+
+        #[test]
+        fn http_request_works_on_a_bare_worker_thread() -> Result<()> {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let port = listener.local_addr()?.port();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("test server accept");
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\npong")
+                    .expect("test server write");
+            });
+
+            let guard =
+                crate::guard::NetworkGuard::new(crate::guard::NetworkGuardPolicy::permissive())
+                    .with_resolver(Arc::new(|_: &str| vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]));
+            let host_api = Arc::new(HostFunctions::new().with_network_guard(guard));
+
+            let script = format!(
+                r#"
+var handleRequest = function(m, p, h, b) {{
+    return JSON.stringify(dispatch("http-request", {{ method: "GET", url: "http://local.test:{}/" }}));
+}};
+"#,
+                port
+            );
+            let out = eval_on_bare_thread(host_api, "bare-http", &script)?;
+            let parsed: Value = serde_json::from_str(&out)?;
+            assert_eq!(parsed["success"], true, "got: {}", out);
+            let resp: Value =
+                serde_json::from_str(parsed["response"].as_str().unwrap_or_default())?;
+            assert_eq!(resp["status"], 200);
+            assert_eq!(resp["body"], "pong");
+
+            server.join().expect("test server thread must not panic");
+            Ok(())
+        }
+
+        #[test]
+        fn forward_event_works_on_a_bare_worker_thread() -> Result<()> {
+            let bus = Arc::new(RecordingBus {
+                published: Mutex::new(Vec::new()),
+            });
+            let host_api =
+                Arc::new(HostFunctions::new().with_pubsub_bus(bus.clone() as Arc<dyn PubSubBus>));
+
+            let out = eval_on_bare_thread(
+                host_api,
+                "bare-forward",
+                r#"
+var handleRequest = function(m, p, h, b) {
+    return JSON.stringify(dispatch("forward-event", {
+        event: JSON.stringify({ topic: "bare.topic", payload: { kind: "tick" } })
+    }));
+};
+"#,
+            )?;
+            let parsed: Value = serde_json::from_str(&out)?;
+            assert_eq!(parsed["success"], true, "got: {}", out);
+
+            let published = bus.published.lock().unwrap();
+            assert_eq!(published.len(), 1);
+            assert_eq!(published[0].0, "bare.topic");
+            assert_eq!(published[0].1["kind"], "tick");
+            Ok(())
+        }
+
+        #[test]
+        fn query_ai_works_on_a_bare_worker_thread() -> Result<()> {
+            let host_api = Arc::new(
+                HostFunctions::new()
+                    .with_llm_service(Arc::new(EchoLlm) as Arc<dyn LlmSubcallService>),
+            );
+
+            let out = eval_on_bare_thread(
+                host_api,
+                "bare-query-ai",
+                r#"
+var handleRequest = function(m, p, h, b) {
+    return JSON.stringify(dispatch("query-ai", { message: "ping", context: "ctx" }));
+};
+"#,
+            )?;
+            let parsed: Value = serde_json::from_str(&out)?;
+            assert_eq!(parsed["success"], true, "got: {}", out);
+            assert_eq!(parsed["response"], "echo:ping");
+            Ok(())
+        }
+
+        #[test]
+        fn config_get_works_on_a_bare_worker_thread() -> Result<()> {
+            let config = [("plugin.mode".to_string(), "fast".to_string())]
+                .into_iter()
+                .collect();
+            let host_api = Arc::new(HostFunctions::new().with_config(config));
+
+            let out = eval_on_bare_thread(
+                host_api,
+                "bare-config",
+                r#"
+var handleRequest = function(m, p, h, b) {
+    return JSON.stringify(dispatch("config-get", { key: "plugin.mode" }));
+};
+"#,
+            )?;
+            let parsed: Value = serde_json::from_str(&out)?;
+            assert_eq!(parsed["success"], true, "got: {}", out);
+            assert_eq!(parsed["value"], "fast");
+            Ok(())
+        }
+
+        /// Several pool workers share one `HostFunctions` (and therefore
+        /// its host runtime): concurrent full-path dispatches from bare
+        /// threads must all complete.
+        #[test]
+        fn concurrent_bare_threads_share_the_host_api() -> Result<()> {
+            let config = [("shared.key".to_string(), "yes".to_string())]
+                .into_iter()
+                .collect();
+            let host_api = Arc::new(HostFunctions::new().with_config(config));
+
+            let threads: Vec<_> = (0..4)
+                .map(|i| {
+                    let api = host_api.clone();
+                    std::thread::Builder::new()
+                        .name(format!("bare-shared-{}", i))
+                        .spawn(move || {
+                            let data = TsPluginData::new(
+                                "bare-shared",
+                                r#"
+var handleRequest = function(m, p, h, b) {
+    dispatch("kv-set", { key: "n", value: "v" });
+    var cfg = dispatch("config-get", { key: "shared.key" });
+    var kv = dispatch("kv-get", { key: "n" });
+    return JSON.stringify({ cfg: cfg.value, kv: kv.value });
+};
+"#,
+                                TsLanguage::JavaScript,
+                            );
+                            let mut plugin = TsPlugin::create_and_load(api, &data)?;
+                            plugin.handle_request("POST", "/bare", "{}", "{}")
+                        })
+                        .expect("spawn shared bare thread")
+                })
+                .collect();
+
+            for t in threads {
+                let out = t.join().expect("shared bare thread must not panic")?;
+                let parsed: Value = serde_json::from_str(&out)?;
+                assert_eq!(parsed["cfg"], "yes", "got: {}", out);
+                assert_eq!(parsed["kv"], "v", "got: {}", out);
+            }
+            Ok(())
+        }
     }
 }
