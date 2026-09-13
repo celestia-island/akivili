@@ -1,7 +1,10 @@
 use anyhow::{Result, anyhow, bail};
 use parking_lot::Mutex;
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 use tokio::sync::RwLock;
 
 use tracing::info;
@@ -156,6 +159,15 @@ pub trait TriggerDispatcherHolder: Send + Sync {
     fn register_subscription(&self, sub: TriggerSubscription);
 }
 
+/// Host-side capabilities exposed to plugin scripts through the
+/// `dispatch(...)` tool.
+///
+/// Implementations are invoked from plugin evaluation threads —
+/// including the bare `TsPluginPool` workers, which run without any
+/// ambient tokio runtime. Blocking implementations must bridge async
+/// work through `HostFunctions::host_block_on` (or stay fully
+/// synchronous) and must never call `Handle::current()` or
+/// `block_in_place` directly.
 pub trait HostApiProvider: Send + Sync + 'static {
     fn http_request(
         &self,
@@ -192,6 +204,17 @@ pub struct HostFunctions {
     /// rather than tokio's because plugin contexts are created on plain
     /// worker threads (outside any async runtime).
     sandbox_env: Arc<parking_lot::RwLock<HashMap<String, String>>>,
+    /// Dedicated async driver for blocking host-API calls made from bare
+    /// plugin worker threads. Plugin contexts evaluate on plain
+    /// `std::thread::Builder` pool workers (see
+    /// [`crate::plugin_router::TsPluginPool`]) and on `spawn_blocking`
+    /// loader threads. An ambient runtime, when one exists, is preferred
+    /// (see [`HostFunctions::host_block_on`]); this lazily built
+    /// current-thread runtime is the fallback for threads with no
+    /// ambient runtime at all, where the former
+    /// [`tokio::task::block_in_place`] + [`tokio::runtime::Handle::current`]
+    /// pair panicked.
+    host_rt: OnceLock<tokio::runtime::Runtime>,
 }
 
 impl Default for HostFunctions {
@@ -215,6 +238,7 @@ impl HostFunctions {
             llm_service: None,
             trigger_dispatcher: None,
             sandbox_env: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            host_rt: OnceLock::new(),
         }
     }
 
@@ -264,6 +288,54 @@ impl HostFunctions {
         self.sandbox_env.read().clone()
     }
 
+    /// Drives `fut` to completion for a blocking host-API call.
+    ///
+    /// Two regimes, so no calling context regresses versus the former
+    /// `tokio::task::block_in_place` + `Handle::current().block_on`
+    /// pair:
+    ///
+    /// - With an ambient runtime (async workers of a multi-thread
+    ///   runtime, `spawn_blocking` threads) the legacy path is kept:
+    ///   `block_in_place` legally parks such callers and the future
+    ///   runs on the caller's own runtime.
+    /// - On bare plugin worker threads — the `TsPluginPool` case, which
+    ///   has no ambient runtime and where the legacy pair panicked — a
+    ///   dedicated current-thread runtime is built on first use and
+    ///   drives the future from the calling thread. `Runtime::block_on`
+    ///   is legal on any thread that is not itself inside an async
+    ///   execution context, and several bare threads sharing this
+    ///   `HostFunctions` may enter it concurrently — tokio documents
+    ///   concurrent `block_on` on the current-thread scheduler (the
+    ///   first caller owns the IO/timer drivers, later ones hook into
+    ///   them).
+    ///
+    /// Boundaries to respect when extending this:
+    ///
+    /// - Never call this from within a future it drives: the nested
+    ///   call would see the fallback runtime via `try_current`, take
+    ///   the `block_in_place` branch, and panic — that helper requires
+    ///   a multi-thread runtime.
+    /// - The fallback spawns no resident threads (the current-thread
+    ///   flavor has no workers); only DNS resolution, which the guard
+    ///   runs through `spawn_blocking`, creates transient pool threads
+    ///   that tokio retires after their keep-alive.
+    /// - The fallback runtime is dropped with the last `HostFunctions`
+    ///   `Arc`, and tokio panics when a runtime is dropped inside an
+    ///   async context — release the final `Arc` from synchronous code
+    ///   (pool workers and process teardown do exactly that).
+    pub(crate) fn host_block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            return tokio::task::block_in_place(|| handle.block_on(fut));
+        }
+        let rt = self.host_rt.get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build the plugin host runtime")
+        });
+        rt.block_on(fut)
+    }
+
     /// Reads one sandbox environment variable — the `env-get` dispatch
     /// target, mirroring [`HostFunctions::config_get`]'s `config-get`.
     pub fn env_get(&self, key: &str) -> Option<String> {
@@ -303,51 +375,47 @@ impl HostApiProvider for HostFunctions {
         }
 
         let client = self.http_client.clone();
-        tokio::task::block_in_place(|| {
-            let handle = tokio::runtime::Handle::current();
-            handle.block_on(async {
-                let parsed_headers: HashMap<String, Value> =
-                    serde_json::from_str(&headers).unwrap_or_default();
+        self.host_block_on(async {
+            let parsed_headers: HashMap<String, Value> =
+                serde_json::from_str(&headers).unwrap_or_default();
 
-                let mut req = match method.to_uppercase().as_str() {
-                    "GET" => client.get(&url),
-                    "POST" => client.post(&url),
-                    "PUT" => client.put(&url),
-                    "PATCH" => client.patch(&url),
-                    "DELETE" => client.delete(&url),
-                    other => client.request(
-                        reqwest::Method::from_bytes(other.as_bytes())
-                            .unwrap_or(reqwest::Method::GET),
-                        &url,
-                    ),
-                };
+            let mut req = match method.to_uppercase().as_str() {
+                "GET" => client.get(&url),
+                "POST" => client.post(&url),
+                "PUT" => client.put(&url),
+                "PATCH" => client.patch(&url),
+                "DELETE" => client.delete(&url),
+                other => client.request(
+                    reqwest::Method::from_bytes(other.as_bytes()).unwrap_or(reqwest::Method::GET),
+                    &url,
+                ),
+            };
 
-                for (k, v) in parsed_headers {
-                    if let Some(s) = v.as_str() {
-                        req = req.header(&k, s);
-                    }
+            for (k, v) in parsed_headers {
+                if let Some(s) = v.as_str() {
+                    req = req.header(&k, s);
                 }
+            }
 
-                if !body.is_empty() && !["GET", "HEAD"].contains(&method.to_uppercase().as_str()) {
-                    req = req.body(body);
-                }
+            if !body.is_empty() && !["GET", "HEAD"].contains(&method.to_uppercase().as_str()) {
+                req = req.body(body);
+            }
 
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| anyhow!("HTTP request failed: {}", e))?;
-                let status = resp.status().as_u16();
-                let resp_body = resp
-                    .text()
-                    .await
-                    .map_err(|e| anyhow!("Failed to read response body: {}", e))?;
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| anyhow!("HTTP request failed: {}", e))?;
+            let status = resp.status().as_u16();
+            let resp_body = resp
+                .text()
+                .await
+                .map_err(|e| anyhow!("Failed to read response body: {}", e))?;
 
-                Ok(serde_json::to_string(&HttpResp {
-                    status,
-                    body: resp_body,
-                })
-                .unwrap_or_default())
+            Ok(serde_json::to_string(&HttpResp {
+                status,
+                body: resp_body,
             })
+            .unwrap_or_default())
         })
     }
 
@@ -362,11 +430,8 @@ impl HostApiProvider for HostFunctions {
             let payload = parsed.get("payload").cloned().unwrap_or(parsed.clone());
 
             let bus = bus.clone();
-            tokio::task::block_in_place(|| {
-                let handle = tokio::runtime::Handle::current();
-                handle.block_on(async {
-                    bus.publish(&topic, payload).await;
-                })
+            self.host_block_on(async {
+                bus.publish(&topic, payload).await;
             });
             info!(event = "plugin_forward_event", topic = %topic, "event forwarded to PubSubBus");
         } else {
@@ -378,12 +443,9 @@ impl HostApiProvider for HostFunctions {
     fn query_ai(&self, message: String, context: Option<String>) -> Result<String> {
         if let Some(ref llm) = self.llm_service {
             let llm = llm.clone();
-            let result = tokio::task::block_in_place(|| {
-                let handle = tokio::runtime::Handle::current();
-                handle.block_on(async {
-                    llm.llm_chat(ModelTier::Basic, &message, context.as_deref(), None, None)
-                        .await
-                })
+            let result = self.host_block_on(async {
+                llm.llm_chat(ModelTier::Basic, &message, context.as_deref(), None, None)
+                    .await
             });
             if result.success {
                 Ok(result.content)
@@ -403,10 +465,7 @@ impl HostApiProvider for HostFunctions {
 
     fn config_get(&self, key: String) -> Option<String> {
         let config = self.config.clone();
-        tokio::task::block_in_place(|| {
-            let handle = tokio::runtime::Handle::current();
-            handle.block_on(async { config.read().await.get(&key).cloned() })
-        })
+        self.host_block_on(async { config.read().await.get(&key).cloned() })
     }
 
     fn register_mcp_tool(
