@@ -112,13 +112,56 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Resolves a manifest-declared `File` payload path against the plugin's
+/// own directory, enforcing the registry's path-confinement invariant:
+/// after normalization the payload must live strictly inside `dir`.
+///
+/// `canonicalize` is used deliberately: it resolves `..` walks *and*
+/// symlinks, so a payload path that hops over the plugin directory by
+/// either mechanism is rejected. `canonicalize` requires the target to
+/// exist, which is why this runs at the read sites (scan validation,
+/// feed, load) — the exact places that would otherwise open the file.
+/// Returns the canonical path to read; the reason strings are
+/// channel-agnostic (scan wraps them in a `Rejection`, feed/load in a
+/// `PayloadIntegrity` error).
+pub(crate) fn confined_payload_path(dir: &Path, path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Err(format!(
+            "payload path '{}' is absolute; file payloads must stay inside the plugin directory",
+            path.display()
+        ));
+    }
+    let full = dir.join(path);
+    let canonical = match full.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!("payload file missing: {}: {e}", full.display()));
+        }
+        Err(e) => {
+            return Err(format!("cannot resolve payload '{}': {e}", full.display()));
+        }
+    };
+    let canonical_dir = dir
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve plugin directory '{}': {e}", dir.display()))?;
+    if !canonical.starts_with(&canonical_dir) {
+        return Err(format!(
+            "payload path '{}' escapes the plugin directory '{}'",
+            path.display(),
+            canonical_dir.display()
+        ));
+    }
+    Ok(canonical)
+}
+
 /// Scans a plugin store: one subdirectory per plugin under `root`, each
 /// containing an `akivili.plugin.toml` plus payload files.
 ///
 /// Validation per plugin directory (in order): manifest readable and
-/// parseable, id/version syntax valid, every `File` payload present in the
-/// plugin directory, every declared `sha256` matching the actual file
-/// content, and the plugin id not already taken by an earlier directory
+/// parseable, id/version syntax valid, every `File` payload present in —
+/// and confined to — the plugin directory, every declared `sha256`
+/// matching the actual file content, and the plugin id not already taken
+/// by an earlier directory
 /// (subdirectories are visited in name order, so the first **valid**
 /// directory wins — see the duplicate check in `validate_dir`).
 /// Any failure rejects that directory only — the scan always reports the
@@ -204,7 +247,15 @@ fn validate_dir(dir: &Path, seen: &HashMap<String, PathBuf>) -> Result<PluginMan
 
     for entry in &manifest.resources {
         if let Payload::File { path, sha256 } = &entry.payload {
-            let full = dir.join(path);
+            let full = match confined_payload_path(dir, path) {
+                Ok(full) => full,
+                Err(reason) => {
+                    return Err(reject(
+                        Some(manifest.id.clone()),
+                        format!("payload rejected for kind '{}': {reason}", entry.kind),
+                    ));
+                }
+            };
             let bytes = match fs::read(&full) {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -254,6 +305,11 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join(MANIFEST_FILE), manifest).unwrap();
             for (file_name, content) in *files {
+                if let Some(parent) = Path::new(file_name).parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    fs::create_dir_all(dir.join(parent)).unwrap();
+                }
                 fs::write(dir.join(file_name), content).unwrap();
             }
         }
@@ -395,6 +451,59 @@ value = 1
         let mut manifest = valid_manifest("hashed");
         manifest.push_str(&format!("sha256 = \"{}\"\n", sha_of(STYLE_CSS)));
         let results = scan_with(&[("hashed", &manifest, &[("style.css", STYLE_CSS)])]).unwrap();
+        assert!(matches!(results[0], ScanResult::Accepted(_)));
+    }
+
+    #[test]
+    fn rejects_payload_path_escaping_the_plugin_dir() {
+        // `../escape.txt` points at a real file outside the plugin
+        // directory (here: inside the store root). The scan must reject
+        // the plugin, and the outside bytes must never be read.
+        let root = tempfile::tempdir().unwrap();
+        let secret = "outside-the-plugin-dir\n";
+        fs::write(root.path().join("escape.txt"), secret).unwrap();
+        let dir = root.path().join("escaper");
+        fs::create_dir_all(&dir).unwrap();
+        let manifest = valid_manifest("escaper").replace("style.css", "../escape.txt");
+        fs::write(dir.join(MANIFEST_FILE), &manifest).unwrap();
+        let results = scan(root.path(), &EnabledState::default()).unwrap();
+        match &results[0] {
+            ScanResult::Rejected(rej) => {
+                assert!(rej.reason.contains("escapes"), "got: {}", rej.reason);
+                assert_eq!(rej.plugin_id.as_deref(), Some("escaper"));
+            }
+            ScanResult::Accepted(_) => panic!("must be rejected"),
+        }
+    }
+
+    #[test]
+    fn rejects_absolute_payload_path() {
+        // An absolute payload path discards the plugin directory in
+        // `join` entirely; it is rejected even though the target exists.
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside.css");
+        fs::write(&outside, STYLE_CSS).unwrap();
+        let dir = root.path().join("abspath");
+        fs::create_dir_all(&dir).unwrap();
+        let manifest = valid_manifest("abspath").replace("style.css", outside.to_str().unwrap());
+        fs::write(dir.join(MANIFEST_FILE), &manifest).unwrap();
+        let results = scan(root.path(), &EnabledState::default()).unwrap();
+        match &results[0] {
+            ScanResult::Rejected(rej) => {
+                assert!(rej.reason.contains("absolute"), "got: {}", rej.reason);
+                assert_eq!(rej.plugin_id.as_deref(), Some("abspath"));
+            }
+            ScanResult::Accepted(_) => panic!("must be rejected"),
+        }
+    }
+
+    #[test]
+    fn accepts_payload_in_nested_subdirectory() {
+        // Confinement must not over-restrict: nested paths inside the
+        // plugin directory normalize back inside it and are accepted.
+        let manifest = valid_manifest("nested").replace("style.css", "assets/style.css");
+        let results =
+            scan_with(&[("nested", &manifest, &[("assets/style.css", STYLE_CSS)])]).unwrap();
         assert!(matches!(results[0], ScanResult::Accepted(_)));
     }
 

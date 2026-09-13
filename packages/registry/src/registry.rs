@@ -316,10 +316,10 @@ impl Registry {
     /// Declares a resource loaded: the host's "I loaded this" statement.
     ///
     /// Looks the entry up in the plugin's manifest, re-verifies file
-    /// payloads against their declared digests (the file may have changed
-    /// since the scan), audits `loaded`, and returns a handle. Loading
-    /// from a disabled plugin is an error — `set_enabled(false)` is the
-    /// store-level off switch.
+    /// payloads (path confinement first, then their declared digests —
+    /// the file may have changed since the scan), audits `loaded`, and
+    /// returns a handle. Loading from a disabled plugin is an error —
+    /// `set_enabled(false)` is the store-level off switch.
     pub fn load(&self, plugin_id: &str, entry_index: usize) -> RegistryResult<ResourceHandle> {
         let fail = |reason: String| {
             self.inner.append_audit(AuditEvent::Failed {
@@ -365,7 +365,18 @@ impl Registry {
         let sha256 = match &entry.payload {
             Payload::Inline(_) => None,
             Payload::File { path, sha256 } => {
-                let bytes = match std::fs::read(record.dir.join(path)) {
+                let full = match store::confined_payload_path(&record.dir, path) {
+                    Ok(full) => full,
+                    Err(reason) => {
+                        let err = RegistryError::PayloadIntegrity {
+                            plugin_id: plugin_id.to_string(),
+                            reason,
+                        };
+                        fail(err.to_string())?;
+                        return Err(err);
+                    }
+                };
+                let bytes = match std::fs::read(&full) {
                     Ok(bytes) => bytes,
                     Err(e) => {
                         let err = RegistryError::PayloadIntegrity {
@@ -413,7 +424,8 @@ impl Registry {
     }
 
     /// Resolves one entry's payload at feed time, verifying declared
-    /// digests; failures audit `failed` and bubble up (feed is fail-loud —
+    /// digests and confining file reads to the plugin's own directory;
+    /// failures audit `failed` and bubble up (feed is fail-loud —
     /// one corrupted payload surfaces rather than being silently skipped).
     fn resolve_payload(
         &self,
@@ -423,7 +435,17 @@ impl Registry {
         match &entry.payload {
             Payload::Inline(value) => Ok(ResolvedPayload::Inline(value.clone())),
             Payload::File { path, sha256 } => {
-                let full = record.dir.join(path);
+                let full = match store::confined_payload_path(&record.dir, path) {
+                    Ok(full) => full,
+                    Err(reason) => {
+                        let err = RegistryError::PayloadIntegrity {
+                            plugin_id: record.manifest.id.clone(),
+                            reason,
+                        };
+                        self.feed_failure(record, &err)?;
+                        return Err(err);
+                    }
+                };
                 let bytes = match std::fs::read(&full) {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -497,6 +519,11 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join(MANIFEST_FILE), manifest).unwrap();
             for (file, content) in files {
+                if let Some(parent) = Path::new(file).parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(dir.join(parent)).unwrap();
+                }
                 std::fs::write(dir.join(file), content).unwrap();
             }
         }
@@ -573,6 +600,26 @@ body = "monospace"
 
     fn style_style() -> Vec<ResourceKind> {
         vec![ResourceKind::new(crate::kinds::WEBUI_STYLE).unwrap()]
+    }
+
+    /// A one-resource manifest whose style payload is a file at `path`
+    /// (relative to the plugin directory, or not — the escape tests
+    /// deliberately declare paths that leave it).
+    fn file_manifest(id: &str, path: &str) -> String {
+        format!(
+            r#"
+id = "{id}"
+version = "0.1.0"
+provider = "test"
+
+[[resources]]
+kind = "webui.style"
+order = 5
+
+[resources.payload.File]
+path = "{path}"
+"#
+        )
     }
 
     #[test]
@@ -904,6 +951,188 @@ sha256 = "{}"
             !events.iter().any(|e| matches!(e, AuditEvent::Fed { .. })),
             "nothing may be fed from a corrupted payload"
         );
+    }
+
+    #[test]
+    fn declared_escape_paths_are_rejected_at_scan_and_never_feed() {
+        // The manifest declares `../escape.txt`, which points at a real
+        // file outside the plugin directory (but inside the store root —
+        // escaping the *plugin* directory is already a violation).
+        let store = TestStore::new();
+        let secret = "store-root-secret-bytes\n";
+        std::fs::write(store.root.path().join("escape.txt"), secret).unwrap();
+        store.add_plugin("evil", &file_manifest("evil", "../escape.txt"), &[]);
+
+        let registry = store.open();
+        assert!(
+            registry.plugins().is_empty(),
+            "an escaping payload must not be accepted: {:?}",
+            registry.plugins()
+        );
+        assert_eq!(registry.rejections().len(), 1);
+        assert!(
+            registry.rejections()[0].reason.contains("escapes"),
+            "got: {}",
+            registry.rejections()[0].reason
+        );
+
+        // Nothing feeds, so the outside bytes are never handed to a host.
+        let feed = registry
+            .feed(&HostAcceptance::new("webui", style_style()))
+            .unwrap();
+        assert!(feed.is_empty(), "nothing may be fed: {feed:?}");
+
+        let events = store.audit_events();
+        assert!(
+            events.iter().any(|e| matches!(e,
+                AuditEvent::Rejected { reason, .. } if reason.contains("escapes"))),
+            "the escape must be audited as a rejection: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e,
+                AuditEvent::Validated { plugin_id, .. } if plugin_id == "evil")),
+            "the escaping plugin must never validate"
+        );
+        assert!(!events.iter().any(|e| matches!(e, AuditEvent::Fed { .. })));
+        // And the secret content never lands in the audit log either.
+        let audit_text = std::fs::read_to_string(store.audit_path()).unwrap();
+        assert!(!audit_text.contains(secret), "content must not leak");
+    }
+
+    #[test]
+    fn absolute_payload_paths_are_rejected() {
+        // An absolute path would replace the plugin directory entirely in
+        // `join`; it is rejected as a confinement violation even though
+        // the target file exists.
+        let store = TestStore::new();
+        let outside = store.root.path().join("outside.css");
+        std::fs::write(&outside, "body { color: red; }\n").unwrap();
+        store.add_plugin("abs", &file_manifest("abs", outside.to_str().unwrap()), &[]);
+
+        let registry = store.open();
+        assert!(registry.plugins().is_empty());
+        assert_eq!(registry.rejections().len(), 1);
+        assert!(
+            registry.rejections()[0].reason.contains("absolute"),
+            "got: {}",
+            registry.rejections()[0].reason
+        );
+
+        let feed = registry
+            .feed(&HostAcceptance::new("webui", style_style()))
+            .unwrap();
+        assert!(feed.is_empty());
+        assert!(
+            store.audit_events().iter().any(|e| matches!(e,
+                AuditEvent::Rejected { reason, .. } if reason.contains("absolute"))),
+            "the rejection must be audited"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)] // requires symlink(2)
+    fn feed_rejects_payload_swapped_for_an_escape_after_the_scan() {
+        // The scan accepted a confined payload; the file is then swapped
+        // for a symlink pointing outside the plugin directory. Only the
+        // feed-time confinement check (canonicalize resolves symlinks)
+        // can catch it — the mandatory runtime defense.
+        let store = TestStore::new();
+        let secret = "classified-payload-bytes\n";
+        std::fs::write(store.root.path().join("secret.txt"), secret).unwrap();
+        store.add_plugin(
+            "beta",
+            &file_manifest("beta", "style.css"),
+            &[("style.css", "body{}\n")],
+        );
+
+        let registry = store.open();
+        assert_eq!(registry.plugins().len(), 1, "scan must accept the plugin");
+
+        let css = store.root.path().join("beta").join("style.css");
+        std::fs::remove_file(&css).unwrap();
+        std::os::unix::fs::symlink(store.root.path().join("secret.txt"), &css).unwrap();
+
+        let err = registry
+            .feed(&HostAcceptance::new("webui", style_style()))
+            .unwrap_err();
+        assert!(
+            matches!(err, RegistryError::PayloadIntegrity { .. }),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("escapes"), "got: {err}");
+        assert!(!err.to_string().contains(secret), "content must not leak");
+
+        let events = store.audit_events();
+        assert!(
+            events.iter().any(|e| matches!(e,
+                AuditEvent::Failed { stage, reason, .. }
+                if stage == "feed" && reason.contains("escapes"))),
+            "the escape must be audited as a feed failure: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AuditEvent::Fed { .. })),
+            "nothing may be fed through a symlink escape"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)] // requires symlink(2)
+    fn load_rejects_payload_swapped_for_an_escape_after_the_scan() {
+        // The load-time read re-runs the same confinement check, so a
+        // symlink planted between feed and load is caught too.
+        let store = TestStore::new();
+        std::fs::write(store.root.path().join("secret.txt"), "classified\n").unwrap();
+        store.add_plugin(
+            "beta",
+            &file_manifest("beta", "style.css"),
+            &[("style.css", "body{}\n")],
+        );
+
+        let registry = store.open();
+        let css = store.root.path().join("beta").join("style.css");
+        std::fs::remove_file(&css).unwrap();
+        std::os::unix::fs::symlink(store.root.path().join("secret.txt"), &css).unwrap();
+
+        let err = registry.load("beta", 0).unwrap_err();
+        assert!(
+            matches!(err, RegistryError::PayloadIntegrity { .. }),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("escapes"), "got: {err}");
+
+        assert!(
+            store.audit_events().iter().any(|e| matches!(e,
+                AuditEvent::Failed { stage, reason, .. }
+                if stage == "load" && reason.contains("escapes"))),
+            "the escape must be audited as a load failure"
+        );
+    }
+
+    #[test]
+    fn feed_resolves_file_payloads_in_nested_subdirectories() {
+        // Confinement must not over-restrict: a payload in a nested
+        // subdirectory of the plugin directory is legitimate.
+        let store = TestStore::new();
+        let css = "body { font: serif; }\n";
+        store.add_plugin(
+            "beta",
+            &file_manifest("beta", "assets/style.css"),
+            &[("assets/style.css", css)],
+        );
+
+        let registry = store.open();
+        assert_eq!(registry.plugins().len(), 1);
+        let feed = registry
+            .feed(&HostAcceptance::new("webui", style_style()))
+            .unwrap();
+        assert_eq!(feed.len(), 1);
+        match &feed.iter().next().unwrap().resolved {
+            ResolvedPayload::File { bytes, sha256 } => {
+                assert_eq!(bytes, css.as_bytes());
+                assert_eq!(sha256, &sha256_hex(css.as_bytes()));
+            }
+            other => panic!("expected file payload, got {other:?}"),
+        }
     }
 
     #[test]

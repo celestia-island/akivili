@@ -20,6 +20,10 @@
 //! - **Auditable** — every discovery, validation, rejection, enable/disable
 //!   toggle, fed item, load, and unload lands in an append-only JSONL audit
 //!   log ([`audit::AuditLog`]); opening the log is fail-loud.
+//! - **Path-confined** — file payloads are only ever read from inside the
+//!   owning plugin's own directory: absolute paths, `..` walks, and
+//!   symlink escapes are rejected at scan time and re-checked at
+//!   feed/load time (see [`store::scan`]).
 //!
 //! Resources are decoupled from service targets: the same registry feeds
 //! webui styles/themes/modules ([`kinds::WEBUI_STYLE`] &c.), sandbox
