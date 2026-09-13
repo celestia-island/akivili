@@ -34,6 +34,9 @@ pub enum RegistryError {
     #[error("entry index {index} out of bounds for plugin '{plugin_id}'")]
     EntryIndexOutOfBounds { plugin_id: String, index: usize },
 
+    /// A file payload failed its read-time verification: unreadable,
+    /// declared-digest mismatch, or a declared path that escapes the
+    /// owning plugin directory (absolute, `..` walk, or symlink hop).
     #[error("payload integrity failure for plugin '{plugin_id}': {reason}")]
     PayloadIntegrity { plugin_id: String, reason: String },
 
