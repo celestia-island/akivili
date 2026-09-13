@@ -124,6 +124,16 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 /// Returns the canonical path to read; the reason strings are
 /// channel-agnostic (scan wraps them in a `Rejection`, feed/load in a
 /// `PayloadIntegrity` error).
+///
+/// Platform note: the supported and CI-exercised platform is Linux; the
+/// post-scan symlink-swap tests are `#[cfg(unix)]` because they need
+/// `symlink(2)`, while the `..`-walk, absolute-path, and nested-path
+/// cases stay platform-independent. On Windows, `is_absolute()` reports
+/// `false` for rooted-but-driveless (`\x`) and drive-relative (`C:x`)
+/// paths, so the early rejection lets them through — but `join`
+/// discards `dir` for both forms and the canonicalize + prefix check
+/// still rejects them (escape when the target exists, missing
+/// otherwise). Only the reason string can differ, never the verdict.
 pub(crate) fn confined_payload_path(dir: &Path, path: &Path) -> Result<PathBuf, String> {
     if path.is_absolute() {
         return Err(format!(
