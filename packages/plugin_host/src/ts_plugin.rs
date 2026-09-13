@@ -192,6 +192,13 @@ fn dispatch_host_fn(
                 None => PluginResult::with_value(serde_json::Value::Null),
             }
         }
+        "env-get" => {
+            let key = params["key"].as_str().unwrap_or("").to_string();
+            match api.env_get(&key) {
+                Some(v) => PluginResult::with_value(serde_json::Value::String(v)),
+                None => PluginResult::with_value(serde_json::Value::Null),
+            }
+        }
         "kv-get" => {
             let key = params["key"].as_str().unwrap_or("").to_string();
             let result = tokio::task::block_in_place(|| {
@@ -406,6 +413,20 @@ impl TsPlugin {
                 Attribute::WRITABLE | Attribute::CONFIGURABLE,
             )
             .map_err(|e| anyhow!("failed to register __plugin_state: {}", e))?;
+
+        // Sandbox environment snapshot (registry-fed + explicit host
+        // configuration — see crate::sandbox_env). Same shape and mutation
+        // scope as __plugin_state: a JSON-string global whose writes only
+        // affect this plugin's own context, never the host's set.
+        let sandbox_env_json =
+            serde_json::to_string(&host_api.sandbox_env()).unwrap_or_else(|_| "{}".to_string());
+        context
+            .register_global_property(
+                JsString::from("__sandbox_env"),
+                JsValue::from(js_string!(sandbox_env_json)),
+                Attribute::WRITABLE | Attribute::CONFIGURABLE,
+            )
+            .map_err(|e| anyhow!("failed to register __sandbox_env: {}", e))?;
 
         context
             .register_global_callable(
@@ -806,6 +827,73 @@ var handleRequest = function(m,p,h,b) {
             let all = host_api_clone.all_mcp_tools();
             assert_eq!(all.len(), 1);
             assert_eq!(all[0].0, "tool-plugin");
+            Ok::<(), Error>(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn sandbox_env_global_is_injected() -> Result<()> {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
+            let env: std::collections::HashMap<String, String> =
+                [("AKIVILI_REGION", "eu"), ("AKIVILI_TRACE", "off")]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+            let host_api = Arc::new(HostFunctions::new().with_sandbox_env(env));
+            let data = TsPluginData::new(
+                "env-plugin",
+                r#"
+var handleRequest = function(method, path, headers, body) {
+    return __sandbox_env;
+};
+"#,
+                TsLanguage::JavaScript,
+            );
+            let result = tokio::task::spawn_blocking(move || {
+                let mut plugin = TsPlugin::create_and_load(host_api, &data)?;
+                plugin.handle_request("POST", "/env", "{}", "{}")
+            })
+            .await??;
+            let parsed: serde_json::Value = serde_json::from_str(&result)?;
+            assert_eq!(parsed["AKIVILI_REGION"], "eu");
+            assert_eq!(parsed["AKIVILI_TRACE"], "off");
+            Ok::<(), Error>(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_env_get_reads_the_sandbox_env() -> Result<()> {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
+            let env: std::collections::HashMap<String, String> = [("AKIVILI_REGION", "eu")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let host_api = Arc::new(HostFunctions::new().with_sandbox_env(env));
+            let data = TsPluginData::new(
+                "env-dispatch-plugin",
+                r#"
+var handleRequest = function(method, path, headers, body) {
+    return JSON.stringify({
+        present: dispatch("env-get", { key: "AKIVILI_REGION" }),
+        missing: dispatch("env-get", { key: "NO_SUCH_VAR" })
+    });
+};
+"#,
+                TsLanguage::JavaScript,
+            );
+            let result = tokio::task::spawn_blocking(move || {
+                let mut plugin = TsPlugin::create_and_load(host_api, &data)?;
+                plugin.handle_request("POST", "/env", "{}", "{}")
+            })
+            .await??;
+            let parsed: serde_json::Value = serde_json::from_str(&result)?;
+            assert_eq!(parsed["present"]["success"], true);
+            assert_eq!(parsed["present"]["value"], "eu");
+            assert_eq!(parsed["missing"]["value"], serde_json::Value::Null);
             Ok::<(), Error>(())
         })?;
         Ok(())

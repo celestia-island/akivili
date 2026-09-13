@@ -186,6 +186,12 @@ pub struct HostFunctions {
     pubsub_bus: Option<Arc<dyn PubSubBus>>,
     llm_service: Option<Arc<dyn LlmSubcallService>>,
     trigger_dispatcher: Option<Arc<dyn TriggerDispatcherHolder>>,
+    /// Environment variables injected into every plugin sandbox. Holds the
+    /// final merged set (registry-fed values layered under explicit caller
+    /// configuration — see [`crate::sandbox_env`]). A `parking_lot` lock
+    /// rather than tokio's because plugin contexts are created on plain
+    /// worker threads (outside any async runtime).
+    sandbox_env: Arc<parking_lot::RwLock<HashMap<String, String>>>,
 }
 
 impl Default for HostFunctions {
@@ -208,6 +214,7 @@ impl HostFunctions {
             pubsub_bus: None,
             llm_service: None,
             trigger_dispatcher: None,
+            sandbox_env: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -237,6 +244,30 @@ impl HostFunctions {
     pub fn with_trigger_dispatcher(mut self, dispatcher: Arc<dyn TriggerDispatcherHolder>) -> Self {
         self.trigger_dispatcher = Some(dispatcher);
         self
+    }
+
+    /// Sets the sandbox environment injected into every plugin sandbox
+    /// (the `__sandbox_env` global and the `env-get` dispatch tool).
+    ///
+    /// This is the **explicit caller configuration** layer: host processes
+    /// should pass the registry-fed set merged underneath their explicit
+    /// values here ([`crate::sandbox_env::SandboxEnvFeed::merged_with`] —
+    /// explicit configuration always wins over registry resources).
+    pub fn with_sandbox_env(mut self, env: HashMap<String, String>) -> Self {
+        self.sandbox_env = Arc::new(parking_lot::RwLock::new(env));
+        self
+    }
+
+    /// A snapshot of the sandbox environment, taken when a plugin context
+    /// is created (the `__sandbox_env` global's content).
+    pub fn sandbox_env(&self) -> HashMap<String, String> {
+        self.sandbox_env.read().clone()
+    }
+
+    /// Reads one sandbox environment variable — the `env-get` dispatch
+    /// target, mirroring [`HostFunctions::config_get`]'s `config-get`.
+    pub fn env_get(&self, key: &str) -> Option<String> {
+        self.sandbox_env.read().get(key).cloned()
     }
 
     pub async fn kv_get(&self, key: &str) -> Option<String> {
@@ -570,7 +601,7 @@ mod tests {
                         vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]
                     }));
             let api = HostFunctions::new().with_network_guard(guard);
-            let url = format!("http://local.test:{}/", addr.port().to_string());
+            let url = format!("http://local.test:{}/", addr.port());
             let resp = api.http_request("GET".into(), url, "{}".into(), String::new())?;
             assert!(resp.contains("pong"), "got: {}", resp);
 
