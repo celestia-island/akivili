@@ -14,11 +14,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 rust-version = "1.91"
 authors = ["langyo <langyo.china@gmail.com>"]
-license-file = "LICENSE"
 license = "LicenseRef-sysl-1.0"
 description = "Plugin SDK for celestia-island — agent plugin host and TypeScript execution pipeline"
 repository = "https://github.com/celestia-island/akivili"
