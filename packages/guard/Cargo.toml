@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-license-file.workspace = true
 description = "Egress network guard — URL/IP policy enforcement with DNS-rebinding-safe resolution"
 repository.workspace = true
 keywords.workspace = true

@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-license-file.workspace = true
 description = "Plugin registry — resource discovery, host feeding, handles, and append-only audit"
 repository.workspace = true
 keywords.workspace = true
