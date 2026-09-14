@@ -8,8 +8,72 @@ use crate::feed::{FeedItem, ResolvedPayload, ResourceFeed};
 use crate::handle::{HandleInfo, LocalRegistration, RegistryInner, ResourceHandle};
 use crate::manifest::{Payload, ResourceEntry};
 use crate::store::{
-    self, EnabledState, PluginRecord, Rejection, STATE_FILE, ScanResult, sha256_hex,
+    self, EnabledState, PluginRecord, ReadPayloadError, Rejection, STATE_FILE, ScanResult,
+    sha256_hex,
 };
+
+/// The default per-payload size cap: 8 MiB — deliberately generous for
+/// the resource vocabulary the registry feeds today (styles, themes,
+/// modules, icons, fonts), while keeping one runaway payload from
+/// dominating host memory. Hosts may raise or lower it via
+/// [`RegistryOptions::max_payload_bytes`].
+pub const DEFAULT_MAX_PAYLOAD_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Open-time options for a [`Registry`] — the builder behind
+/// [`Registry::options`].
+///
+/// The defaults reproduce [`Registry::open`]: the scan replay is audited
+/// and file payloads are capped at [`DEFAULT_MAX_PAYLOAD_BYTES`].
+#[derive(Debug, Clone)]
+pub struct RegistryOptions {
+    pub(crate) audit_scan_replay: bool,
+    pub(crate) max_payload_bytes: u64,
+}
+
+impl Default for RegistryOptions {
+    fn default() -> Self {
+        Self {
+            audit_scan_replay: true,
+            max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
+        }
+    }
+}
+
+impl RegistryOptions {
+    /// The default options (equivalent to [`Registry::open`]).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Skips replaying the scan into the audit log at open — the quiet
+    /// semantics of [`Registry::open_quiet`] — so read-only opens append
+    /// nothing. Composable with [`Self::max_payload_bytes`] for a quiet
+    /// open under a custom cap.
+    pub fn quiet(mut self, quiet: bool) -> Self {
+        self.audit_scan_replay = !quiet;
+        self
+    }
+
+    /// Sets the per-file-payload size cap (bytes), enforced at **every**
+    /// payload read: scan validation at open (an oversized payload
+    /// rejects its plugin, audited as `rejected` with the measured
+    /// size), feed, and load (fail-loud `failed` events if the file grew
+    /// past the cap after the scan). The reads themselves are bounded,
+    /// so an oversized payload never dominates host memory — the feed
+    /// snapshot guarantee (hosts load exactly the audited bytes) is
+    /// untouched. Default: [`DEFAULT_MAX_PAYLOAD_BYTES`].
+    pub fn max_payload_bytes(mut self, max: u64) -> Self {
+        self.max_payload_bytes = max;
+        self
+    }
+
+    /// Opens the registry against a plugin store and an audit log with
+    /// these options; anything left at its default behaves exactly like
+    /// [`Registry::open`].
+    pub fn open(self, store_dir: &Path, audit_path: &Path) -> RegistryResult<Registry> {
+        Registry::open_impl(store_dir, audit_path, self)
+    }
+}
 
 /// The registry facade: plugin management, host feeding, and runtime
 /// registration, all audited.
@@ -44,6 +108,7 @@ pub struct Registry {
     state: EnabledState,
     records: Vec<PluginRecord>,
     rejections: Vec<Rejection>,
+    max_payload_bytes: u64,
 }
 
 impl std::fmt::Debug for Registry {
@@ -58,6 +123,7 @@ impl std::fmt::Debug for Registry {
                     .map(|r| r.manifest.id.as_str())
                     .collect::<Vec<_>>(),
             )
+            .field("max_payload_bytes", &self.max_payload_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -76,8 +142,11 @@ impl Registry {
     /// process. Read-only lookups that may run repeatedly (the CLI's
     /// `list`) should prefer [`Registry::open_quiet`] so they do not
     /// grow the audit log on every invocation.
+    ///
+    /// Opens with the default options; [`Registry::options`] is the
+    /// builder for the knobs (quiet open, per-payload size cap).
     pub fn open(store_dir: &Path, audit_path: &Path) -> RegistryResult<Self> {
-        Self::open_impl(store_dir, audit_path, true)
+        RegistryOptions::new().open(store_dir, audit_path)
     }
 
     /// Opens the registry quietly: the same scan, the same persisted
@@ -89,27 +158,36 @@ impl Registry {
     /// load, unload, failures) audits exactly as with `open`; only the
     /// open-time `discovered`/`validated`/`rejected` replay is skipped.
     pub fn open_quiet(store_dir: &Path, audit_path: &Path) -> RegistryResult<Self> {
-        Self::open_impl(store_dir, audit_path, false)
+        RegistryOptions::new()
+            .quiet(true)
+            .open(store_dir, audit_path)
+    }
+
+    /// The open-time options surface: a builder for every registry knob
+    /// (quiet open, per-payload size cap), starting from the
+    /// [`Registry::open`] defaults.
+    pub fn options() -> RegistryOptions {
+        RegistryOptions::new()
     }
 
     fn open_impl(
         store_dir: &Path,
         audit_path: &Path,
-        audit_scan_replay: bool,
+        options: RegistryOptions,
     ) -> RegistryResult<Self> {
         let audit = AuditLog::open(audit_path)?;
         let inner = Arc::new(RegistryInner::from_audit(audit));
 
         let state_path = store_dir.join(STATE_FILE);
         let state = EnabledState::load(&state_path)?;
-        let scan = store::scan(store_dir, &state)?;
+        let scan = store::scan(store_dir, &state, options.max_payload_bytes)?;
 
         let mut records = Vec::new();
         let mut rejections = Vec::new();
         for result in scan {
             match result {
                 ScanResult::Accepted(record) => {
-                    if audit_scan_replay {
+                    if options.audit_scan_replay {
                         inner.append_audit(AuditEvent::Discovered {
                             ts: unix_secs(),
                             source: record.dir.display().to_string(),
@@ -125,7 +203,7 @@ impl Registry {
                     records.push(record);
                 }
                 ScanResult::Rejected(rejection) => {
-                    if audit_scan_replay {
+                    if options.audit_scan_replay {
                         inner.append_audit(AuditEvent::Discovered {
                             ts: unix_secs(),
                             source: rejection.dir.display().to_string(),
@@ -150,6 +228,7 @@ impl Registry {
             state,
             records,
             rejections,
+            max_payload_bytes: options.max_payload_bytes,
         })
     }
 
@@ -167,6 +246,12 @@ impl Registry {
     /// The plugin store root this registry was opened against.
     pub fn store_dir(&self) -> &Path {
         &self.store_dir
+    }
+
+    /// The per-payload size cap this registry enforces at scan, feed,
+    /// and load (see [`RegistryOptions::max_payload_bytes`]).
+    pub fn max_payload_bytes(&self) -> u64 {
+        self.max_payload_bytes
     }
 
     /// Toggles a plugin: persists the override to the state file next to
@@ -269,9 +354,11 @@ impl Registry {
     }
 
     /// Feeds a host: filters enabled store plugins by the acceptance's
-    /// declared kinds, resolves payloads (file bytes are read and digested
-    /// now), orders the result (entry `order` ascending, ties by plugin
-    /// id, then manifest position), and audits one `fed` event per item.
+    /// declared kinds, resolves payloads (file bytes are read — under
+    /// the registry's size cap, see [`RegistryOptions::max_payload_bytes`]
+    /// — and digested now), orders the result (entry `order` ascending,
+    /// ties by plugin id, then manifest position), and audits one `fed`
+    /// event per item.
     ///
     /// Local registrations are intentionally not fed (see
     /// [`Registry::register_local`]).
@@ -316,10 +403,11 @@ impl Registry {
     /// Declares a resource loaded: the host's "I loaded this" statement.
     ///
     /// Looks the entry up in the plugin's manifest, re-verifies file
-    /// payloads (path confinement first, then their declared digests —
-    /// the file may have changed since the scan), audits `loaded`, and
-    /// returns a handle. Loading from a disabled plugin is an error —
-    /// `set_enabled(false)` is the store-level off switch.
+    /// payloads (path confinement first, then the size cap, then their
+    /// declared digests — the file may have changed since the scan),
+    /// audits `loaded`, and returns a handle. Loading from a disabled
+    /// plugin is an error — `set_enabled(false)` is the store-level off
+    /// switch.
     pub fn load(&self, plugin_id: &str, entry_index: usize) -> RegistryResult<ResourceHandle> {
         let fail = |reason: String| {
             self.inner.append_audit(AuditEvent::Failed {
@@ -376,12 +464,23 @@ impl Registry {
                         return Err(err);
                     }
                 };
-                let bytes = match std::fs::read(&full) {
+                let bytes = match store::read_capped(&full, self.max_payload_bytes) {
                     Ok(bytes) => bytes,
                     Err(e) => {
-                        let err = RegistryError::PayloadIntegrity {
-                            plugin_id: plugin_id.to_string(),
-                            reason: format!("cannot read payload '{}': {e}", path.display()),
+                        let reason = e.reason(&full);
+                        let err = match e {
+                            ReadPayloadError::TooLarge { size, cap } => {
+                                RegistryError::PayloadTooLarge {
+                                    plugin_id: plugin_id.to_string(),
+                                    path: path.display().to_string(),
+                                    size,
+                                    cap,
+                                }
+                            }
+                            ReadPayloadError::Io(_) => RegistryError::PayloadIntegrity {
+                                plugin_id: plugin_id.to_string(),
+                                reason,
+                            },
                         };
                         fail(err.to_string())?;
                         return Err(err);
@@ -424,9 +523,10 @@ impl Registry {
     }
 
     /// Resolves one entry's payload at feed time, verifying declared
-    /// digests and confining file reads to the plugin's own directory;
-    /// failures audit `failed` and bubble up (feed is fail-loud —
-    /// one corrupted payload surfaces rather than being silently skipped).
+    /// digests, confining file reads to the plugin's own directory, and
+    /// reading under the registry's size cap; failures audit `failed`
+    /// and bubble up (feed is fail-loud — one corrupted or oversized
+    /// payload surfaces rather than being silently skipped).
     fn resolve_payload(
         &self,
         record: &PluginRecord,
@@ -446,12 +546,23 @@ impl Registry {
                         return Err(err);
                     }
                 };
-                let bytes = match std::fs::read(&full) {
+                let bytes = match store::read_capped(&full, self.max_payload_bytes) {
                     Ok(bytes) => bytes,
                     Err(e) => {
-                        let err = RegistryError::PayloadIntegrity {
-                            plugin_id: record.manifest.id.clone(),
-                            reason: format!("cannot read payload '{}': {e}", full.display()),
+                        let reason = e.reason(&full);
+                        let err = match e {
+                            ReadPayloadError::TooLarge { size, cap } => {
+                                RegistryError::PayloadTooLarge {
+                                    plugin_id: record.manifest.id.clone(),
+                                    path: path.display().to_string(),
+                                    size,
+                                    cap,
+                                }
+                            }
+                            ReadPayloadError::Io(_) => RegistryError::PayloadIntegrity {
+                                plugin_id: record.manifest.id.clone(),
+                                reason,
+                            },
                         };
                         self.feed_failure(record, &err)?;
                         return Err(err);
@@ -530,6 +641,10 @@ mod tests {
 
         fn open(&self) -> Registry {
             Registry::open(self.store_dir(), &self.audit_path()).unwrap()
+        }
+
+        fn open_with(&self, options: RegistryOptions) -> Registry {
+            options.open(self.store_dir(), &self.audit_path()).unwrap()
         }
 
         fn audit_events(&self) -> Vec<AuditEvent> {
@@ -898,6 +1013,202 @@ path = "{path}"
         let mut registry = store.open();
         let err = registry.set_enabled("ghost", true).unwrap_err();
         assert!(matches!(err, RegistryError::UnknownPlugin(_)));
+    }
+
+    #[test]
+    fn payload_exactly_at_the_cap_feeds() {
+        // Boundary: the cap is inclusive — a payload of exactly `cap`
+        // bytes is at the limit, not over it.
+        let store = TestStore::new();
+        let exactly = "x".repeat(8);
+        store.add_plugin(
+            "beta",
+            &file_manifest("beta", "style.css"),
+            &[("style.css", &exactly)],
+        );
+
+        let registry = store.open_with(Registry::options().max_payload_bytes(8));
+        assert_eq!(registry.max_payload_bytes(), 8);
+        let feed = registry
+            .feed(&HostAcceptance::new("webui", style_style()))
+            .unwrap();
+        assert_eq!(feed.len(), 1, "an exactly-at-cap payload must feed");
+        match &feed.iter().next().unwrap().resolved {
+            ResolvedPayload::File { bytes, sha256 } => {
+                assert_eq!(bytes.as_slice(), b"xxxxxxxx");
+                assert_eq!(sha256, &sha256_hex(b"xxxxxxxx"));
+            }
+            other => panic!("expected file payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_payloads_reject_the_plugin_at_scan_with_audited_sizes() {
+        let store = TestStore::new();
+        let oversized = "x".repeat(9);
+        store.add_plugin(
+            "beta",
+            &file_manifest("beta", "style.css"),
+            &[("style.css", &oversized)],
+        );
+
+        let registry = store.open_with(Registry::options().max_payload_bytes(8));
+        assert!(
+            registry.plugins().is_empty(),
+            "an oversized payload must not validate: {:?}",
+            registry.plugins()
+        );
+        assert_eq!(registry.rejections().len(), 1);
+        let reason = &registry.rejections()[0].reason;
+        assert!(
+            reason.contains("payload_too_large"),
+            "the reason must carry the machine token: {reason}"
+        );
+        assert!(
+            reason.contains("9 bytes") && reason.contains("cap of 8 bytes"),
+            "the reason must record the measured size and the cap: {reason}"
+        );
+
+        let events = store.audit_events();
+        assert!(
+            events.iter().any(|e| matches!(e,
+                AuditEvent::Rejected { reason, plugin_id, .. }
+                if reason.contains("payload_too_large") && reason.contains("9 bytes")
+                    && plugin_id.as_deref() == Some("beta"))),
+            "the oversize must be audited with its measured size: {events:?}"
+        );
+        assert!(!events.iter().any(|e| matches!(e,
+            AuditEvent::Validated { plugin_id, .. } if plugin_id == "beta")));
+        assert!(!events.iter().any(|e| matches!(e, AuditEvent::Fed { .. })));
+    }
+
+    #[test]
+    fn default_cap_is_8_mib_with_the_exact_boundary_accepted() {
+        let store = TestStore::new();
+        let at_cap = "x".repeat(DEFAULT_MAX_PAYLOAD_BYTES as usize);
+        let over_cap = "y".repeat(DEFAULT_MAX_PAYLOAD_BYTES as usize + 1);
+        store.add_plugin(
+            "atcap",
+            &file_manifest("atcap", "style.css"),
+            &[("style.css", &at_cap)],
+        );
+        store.add_plugin(
+            "over",
+            &file_manifest("over", "style.css"),
+            &[("style.css", &over_cap)],
+        );
+
+        let registry = store.open();
+        assert_eq!(registry.max_payload_bytes(), 8 * 1024 * 1024);
+        let ids: Vec<&str> = registry
+            .plugins()
+            .iter()
+            .map(|r| r.manifest.id.as_str())
+            .collect();
+        assert_eq!(ids, ["atcap"], "exactly-at-cap passes, one-over rejects");
+
+        let feed = registry
+            .feed(&HostAcceptance::new("webui", style_style()))
+            .unwrap();
+        assert_eq!(feed.len(), 1);
+        assert_eq!(feed.iter().next().unwrap().plugin_id, "atcap");
+    }
+
+    #[test]
+    fn feed_fails_loud_when_a_payload_grows_past_the_cap_after_the_scan() {
+        // TOCTOU backstop: the scan accepted a 4-byte payload; the file
+        // then grows past the cap. Only the feed-time capped read can
+        // catch it — and it must fail loud, never feed the oversized
+        // bytes (the feed snapshot stays byte-exact).
+        let store = TestStore::new();
+        store.add_plugin(
+            "beta",
+            &file_manifest("beta", "style.css"),
+            &[("style.css", "tiny")],
+        );
+        let registry = store.open_with(Registry::options().max_payload_bytes(8));
+
+        let grown = "x".repeat(20);
+        std::fs::write(store.root.path().join("beta").join("style.css"), &grown).unwrap();
+        let err = registry
+            .feed(&HostAcceptance::new("webui", style_style()))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RegistryError::PayloadTooLarge {
+                    size: 20,
+                    cap: 8,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+
+        let events = store.audit_events();
+        assert!(
+            events.iter().any(|e| matches!(e,
+                AuditEvent::Failed { stage, reason, .. }
+                if stage == "feed" && reason.contains("payload_too_large")
+                    && reason.contains("20 bytes"))),
+            "the oversize must be audited as a feed failure with the size: {events:?}"
+        );
+        assert!(!events.iter().any(|e| matches!(e, AuditEvent::Fed { .. })));
+    }
+
+    #[test]
+    fn load_fails_loud_when_a_payload_grows_past_the_cap_after_the_scan() {
+        let store = TestStore::new();
+        store.add_plugin(
+            "beta",
+            &file_manifest("beta", "style.css"),
+            &[("style.css", "tiny")],
+        );
+        let registry = store.open_with(Registry::options().max_payload_bytes(8));
+
+        std::fs::write(
+            store.root.path().join("beta").join("style.css"),
+            "x".repeat(20),
+        )
+        .unwrap();
+        let err = registry.load("beta", 0).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RegistryError::PayloadTooLarge {
+                    size: 20,
+                    cap: 8,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+        assert!(
+            store.audit_events().iter().any(|e| matches!(e,
+                AuditEvent::Failed { stage, .. } if stage == "load")),
+            "the oversize must be audited as a load failure"
+        );
+    }
+
+    #[test]
+    fn quiet_opens_compose_with_a_custom_cap() {
+        let store = TestStore::new();
+        let oversized = "x".repeat(9);
+        store.add_plugin(
+            "beta",
+            &file_manifest("beta", "style.css"),
+            &[("style.css", &oversized)],
+        );
+
+        let registry = store.open_with(Registry::options().quiet(true).max_payload_bytes(8));
+        assert!(
+            registry.plugins().is_empty(),
+            "the cap applies on quiet opens"
+        );
+        assert!(
+            store.audit_events().is_empty(),
+            "quiet open writes nothing, rejection included"
+        );
     }
 
     #[test]

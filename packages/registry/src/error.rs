@@ -6,8 +6,10 @@ use thiserror::Error;
 /// this type: they are recorded as [`crate::store::Rejection`]s (and audited
 /// as `rejected` events) so one broken plugin directory never hides the
 /// rest of the store. This type covers the fail-loud paths: audit-log and
-/// state-file IO, unknown or disabled plugins, and payload integrity
-/// failures at feed/load time.
+/// state-file IO, unknown or disabled plugins, payload integrity failures
+/// at feed/load time, and payloads exceeding the configured size cap at
+/// any payload read (see
+/// [`RegistryOptions::max_payload_bytes`](crate::RegistryOptions::max_payload_bytes)).
 #[derive(Debug, Error)]
 pub enum RegistryError {
     #[error("IO error: {0}")]
@@ -39,6 +41,18 @@ pub enum RegistryError {
     /// owning plugin directory (absolute, `..` walk, or symlink hop).
     #[error("payload integrity failure for plugin '{plugin_id}': {reason}")]
     PayloadIntegrity { plugin_id: String, reason: String },
+
+    /// A file payload exceeded the configured per-payload size cap at
+    /// read time (scan validation, feed, or load). `size` is the measured
+    /// size — always at least `cap + 1` bytes; `path` is the
+    /// manifest-declared payload path.
+    #[error("payload_too_large: '{path}' is {size} bytes, exceeding the cap of {cap} bytes")]
+    PayloadTooLarge {
+        plugin_id: String,
+        path: String,
+        size: u64,
+        cap: u64,
+    },
 
     #[error("local registrations only support inline payloads: {0}")]
     UnsupportedLocalPayload(String),

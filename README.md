@@ -59,6 +59,14 @@ resources at startup which they load one by one (`ResourceFeed` → `ResourceHan
 - **Path confinement** — file payloads are only ever read from inside the owning
   plugin's own directory; absolute paths, `..` walks, and symlink escapes are
   rejected at scan time and re-checked at feed/load time.
+- **Size cap** — file payloads are read under a per-payload size cap
+  (`RegistryOptions::max_payload_bytes`, default 8 MiB =
+  `DEFAULT_MAX_PAYLOAD_BYTES`): an oversized payload rejects its plugin at scan
+  time (reason `payload_too_large`, the measured size lands in the audit log) and
+  fails loud at feed/load if the file grew past the cap after the scan; the read
+  itself is bounded, so a runaway payload cannot dominate host memory.
+  `Registry::open` uses the default cap — raise or lower it through
+  `Registry::options()`.
 - **Runtime-local resources** — in-process registrations
   (`Registry::register_local`, the analogue of the plugin host's
   `registerMcpTool`) never touch the disk store.

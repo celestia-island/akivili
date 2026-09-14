@@ -24,6 +24,13 @@
 //!   owning plugin's own directory: absolute paths, `..` walks, and
 //!   symlink escapes are rejected at scan time and re-checked at
 //!   feed/load time (see [`store::scan`]).
+//! - **Size-capped** — every file payload is read under a configurable
+//!   per-payload size cap
+//!   ([`RegistryOptions::max_payload_bytes`], 8 MiB by default): an
+//!   oversized payload rejects its plugin at scan time (the measured
+//!   size lands in the `rejected` audit event) and fails loud at
+//!   feed/load if it grew past the cap afterwards; the read itself is
+//!   bounded, so a runaway payload can never dominate host memory.
 //!
 //! Resources are decoupled from service targets: the same registry feeds
 //! webui styles/themes/modules ([`kinds::WEBUI_STYLE`] &c.), sandbox
@@ -105,5 +112,5 @@ pub use feed::{FeedItem, ResolvedPayload, ResourceFeed};
 pub use handle::{LocalRegistration, ResourceHandle};
 pub use kinds::ResourceKind;
 pub use manifest::{Payload, PluginManifest, ResourceEntry};
-pub use registry::Registry;
+pub use registry::{DEFAULT_MAX_PAYLOAD_BYTES, Registry, RegistryOptions};
 pub use store::{PluginRecord, Rejection, ScanResult};

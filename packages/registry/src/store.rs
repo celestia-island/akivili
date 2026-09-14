@@ -164,19 +164,77 @@ pub(crate) fn confined_payload_path(dir: &Path, path: &Path) -> Result<PathBuf, 
     Ok(canonical)
 }
 
+/// Why a capped payload read failed (see [`read_capped`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ReadPayloadError {
+    /// The payload exceeded the size cap; `size` is the measured size —
+    /// always at least `cap + 1` bytes.
+    TooLarge { size: u64, cap: u64 },
+    /// The payload could not be opened or read (`io::Error` text).
+    Io(String),
+}
+
+impl ReadPayloadError {
+    /// The channel-agnostic reason string: scan wraps it in a
+    /// [`Rejection`], feed/load in a registry error plus a `failed`
+    /// audit event — the same convention as
+    /// [`confined_payload_path`].
+    pub(crate) fn reason(&self, full: &Path) -> String {
+        match self {
+            ReadPayloadError::TooLarge { size, cap } => format!(
+                "payload_too_large: '{}' is {size} bytes, exceeding the cap of {cap} bytes",
+                full.display()
+            ),
+            ReadPayloadError::Io(err) => format!("cannot read payload '{}': {err}", full.display()),
+        }
+    }
+}
+
+/// Reads a file payload under a hard size cap.
+///
+/// The read itself is bounded: the file is read through
+/// `take(cap + 1)`, so a payload larger than the cap — or one that grows
+/// past it mid-read — costs at most `cap + 1` bytes of memory, never its
+/// full size. A payload at or under the cap reads in full; anything
+/// strictly larger is [`ReadPayloadError::TooLarge`] with the measured
+/// size for the audit trail.
+pub(crate) fn read_capped(full: &Path, cap: u64) -> Result<Vec<u8>, ReadPayloadError> {
+    use std::io::Read as _;
+
+    let file = fs::File::open(full).map_err(|e| ReadPayloadError::Io(e.to_string()))?;
+    let mut bytes = Vec::new();
+    file.take(cap.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| ReadPayloadError::Io(e.to_string()))?;
+    if bytes.len() as u64 > cap {
+        // Best-effort true size for the audit record — the verdict is
+        // already made, so a racing change cannot alter it; never report
+        // less than the bounded read measured.
+        let size = full
+            .metadata()
+            .map_or(bytes.len() as u64, |m| m.len().max(bytes.len() as u64));
+        return Err(ReadPayloadError::TooLarge { size, cap });
+    }
+    Ok(bytes)
+}
+
 /// Scans a plugin store: one subdirectory per plugin under `root`, each
 /// containing an `akivili.plugin.toml` plus payload files.
 ///
 /// Validation per plugin directory (in order): manifest readable and
 /// parseable, id/version syntax valid, every `File` payload present in —
-/// and confined to — the plugin directory, every declared `sha256`
-/// matching the actual file content, and the plugin id not already taken
-/// by an earlier directory
+/// and confined to — the plugin directory, at most `max_payload_bytes`
+/// large, every declared `sha256` matching the actual file content, and
+/// the plugin id not already taken by an earlier directory
 /// (subdirectories are visited in name order, so the first **valid**
 /// directory wins — see the duplicate check in `validate_dir`).
 /// Any failure rejects that directory only — the scan always reports the
 /// whole store.
-pub fn scan(root: &Path, state: &EnabledState) -> RegistryResult<Vec<ScanResult>> {
+pub fn scan(
+    root: &Path,
+    state: &EnabledState,
+    max_payload_bytes: u64,
+) -> RegistryResult<Vec<ScanResult>> {
     let entries = fs::read_dir(root).map_err(|e| {
         RegistryError::Io(std::io::Error::new(
             e.kind(),
@@ -194,7 +252,7 @@ pub fn scan(root: &Path, state: &EnabledState) -> RegistryResult<Vec<ScanResult>
     let mut results = Vec::new();
     let mut seen: HashMap<String, PathBuf> = HashMap::new();
     for dir in dirs {
-        match validate_dir(&dir, &seen) {
+        match validate_dir(&dir, &seen, max_payload_bytes) {
             Ok(manifest) => {
                 let record = PluginRecord {
                     enabled: state.get(&manifest.id),
@@ -212,7 +270,11 @@ pub fn scan(root: &Path, state: &EnabledState) -> RegistryResult<Vec<ScanResult>
 
 /// Validates a single plugin directory, mapping every failure to a
 /// [`Rejection`] instead of an error.
-fn validate_dir(dir: &Path, seen: &HashMap<String, PathBuf>) -> Result<PluginManifest, Rejection> {
+fn validate_dir(
+    dir: &Path,
+    seen: &HashMap<String, PathBuf>,
+    max_payload_bytes: u64,
+) -> Result<PluginManifest, Rejection> {
     let reject = |plugin_id: Option<String>, reason: String| Rejection {
         dir: dir.to_path_buf(),
         plugin_id,
@@ -266,15 +328,15 @@ fn validate_dir(dir: &Path, seen: &HashMap<String, PathBuf>) -> Result<PluginMan
                     ));
                 }
             };
-            let bytes = match fs::read(&full) {
+            let bytes = match read_capped(&full, max_payload_bytes) {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     return Err(reject(
                         Some(manifest.id.clone()),
                         format!(
-                            "payload file missing for kind '{}': {}: {e}",
+                            "payload rejected for kind '{}': {}",
                             entry.kind,
-                            full.display()
+                            e.reason(&full)
                         ),
                     ));
                 }
@@ -307,8 +369,13 @@ mod tests {
     type DirSpec<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
 
     /// Writes a plugin directory with the given manifest content and extra
-    /// files; returns the store scan over a fresh temp root.
+    /// files; returns the store scan over a fresh temp root (default cap).
     fn scan_with(dirs: &[DirSpec<'_>]) -> RegistryResult<Vec<ScanResult>> {
+        scan_with_cap(dirs, crate::registry::DEFAULT_MAX_PAYLOAD_BYTES)
+    }
+
+    /// [`scan_with`] under an explicit size cap.
+    fn scan_with_cap(dirs: &[DirSpec<'_>], cap: u64) -> RegistryResult<Vec<ScanResult>> {
         let root = tempfile::tempdir().unwrap();
         for (name, manifest, files) in dirs {
             let dir = root.path().join(name);
@@ -323,7 +390,7 @@ mod tests {
                 fs::write(dir.join(file_name), content).unwrap();
             }
         }
-        scan(root.path(), &EnabledState::default())
+        scan(root.path(), &EnabledState::default(), cap)
     }
 
     fn valid_manifest(id: &str) -> String {
@@ -373,7 +440,12 @@ path = "style.css"
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("empty");
         fs::create_dir_all(&dir).unwrap(); // a directory with no manifest at all
-        let results = scan(root.path(), &EnabledState::default()).unwrap();
+        let results = scan(
+            root.path(),
+            &EnabledState::default(),
+            crate::registry::DEFAULT_MAX_PAYLOAD_BYTES,
+        )
+        .unwrap();
         match &results[0] {
             ScanResult::Rejected(rej) => {
                 assert!(rej.reason.contains("cannot read"), "got: {}", rej.reason);
@@ -465,6 +537,40 @@ value = 1
     }
 
     #[test]
+    fn size_cap_accepts_exactly_at_cap_and_rejects_one_byte_over() {
+        // Boundary: the cap is inclusive — a payload of exactly `cap`
+        // bytes passes, `cap + 1` rejects the whole plugin.
+        let at_cap = "x".repeat(64);
+        let over_cap = "y".repeat(65);
+        let results = scan_with_cap(
+            &[
+                ("atcap", &valid_manifest("atcap"), &[("style.css", &at_cap)]),
+                ("over", &valid_manifest("over"), &[("style.css", &over_cap)]),
+            ],
+            64,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(matches!(results[0], ScanResult::Accepted(_)));
+        match &results[1] {
+            ScanResult::Rejected(rej) => {
+                assert!(
+                    rej.reason.contains("payload_too_large"),
+                    "got: {}",
+                    rej.reason
+                );
+                assert!(
+                    rej.reason.contains("65 bytes") && rej.reason.contains("cap of 64 bytes"),
+                    "the reason must record the measured size and the cap: {}",
+                    rej.reason
+                );
+                assert_eq!(rej.plugin_id.as_deref(), Some("over"));
+            }
+            ScanResult::Accepted(_) => panic!("must be rejected"),
+        }
+    }
+
+    #[test]
     fn rejects_payload_path_escaping_the_plugin_dir() {
         // `../escape.txt` points at a real file outside the plugin
         // directory (here: inside the store root). The scan must reject
@@ -476,7 +582,12 @@ value = 1
         fs::create_dir_all(&dir).unwrap();
         let manifest = valid_manifest("escaper").replace("style.css", "../escape.txt");
         fs::write(dir.join(MANIFEST_FILE), &manifest).unwrap();
-        let results = scan(root.path(), &EnabledState::default()).unwrap();
+        let results = scan(
+            root.path(),
+            &EnabledState::default(),
+            crate::registry::DEFAULT_MAX_PAYLOAD_BYTES,
+        )
+        .unwrap();
         match &results[0] {
             ScanResult::Rejected(rej) => {
                 assert!(rej.reason.contains("escapes"), "got: {}", rej.reason);
@@ -497,7 +608,12 @@ value = 1
         fs::create_dir_all(&dir).unwrap();
         let manifest = valid_manifest("abspath").replace("style.css", outside.to_str().unwrap());
         fs::write(dir.join(MANIFEST_FILE), &manifest).unwrap();
-        let results = scan(root.path(), &EnabledState::default()).unwrap();
+        let results = scan(
+            root.path(),
+            &EnabledState::default(),
+            crate::registry::DEFAULT_MAX_PAYLOAD_BYTES,
+        )
+        .unwrap();
         match &results[0] {
             ScanResult::Rejected(rej) => {
                 assert!(rej.reason.contains("absolute"), "got: {}", rej.reason);
@@ -552,7 +668,12 @@ value = 1
     fn scan_errors_when_store_root_is_missing() {
         let root = tempfile::tempdir().unwrap();
         let missing = root.path().join("nope");
-        let err = scan(&missing, &EnabledState::default()).unwrap_err();
+        let err = scan(
+            &missing,
+            &EnabledState::default(),
+            crate::registry::DEFAULT_MAX_PAYLOAD_BYTES,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("cannot read plugin store"),
             "got: {err}"
