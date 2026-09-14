@@ -8,6 +8,7 @@ description = "Agent plugin host — Boa TypeScript runtime, plugin router and h
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+publish.workspace = true
 
 [dependencies]
 akivili_guard = { path = "../guard" }

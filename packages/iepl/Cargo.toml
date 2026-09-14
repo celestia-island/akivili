@@ -8,6 +8,7 @@ description = "Sandboxed TypeScript to JavaScript execution pipeline (SWC transp
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true

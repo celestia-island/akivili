@@ -8,6 +8,7 @@ description = "Egress network guard — URL/IP policy enforcement with DNS-rebin
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+publish.workspace = true
 
 [dependencies]
 reqwest.workspace = true
