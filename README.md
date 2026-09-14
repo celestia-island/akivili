@@ -74,7 +74,7 @@ installed from source — this requires members with repo access (GitHub
 credentials for `celestia-island/akivili`):
 
 ```sh
-cargo install --git https://github.com/celestia-island/akivili.git akivili-plugin
+cargo install --git https://github.com/celestia-island/akivili.git akivili_registry
 ```
 
 | Command | Effect |
