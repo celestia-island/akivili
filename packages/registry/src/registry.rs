@@ -62,6 +62,12 @@ impl RegistryOptions {
     /// so an oversized payload never dominates host memory — the feed
     /// snapshot guarantee (hosts load exactly the audited bytes) is
     /// untouched. Default: [`DEFAULT_MAX_PAYLOAD_BYTES`].
+    ///
+    /// A cap of `u64::MAX` is effectively "no cap": the bounded read
+    /// (`take(cap + 1)`) saturates instead of overflowing and no file
+    /// can exceed `u64::MAX` bytes, so nothing is ever rejected — the
+    /// trade-off being that reads are then bounded only by the file's
+    /// actual size, not by the cap.
     pub fn max_payload_bytes(mut self, max: u64) -> Self {
         self.max_payload_bytes = max;
         self
