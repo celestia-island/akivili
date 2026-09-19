@@ -38,14 +38,6 @@ jobs:
     - name: Setup sccache
       uses: mozilla/sccache-action@v0.0.4
 
-    - name: Cache Cargo (sources only)
-      uses: actions/cache@v4
-      with:
-        path: |
-          ${{ env.CARGO_HOME }}/registry
-          ${{ env.CARGO_HOME }}/git
-        key: ${{ runner.os }}-cargo-sources-${{ hashFiles('**/Cargo.toml') }}
-
     - name: Format check
       run: cargo fmt --all -- --check
 
