@@ -56,3 +56,21 @@ it and do not open pull requests against it.
 ---
 *Canonical file maintained in the organization metadata repository; changes apply to
 every repository that adopts it.*
+
+<!-- repository-specific notes below this line -->
+## What this repository builds
+
+Plugins execute third-party TypeScript inside the Boa engine sandbox. Treat the
+sandbox boundary, the transpile pipeline and the egress path as security-critical
+surfaces of this repository.
+
+## Known hardening notes
+
+- The SWC transpile pipeline runs the AST security validator (`akivili_iepl`)
+  before any code is evaluated: forbidden globals, dynamic code execution and
+  unsafe timer usage are rejected.
+- Egress HTTP from plugins is gated by `NetworkGuard` (URL allow-list policy).
+- `verify_signature` / `trusted_sources` on Layer-3 agent subscriptions are
+  currently parsed but **not yet enforced**; treat subscriptions from untrusted
+  sources accordingly until they are. Reports about that gap are known and
+  tracked, not new findings.
