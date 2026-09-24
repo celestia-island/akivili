@@ -5,7 +5,19 @@ on:
     types: [opened, edited, reopened, ready_for_review, synchronize]
   merge_group:
     types: [checks_requested]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request number to lint"
+        required: true
+        type: string
 
 jobs:
   lint-commits:
     uses: celestia-island/celestia-devtools/.github/workflows/commit-msg-lint.yml@master
+    with:
+      # Private repo: hosted minutes are the org's paid quota (currently
+      # failing), so this check is served from the free self-hosted farm.
+      runner: '["self-hosted","linux","x64","local"]'
+      lane: "farm"
+      pr: ${{ inputs.pr }}
