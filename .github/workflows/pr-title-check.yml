@@ -7,3 +7,6 @@ on:
 jobs:
   pr-title-check:
     uses: celestia-island/celestia-devtools/.github/workflows/pr-title-check.yml@master
+    with:
+      # Same private-repo lane switch as commit-msg-lint.yml.
+      runner: '["self-hosted","linux","x64","local"]'
