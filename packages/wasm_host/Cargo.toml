@@ -38,5 +38,5 @@ wit-parser = "^0.252"
 
 [package.metadata.wit]
 # The WIT contract ships in-tree; guests bind against
-# packages/wasm_host/wit/host.wit (world celestia:host/host-v0).
-world = "host-v0"
+# packages/wasm_host/wit/host.wit (world celestia:host/guest).
+world = "guest"

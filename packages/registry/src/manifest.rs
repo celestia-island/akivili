@@ -769,6 +769,8 @@ min_trust = "verified-publisher"
     #[test]
     fn contract_refs_validate_shape() {
         for good in [
+            // The canonical fabric world (wasm_host wit/host.wit).
+            "celestia:host/guest@0.1",
             "celestia:panel/host@0.1",
             "celestia:kv/host@1.0",
             "celestia:mesh/plugin@0.2",

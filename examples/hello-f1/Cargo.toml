@@ -1,0 +1,15 @@
+[package]
+name = "akivili-example-hello-f1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The first F1 (wasm.component) pilot plugin — binds celestia:host/guest and exercises every host import"
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.57"

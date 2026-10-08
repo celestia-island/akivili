@@ -11,14 +11,14 @@
 //!   grant ceiling.
 //! - **The tairitsu adapter** (feature `tairitsu`):
 //!   [`WasmPluginHost`] builds a wasmtime [`AsyncContainer`] over a
-//!   component binary, registers the `celestia:host/host-v0` imports
+//!   component binary, registers the `celestia:host/guest` imports
 //!   against the host's [`HostCapabilities`] implementation, and
 //!   exposes a `run` call surface. The weight discipline (design D9):
 //!   nothing in akivili's other crates pulls wasmtime; consumers opt
 //!   into the feature.
 //!
 //! The WIT contract lives in [`wit/host.wit`](https://github.com/celestia-island/akivili/blob/master/packages/wasm_host/wit/host.wit)
-//! (world `celestia:host/host-v0`); guests bind with
+//! (world `celestia:host/guest`); guests bind with
 //! `wit_bindgen::generate!`.
 
 /// The capability-injection SPI (design D8) — runtime-agnostic.
@@ -126,7 +126,7 @@ mod adapter {
     }
 
     /// One loaded F1 plugin: a tairitsu [`AsyncContainer`] wired to the
-    /// host's [`HostCapabilities`] through the `host-v0` world imports.
+    /// host's [`HostCapabilities`] through the `guest` world imports.
     ///
     /// Built from a component binary (wasm32-wasip2). Fuel/epoch limits
     /// ride the builder before [`WasmPluginHost::build`].
@@ -167,7 +167,7 @@ mod adapter {
         }
 
         /// Build the host over a component binary: registers the
-        /// `host-v0` imports against the capabilities and instantiates
+        /// `guest` world imports against the capabilities and instantiates
         /// the component async.
         ///
         /// The registration itself uses sync host closures — wasmtime's
@@ -199,6 +199,12 @@ mod adapter {
 
                     let caps = capabilities.clone();
                     root.func_wrap("kv-set", move |_store, (key, value): (String, String)| {
+                        // A failed write traps the guest run (harder
+                        // than `log`, whose denials merely drop) — the
+                        // v0 world has no per-call error channel for
+                        // writes, and the trap's original cause is
+                        // reduced to the wasm backtrace at the ABI
+                        // boundary.
                         caps.kv_set(&key, &value)
                             .map_err(|e| wasmtime::format_err!(e.to_string()))
                     })?;
@@ -382,6 +388,116 @@ mod adapter_tests {
         // the B2 pilot with a properly configured image.)
         assert!(host.is_err(), "fuel without engine config must fail loud");
     }
+    /// Panics with a dedicated message when the wasm32-wasip2 target is
+    /// missing (the one legitimate skip condition).
+    fn ensure_pilot_toolchain_present() {
+        let out = std::process::Command::new("rustup")
+            .args(["target", "list", "--installed"])
+            .output();
+        let installed = out
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        if !installed.contains("wasm32-wasip2") {
+            panic!(
+                "SKIP (toolchain): wasm32-wasip2 target not installed — \
+                 CI installs it; locally run `rustup target add wasm32-wasip2`"
+            );
+        }
+    }
+
+    /// Builds the F1 pilot plugin (examples/hello-f1) for wasm32-wasip2
+    /// and returns its component binary. The pilot is the world's
+    /// reference guest: string ABI, every host import exercised.
+    fn pilot_wasm() -> Option<bytes::Bytes> {
+        let status = std::process::Command::new(env!("CARGO"))
+            .args([
+                "build",
+                "-p",
+                "akivili-example-hello-f1",
+                "--target",
+                "wasm32-wasip2",
+                "--release",
+            ])
+            .status()
+            .ok()?;
+        if !status.success() {
+            return None;
+        }
+        // CARGO_TARGET_DIR may be external; ask cargo where it puts
+        // artifacts by locating via the manifest metadata.
+        let out = std::process::Command::new(env!("CARGO"))
+            .args(["metadata", "--format-version", "1", "--no-deps"])
+            .output()
+            .ok()?;
+        let meta: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+        let target_dir = meta["target_directory"].as_str()?.to_string();
+        let wasm = std::path::Path::new(&target_dir)
+            .join("wasm32-wasip2/release/akivili_example_hello_f1.wasm");
+        std::fs::read(wasm).ok().map(bytes::Bytes::from)
+    }
+
+    /// The B2 headline: the FIRST full-round-trip through a real
+    /// wit-bindgen guest — host string → guest `run` → every host
+    /// import (kv-set, kv-get, config-get, log) dispatched into the
+    /// host's capability implementation → guest answer → host result
+    /// classification. A missing wasm32-wasip2 toolchain skips with a
+    /// dedicated panic message; a pilot build failure fails loudly.
+    #[tokio::test]
+    async fn f1_pilot_full_round_trip() {
+        let Some(wasm) = pilot_wasm() else {
+            // A missing wasm32-wasip2 toolchain is the one legitimate
+            // skip; a pilot BUILD failure must fail loudly (CI installs
+            // the target, so the green check always means the round-trip
+            // really ran).
+            ensure_pilot_toolchain_present();
+            panic!("pilot build failed with the toolchain present — see stderr");
+        };
+        let caps = Arc::new(InMemoryCapabilities::default().with_config("greeting", "hello"));
+        let mut host = WasmPluginHostBuilder::new(caps.clone())
+            .build(wasm)
+            .await
+            .expect("host must build over the pilot");
+
+        let out = host.run("fabric").await.expect("pilot run must succeed");
+        assert_eq!(out, "hello: fabric", "greeting + kv echo, got {out}");
+
+        // The guest's kv-set must have landed in the HOST's capability
+        // store — the injection chain is real, not mocked.
+        assert_eq!(
+            caps.kv_get("last-run").unwrap().as_deref(),
+            Some("fabric"),
+            "the pilot's kv-set must land host-side"
+        );
+    }
+
+    /// A guest's declared error (Err variant of run) must surface as
+    /// [`WasmHostError::Guest`], not a host failure — the parse_run_result
+    /// classification proven against a real bindgen guest's ABI.
+    #[tokio::test]
+    async fn f1_pilot_guest_error_classification() {
+        let Some(wasm) = pilot_wasm() else {
+            ensure_pilot_toolchain_present();
+            panic!("pilot build failed with the toolchain present — see stderr");
+        };
+        // No greeting configured → the pilot returns Err("config-get:
+        // greeting missing").
+        let caps = Arc::new(InMemoryCapabilities::default());
+        let mut host = WasmPluginHostBuilder::new(caps)
+            .build(wasm)
+            .await
+            .expect("host must build over the pilot");
+
+        let err = host.run("x").await.expect_err("missing config must fail");
+        match err {
+            crate::WasmHostError::Guest(msg) => {
+                assert!(
+                    msg.contains("greeting"),
+                    "guest error carries its message: {msg}"
+                );
+            }
+            other => panic!("expected Guest error, got {other}"),
+        }
+    }
 }
 
 /// The WIT contract gate: `wit/host.wit` must parse and carry the
@@ -408,9 +524,9 @@ mod wit_contract {
         let world = resolver
             .worlds
             .iter()
-            .find(|(_, world)| world.name == "host-v0")
+            .find(|(_, world)| world.name == "guest")
             .map(|(_, world)| world)
-            .expect("world host-v0 must exist");
+            .expect("world guest must exist");
         let import_names: Vec<String> = world
             .imports
             .iter()

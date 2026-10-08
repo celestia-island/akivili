@@ -11,17 +11,22 @@
 //! string-keyed capabilities only, sync host functions. Async host
 //! functions require wasmtime's `wasm_component_model_async` ABI and
 //! arrive with the fabric's async-ABI wave.
+//!
+//! Contract reference form (akivili_registry::ContractRef): the
+//! canonical reference to this world is `celestia:host/guest@0.1` —
+//! the two-part version is a compatibility constraint over the WIT
+//! package's semver (`0.1` covers `0.1.x`).
 
 package celestia:host@0.1.0;
 
-world host-v0 {
+world guest {
     /// Structured logging through the host (capability `log`).
     import log: func(level: string, message: string);
 
     /// Plugin-scoped key/value state (capability `kv.read`).
     import kv-get: func(key: string) -> option<string>;
     /// Plugin-scoped key/value state (capability `kv.write`).
-    import kv-set: func(key: string, value: string) -> result<_, string>;
+    import kv-set: func(key: string, value: string);
 
     /// The plugin's own configuration section (capability
     /// `config.read`).
