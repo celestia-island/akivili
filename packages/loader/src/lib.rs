@@ -154,16 +154,18 @@ impl ConfigManifest {
         // PluginManifest::validate enforce the id rule, form spelling
         // and closed capability vocabulary.
         let form = match self.form.as_deref() {
-            None | Some("web.resource") => None,
-            Some(f) => match f {
-                "wasm.component" | "process.rpc" | "script.ts" | "web.vue-module" => Some(f),
-                other => {
-                    return Err(LoaderError::Source(format!(
-                        "config plugin '{}' has unknown form '{other}'",
-                        self.id
-                    )));
-                }
-            },
+            None => akivili_registry::FormKind::WebResource,
+            Some("wasm.component") => akivili_registry::FormKind::WasmComponent,
+            Some("process.rpc") => akivili_registry::FormKind::ProcessRpc,
+            Some("script.ts") => akivili_registry::FormKind::ScriptTs,
+            Some("web.vue-module") => akivili_registry::FormKind::WebVueModule,
+            Some("web.resource") => akivili_registry::FormKind::WebResource,
+            Some(other) => {
+                return Err(LoaderError::Source(format!(
+                    "config plugin '{}' has unknown form '{other}'",
+                    self.id
+                )));
+            }
         };
         let capabilities = self
             .capabilities
