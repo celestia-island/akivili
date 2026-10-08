@@ -24,6 +24,16 @@ pub enum RegistryError {
     #[error("invalid resource kind '{0}': must match ^[a-z0-9-]+(\\.[a-z0-9-]+)+$")]
     InvalidResourceKind(String),
 
+    #[error(
+        "invalid capability '{0}': must come from the closed v1 vocabulary (optionally as word:parameter, e.g. http.egress:api.github.com)"
+    )]
+    InvalidCapability(String),
+
+    #[error(
+        "invalid contract reference '{0}': expected celestia:<domain>/<world>@<major>.<minor> (e.g. celestia:panel/host@0.1)"
+    )]
+    InvalidContractRef(String),
+
     #[error("invalid plugin manifest: {0}")]
     InvalidManifest(String),
 
