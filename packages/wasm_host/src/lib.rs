@@ -25,9 +25,10 @@
 ///
 /// Implement this once per host; the wasm adapter (and future runtime
 /// outlets) call through it. The v0 surface covers the vocabulary
-/// words `log`, `kv.read`, `kv.write` and `config.read`; every method
-/// is fallible so a host can enforce its grant ceiling (deny = error,
-/// never a silent default).
+/// words `log`, `kv.read`, `kv.write` and `config.read`; the data
+/// methods are fallible so a host can enforce its grant ceiling
+/// (deny = error, never a silent default). `log` is infallible by
+/// design — a denied log is a dropped log, not a guest trap.
 pub trait HostCapabilities: Send + Sync {
     /// Vocabulary word `log` — structured logging through the host.
     fn log(&self, level: &str, message: &str);
@@ -104,7 +105,6 @@ mod adapter {
     /// (`Ok("value")` / `Err("boom")`), so the guest's declared error must
     /// be re-classified here — the Ok arm strips the wrapper, the Err arm
     /// becomes [`WasmHostError::Guest`].
-    #[cfg_attr(not(feature = "tairitsu"), allow(dead_code))]
     pub(super) fn parse_run_result(raw: &str) -> Result<String, WasmHostError> {
         let trimmed = raw.trim();
         if let Some(inner) = trimmed

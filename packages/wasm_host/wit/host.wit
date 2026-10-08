@@ -15,11 +15,16 @@
 package celestia:host@0.1.0;
 
 world host-v0 {
+    /// Structured logging through the host (capability `log`).
     import log: func(level: string, message: string);
 
+    /// Plugin-scoped key/value state (capability `kv.read`).
     import kv-get: func(key: string) -> option<string>;
+    /// Plugin-scoped key/value state (capability `kv.write`).
     import kv-set: func(key: string, value: string) -> result<_, string>;
 
+    /// The plugin's own configuration section (capability
+    /// `config.read`).
     import config-get: func(key: string) -> option<string>;
 
     /// The plugin's entry point. `payload` is call-dependent
