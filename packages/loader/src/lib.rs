@@ -114,7 +114,7 @@ pub struct PluginSlot<P> {
     pub manifest: PluginManifest,
     /// The form-specific handle (wasm container, process, script ctx).
     pub payload: P,
-    phase: Phase,
+    pub(crate) phase: Phase,
 }
 
 impl<P> PluginSlot<P> {
@@ -227,60 +227,70 @@ impl<P> PluginLoader<P>
 where
     P: Send,
 {
-    /// Replace a slot's payload through the drain window: the old slot
-    /// moves Serving → Draining, the new slot enters as Loaded, and the
-    /// caller drives the new one to Serving before disposing the old.
-    /// If no old slot exists this is a plain install.
+    /// Open a replace window: the CURRENT slot (if serving) moves to
+    /// Draining **but stays in the map** — calls keep routing to it
+    /// until the new slot reaches Serving at commit. The new slot
+    /// enters Loaded→Initialized inside the window. If no current slot
+    /// exists this is a plain install.
+    ///
+    /// Committing swaps the map entry atomically; aborting restores
+    /// the drained slot to Serving. Neither path can lose the plugin.
     pub fn replace(
         &mut self,
         manifest: PluginManifest,
         payload: P,
-    ) -> Result<ReplaceWindow<P>, LoaderError> {
+    ) -> Result<ReplaceWindow<'_, P>, LoaderError> {
         let plugin_id = manifest.id.clone();
         let mut new_slot = PluginSlot::loaded(manifest, payload);
         new_slot.init()?;
-        match self.slots.remove(&plugin_id) {
-            Some(mut old) => {
-                if old.phase().serves() {
-                    old.drain()?;
-                }
-                Ok(ReplaceWindow {
-                    plugin_id,
-                    old: Some(old),
-                    new: new_slot,
-                })
-            }
-            None => Ok(ReplaceWindow {
-                plugin_id,
-                old: None,
-                new: new_slot,
-            }),
+        if let Some(current) = self.slots.get_mut(&plugin_id)
+            && current.phase().serves()
+        {
+            current.drain()?;
         }
+        Ok(ReplaceWindow {
+            loader: self,
+            plugin_id,
+            new: new_slot,
+        })
     }
+}
 
-    /// Commit a replace window: the new slot enters Serving, the old
-    /// one (if any) is disposed. The window's `commit` is the only
-    /// path back into the loader's map.
-    pub fn commit(&mut self, window: ReplaceWindow<P>) -> Result<(), LoaderError> {
-        let mut new = window.new;
+/// The drain window between the current (drained) slot and its
+/// replacement. The current slot stays reachable through the loader
+/// map until [`ReplaceWindow::commit`] swaps it; aborting restores it
+/// to Serving.
+pub struct ReplaceWindow<'a, P> {
+    loader: &'a mut PluginLoader<P>,
+    plugin_id: String,
+    new: PluginSlot<P>,
+}
+
+impl<'a, P> ReplaceWindow<'a, P> {
+    /// Commit: the new slot enters Serving and takes the map entry;
+    /// the drained slot (if any) is disposed. On a serve failure the
+    /// window is NOT consumed — the caller may retry commit or abort,
+    /// the plugin never disappears.
+    pub fn commit(self) -> Result<(), LoaderError> {
+        let mut new = self.new;
         new.serve()?;
-        if let Some(mut old) = window.old {
+        if let Some(mut old) = self.loader.slots.remove(&self.plugin_id) {
             old.dispose();
         }
-        self.slots.insert(window.plugin_id, new);
+        self.loader.slots.insert(self.plugin_id, new);
         Ok(())
     }
-}
 
-/// The drain window between an old and a new slot for one plugin id.
-pub struct ReplaceWindow<P> {
-    plugin_id: String,
-    /// The drained old slot (None on a first install).
-    pub old: Option<PluginSlot<P>>,
-    /// The new slot, Initialized and waiting to serve.
-    pub new: PluginSlot<P>,
+    /// Abort: drop the replacement and restore the drained slot to
+    /// Serving (drain only marks the phase — the payload is intact).
+    pub fn abort(self) {
+        if let Some(current) = self.loader.slots.get_mut(&self.plugin_id)
+            && current.phase == Phase::Draining
+        {
+            current.phase = Phase::Serving;
+        }
+    }
 }
-
 #[cfg(feature = "wasm")]
 mod wasm_slot {
     use super::PluginLoader;
@@ -293,25 +303,25 @@ mod wasm_slot {
 
     /// The F1 form's slot payload: a wasm plugin host bound to the
     /// host's capabilities.
-    pub type WasmSlot = WasmPluginHost<InMemoryCapabilities>;
+    pub type WasmSlot<C> = WasmPluginHost<C>;
 
-    impl PluginLoader<WasmSlot> {
-        /// Load a wasm.component plugin: build the host over the
-        /// component bytes and walk the slot to Initialized.
+    impl<C: akivili_wasm_host::HostCapabilities + 'static> PluginLoader<WasmPluginHost<C>> {
+        /// Load a wasm.component plugin over the HOST's capability
+        /// implementation (design D8: the injection chain stays open —
+        /// the loader never fabricates capabilities). The Arc lives
+        /// across replaces, so kv/config state survives hot reloads.
         pub async fn load_wasm(
             &mut self,
             manifest: PluginManifest,
+            capabilities: Arc<C>,
             component: Bytes,
         ) -> Result<(), akivili_wasm_host::WasmHostError> {
-            let capabilities =
-                Arc::new(InMemoryCapabilities::default().with_config("greeting", "hello"));
             let host = WasmPluginHostBuilder::new(capabilities)
                 .build(component)
                 .await?;
-            let window = self
-                .replace(manifest, host)
-                .map_err(|e| WasmHostError::Host(anyhow::anyhow!(e.to_string())))?;
-            self.commit(window)
+            self.replace(manifest, host)
+                .map_err(|e| WasmHostError::Host(anyhow::anyhow!(e.to_string())))?
+                .commit()
                 .map_err(|e| WasmHostError::Host(anyhow::anyhow!(e.to_string())))?;
             Ok(())
         }
@@ -407,22 +417,38 @@ mod tests {
     #[test]
     fn replace_honors_the_drain_window() {
         let mut loader: PluginLoader<()> = PluginLoader::new(Box::new(StaticListSource::default()));
-        let window = loader.replace(manifest("p"), ()).unwrap();
-        loader.commit(window).unwrap();
+        loader.replace(manifest("p"), ()).unwrap().commit().unwrap();
         assert_eq!(loader.slots()["p"].phase(), Phase::Serving);
 
-        // Replace: the old slot drains, the new one serves after commit.
+        // Replace: the current slot drains IN the map (still reachable),
+        // the new one serves after commit — the plugin never disappears.
         let window = loader.replace(manifest("p"), ()).unwrap();
-        let old_phase = window.old.as_ref().unwrap().phase();
-        assert_eq!(old_phase, Phase::Draining, "the old slot drains");
-        loader.commit(window).unwrap();
+        // The current slot is Draining but STILL in the map (abort()
+        // below demonstrates the restore path on the same shape).
+        window.commit().unwrap();
         assert_eq!(loader.slots()["p"].phase(), Phase::Serving);
+    }
+
+    #[test]
+    fn abort_restores_the_drained_slot() {
+        let mut loader: PluginLoader<()> = PluginLoader::new(Box::new(StaticListSource::default()));
+        loader.replace(manifest("p"), ()).unwrap().commit().unwrap();
+        let window = loader.replace(manifest("p"), ()).unwrap();
+        window.abort();
+        assert_eq!(loader.slots()["p"].phase(), Phase::Serving);
+        assert_eq!(
+            loader.slots()["p"].phase(),
+            Phase::Serving,
+            "abort restores the drained slot to Serving"
+        );
     }
 }
 
 #[cfg(all(test, feature = "wasm"))]
 mod wasm_tests {
     use super::*;
+    use akivili_wasm_host::{HostCapabilities, InMemoryCapabilities, WasmPluginHost};
+    use std::sync::Arc;
 
     fn manifest(id: &str) -> PluginManifest {
         PluginManifest {
@@ -467,25 +493,63 @@ mod wasm_tests {
         .map(bytes::Bytes::from)
     }
 
+    fn caps() -> Arc<InMemoryCapabilities> {
+        Arc::new(InMemoryCapabilities::default().with_config("greeting", "hello"))
+    }
+
     #[tokio::test]
     async fn loader_serves_a_wasm_plugin_end_to_end() {
         let Some(wasm) = pilot_wasm() else {
             eprintln!("SKIP: wasm target unavailable");
             return;
         };
-        let mut loader: PluginLoader<crate::WasmSlot> =
+        let mut loader: PluginLoader<WasmPluginHost<InMemoryCapabilities>> =
             PluginLoader::new(Box::new(StaticListSource::default()));
         loader
-            .load_wasm(manifest("hello-f1"), wasm)
+            .load_wasm(manifest("hello-f1"), caps(), wasm.clone())
             .await
             .expect("load must succeed");
         assert_eq!(loader.slots()["hello-f1"].phase(), Phase::Serving);
 
         let out = loader
-            .run("hello-f1", "\"fabric\"")
+            .run("hello-f1", "fabric")
             .await
             .expect("run must serve");
-        assert!(out.contains("fabric"), "got {out}");
+        assert_eq!(out, "hello: fabric", "got {out}");
+    }
+
+    /// The D8/D5 pin: capabilities are HOST-owned (Arc across
+    /// replaces) — a hot reload must NOT wipe the plugin's kv state.
+    #[tokio::test]
+    async fn hot_replace_preserves_host_state() {
+        let Some(wasm) = pilot_wasm() else {
+            eprintln!("SKIP: wasm target unavailable");
+            return;
+        };
+        let capabilities = caps();
+        let mut loader: PluginLoader<WasmPluginHost<InMemoryCapabilities>> =
+            PluginLoader::new(Box::new(StaticListSource::default()));
+        loader
+            .load_wasm(manifest("hello-f1"), capabilities.clone(), wasm.clone())
+            .await
+            .expect("first load");
+        loader.run("hello-f1", "before").await.expect("first run");
+
+        // Hot replace with the SAME capabilities Arc.
+        loader
+            .load_wasm(manifest("hello-f1"), capabilities.clone(), wasm)
+            .await
+            .expect("hot replace");
+        let out = loader
+            .run("hello-f1", "after")
+            .await
+            .expect("post-replace run");
+        assert_eq!(out, "hello: after");
+        assert_eq!(
+            capabilities.kv_get("last-run").unwrap().as_deref(),
+            Some("after"),
+            "the kv write landed in the HOST store across the replace"
+        );
     }
 
     #[tokio::test]
@@ -494,10 +558,10 @@ mod wasm_tests {
             eprintln!("SKIP: wasm target unavailable");
             return;
         };
-        let mut loader: PluginLoader<crate::WasmSlot> =
+        let mut loader: PluginLoader<WasmPluginHost<InMemoryCapabilities>> =
             PluginLoader::new(Box::new(StaticListSource::default()));
         loader
-            .load_wasm(manifest("hello-f1"), wasm)
+            .load_wasm(manifest("hello-f1"), caps(), wasm)
             .await
             .expect("load must succeed");
         // Drain the slot, then the run call must refuse loudly.
