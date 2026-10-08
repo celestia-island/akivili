@@ -1,0 +1,32 @@
+[package]
+name = "akivili_loader"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Plugin fabric loader — unified lifecycle orchestration over the registry and the F1 wasm host, with a pluggable plugin-list source (evernight topology or own config)"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[dependencies]
+akivili_registry = { path = "../registry" }
+anyhow.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# The F1 outlet: only consumers who opt into wasm pull the runtime stack
+# (the D9 weight discipline — the loader core itself stays tairitsu-free).
+akivili_wasm_host = { path = "../wasm_host", optional = true }
+
+[features]
+default = []
+wasm = ["dep:akivili_wasm_host", "akivili_wasm_host/tairitsu"]
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { version = "^1", features = ["rt", "macros"] }

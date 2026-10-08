@@ -13,10 +13,11 @@ members = [
     "packages/iepl",
     "packages/registry",
     "packages/wasm_host",
+    "packages/loader",
 ]
 
 [workspace.package]
-version = "0.2.8"
+version = "0.2.9"
 edition = "2024"
 rust-version = "1.91"
 authors = ["langyo <langyo.china@gmail.com>"]
