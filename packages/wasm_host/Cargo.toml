@@ -1,0 +1,39 @@
+[package]
+name = "akivili_wasm_host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Plugin fabric F1 adapter — the thin wasm_host crate over the tairitsu runtime (feature-gated; core akivili stays tairitsu-free)"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# The tairitsu-backed adapter: pulls the wasm runtime stack ONLY for
+# hosts that opt in (the D9 weight discipline — registry/loader/iepl/
+# plugin_host/guard never see wasmtime).
+tairitsu = ["dep:tairitsu", "dep:wasmtime"]
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+tairitsu = { git = "https://github.com/celestia-island/tairitsu.git", branch = "master", optional = true, features = ["dynamic"] }
+# Aligned with tairitsu's wasmtime (^47 — one copy after unification);
+# only the Error type and the ABI surfaces the closures need.
+wasmtime = { version = "^47", optional = true }
+
+[dev-dependencies]
+tokio = { version = "^1", features = ["rt", "macros"] }
+wat = "^1"
+
+[package.metadata.wit]
+# The WIT contract ships in-tree; guests bind against
+# packages/wasm_host/wit/host.wit (world celestia:host/host-v0).
+world = "host-v0"
