@@ -126,7 +126,7 @@ mod adapter {
     }
 
     /// One loaded F1 plugin: a tairitsu [`AsyncContainer`] wired to the
-    /// host's [`HostCapabilities`] through the `host-v0` world imports.
+    /// host's [`HostCapabilities`] through the `guest` world imports.
     ///
     /// Built from a component binary (wasm32-wasip2). Fuel/epoch limits
     /// ride the builder before [`WasmPluginHost::build`].
@@ -167,7 +167,7 @@ mod adapter {
         }
 
         /// Build the host over a component binary: registers the
-        /// `host-v0` imports against the capabilities and instantiates
+        /// `guest` world imports against the capabilities and instantiates
         /// the component async.
         ///
         /// The registration itself uses sync host closures — wasmtime's
@@ -199,9 +199,12 @@ mod adapter {
 
                     let caps = capabilities.clone();
                     root.func_wrap("kv-set", move |_store, (key, value): (String, String)| {
-                        // Failures trap (the same contract as `log`) —
-                        // the v0 world has no per-call error channel for
-                        // writes.
+                        // A failed write traps the guest run (harder
+                        // than `log`, whose denials merely drop) — the
+                        // v0 world has no per-call error channel for
+                        // writes, and the trap's original cause is
+                        // reduced to the wasm backtrace at the ABI
+                        // boundary.
                         caps.kv_set(&key, &value)
                             .map_err(|e| wasmtime::format_err!(e.to_string()))
                     })?;
@@ -385,6 +388,23 @@ mod adapter_tests {
         // the B2 pilot with a properly configured image.)
         assert!(host.is_err(), "fuel without engine config must fail loud");
     }
+    /// Panics with a dedicated message when the wasm32-wasip2 target is
+    /// missing (the one legitimate skip condition).
+    fn ensure_pilot_toolchain_present() {
+        let out = std::process::Command::new("rustup")
+            .args(["target", "list", "--installed"])
+            .output();
+        let installed = out
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        if !installed.contains("wasm32-wasip2") {
+            panic!(
+                "SKIP (toolchain): wasm32-wasip2 target not installed — \
+                 CI installs it; locally run `rustup target add wasm32-wasip2`"
+            );
+        }
+    }
+
     /// Builds the F1 pilot plugin (examples/hello-f1) for wasm32-wasip2
     /// and returns its component binary. The pilot is the world's
     /// reference guest: string ABI, every host import exercised.
@@ -424,8 +444,12 @@ mod adapter_tests {
     #[tokio::test]
     async fn f1_pilot_full_round_trip() {
         let Some(wasm) = pilot_wasm() else {
-            eprintln!("SKIP: wasm32-wasip2 target or pilot build unavailable");
-            return;
+            // A missing wasm32-wasip2 toolchain is the one legitimate
+            // skip; a pilot BUILD failure must fail loudly (CI installs
+            // the target, so the green check always means the round-trip
+            // really ran).
+            ensure_pilot_toolchain_present();
+            panic!("pilot build failed with the toolchain present — see stderr");
         };
         let caps = Arc::new(InMemoryCapabilities::default().with_config("greeting", "hello"));
         let mut host = WasmPluginHostBuilder::new(caps.clone())
@@ -451,8 +475,8 @@ mod adapter_tests {
     #[tokio::test]
     async fn f1_pilot_guest_error_classification() {
         let Some(wasm) = pilot_wasm() else {
-            eprintln!("SKIP: wasm32-wasip2 target or pilot build unavailable");
-            return;
+            ensure_pilot_toolchain_present();
+            panic!("pilot build failed with the toolchain present — see stderr");
         };
         // No greeting configured → the pilot returns Err("config-get:
         // greeting missing").

@@ -55,6 +55,8 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+      - name: Install wasm32-wasip2 target
+        run: rustup target add wasm32-wasip2
       - name: Compile check (tairitsu adapter)
         run: cargo check -p akivili_wasm_host --features tairitsu --all-targets
       - name: Clippy (tairitsu adapter)

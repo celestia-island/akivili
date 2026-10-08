@@ -1,6 +1,6 @@
 //! The first F1 pilot plugin (Celestia Plugin Fabric B2).
 //!
-//! Binds the `celestia:host/host-v0` world (packages/wasm_host/wit/
+//! Binds the `celestia:host/guest` world (packages/wasm_host/wit/
 //! host.wit) and exercises EVERY host import on each `run`: writes a
 //! kv entry, reads it back, reads a config key, and logs the summary.
 //! The run answer is the plugin's report — the adapter tests assert

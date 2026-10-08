@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "The first F1 (wasm.component) pilot plugin — binds celestia:host/host-v0 and exercises every host import"
+description = "The first F1 (wasm.component) pilot plugin — binds celestia:host/guest and exercises every host import"
 repository.workspace = true
 publish = false
 
