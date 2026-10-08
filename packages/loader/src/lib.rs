@@ -295,9 +295,7 @@ impl<'a, P> ReplaceWindow<'a, P> {
 mod wasm_slot {
     use super::PluginLoader;
     use akivili_registry::PluginManifest;
-    use akivili_wasm_host::{
-        InMemoryCapabilities, WasmHostError, WasmPluginHost, WasmPluginHostBuilder,
-    };
+    use akivili_wasm_host::{WasmHostError, WasmPluginHost, WasmPluginHostBuilder};
     use bytes::Bytes;
     use std::sync::Arc;
 
