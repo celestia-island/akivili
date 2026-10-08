@@ -228,6 +228,31 @@ impl<'de> Deserialize<'de> for ContractRef {
     }
 }
 
+impl Default for PluginManifest {
+    /// The v1 baseline: every non-essential field empty, schema 1.
+    ///
+    /// This exists so downstream constructors (chest's store ops, tests)
+    /// can use struct-update syntax (`..PluginManifest::default()`) and
+    /// stay source-compatible when this crate grows additive fields —
+    /// a bare literal pins every field and breaks on each addition.
+    /// A default is **not** a valid manifest: `validate()` rejects the
+    /// empty id/version/provider.
+    fn default() -> Self {
+        Self {
+            schema: SCHEMA_V1,
+            id: String::new(),
+            version: String::new(),
+            provider: String::new(),
+            description: None,
+            form: None,
+            capabilities: Vec::new(),
+            requires_contract: Vec::new(),
+            trust: None,
+            resources: Vec::new(),
+        }
+    }
+}
+
 impl PluginManifest {
     /// Validates the manifest against its schema generation.
     ///
@@ -690,6 +715,36 @@ requires-contract = ["celestia:panel/host@0.1", "celestia:kv/host@0.2"]
     fn v1_default_form_is_web_resource() {
         let manifest = v1_manifest();
         assert_eq!(manifest.form_or_default(), FormKind::WebResource);
+    }
+
+    #[test]
+    fn default_is_the_v1_baseline_and_is_not_a_valid_manifest() {
+        // Downstream struct-update constructors rely on the default being
+        // the v1 baseline; validate() must still reject it loudly.
+        let default = PluginManifest::default();
+        assert_eq!(default.schema, SCHEMA_V1);
+        assert!(default.form.is_none());
+        assert!(default.capabilities.is_empty());
+        assert!(default.requires_contract.is_empty());
+        assert!(default.trust.is_none());
+        assert!(default.resources.is_empty());
+        assert!(default.validate().is_err(), "default must not validate");
+    }
+
+    #[test]
+    fn struct_update_syntax_stays_v1_compatible() {
+        // The exact construction shape chest's store ops will use after
+        // this PR: fill the six v1 fields, inherit the rest.
+        let manifest = PluginManifest {
+            id: "acme".into(),
+            version: "1".into(),
+            provider: "acme".into(),
+            description: None,
+            resources: Vec::new(),
+            ..PluginManifest::default()
+        };
+        assert_eq!(manifest.schema, SCHEMA_V1);
+        manifest.validate().expect("v1 semantics preserved");
     }
 
     #[test]
