@@ -11,10 +11,11 @@ members = [
     "packages/plugin_host",
     "packages/iepl",
     "packages/registry",
+    "packages/wasm_host",
 ]
 
 [workspace.package]
-version = "0.2.6"
+version = "0.2.7"
 edition = "2024"
 rust-version = "1.91"
 authors = ["langyo <langyo.china@gmail.com>"]
@@ -26,6 +27,7 @@ keywords = ["plugin", "agent", "wasm", "typescript", "ai-agent"]
 categories = ["development-tools"]
 
 [workspace.dependencies]
+bytes = "^1"
 anyhow = "^1"
 async-trait = "^0.1"
 boa_engine = "^0.21"
