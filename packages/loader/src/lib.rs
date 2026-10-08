@@ -179,13 +179,7 @@ impl ConfigManifest {
             version: self.version,
             provider: self.provider,
             description: None,
-            form: form.map(|f| match f {
-                "wasm.component" => akivili_registry::FormKind::WasmComponent,
-                "process.rpc" => akivili_registry::FormKind::ProcessRpc,
-                "script.ts" => akivili_registry::FormKind::ScriptTs,
-                "web.vue-module" => akivili_registry::FormKind::WebVueModule,
-                _ => unreachable!("the match above filters"),
-            }),
+            form: Some(form),
             capabilities,
             requires_contract: Vec::new(),
             trust: None,
@@ -662,6 +656,63 @@ provider = "p"
         assert!(err.to_string().contains("bad-id"), "{err}");
         // The error is cached — every read reports it, never an empty list.
         assert!(loader.current_manifests().is_err());
+    }
+
+    #[test]
+    fn omitted_form_defaults_to_web_resource() {
+        let text = r#"
+[[plugin]]
+id = "theme-pack"
+version = "1.0.0"
+provider = "official"
+"#;
+        let source = ConfigListSource::from_toml(text).expect("parses");
+        let loader: PluginLoader<()> = PluginLoader::new(Box::new(source));
+        let manifests = loader.current_manifests().expect("defaults validate");
+        assert_eq!(
+            manifests[0].form,
+            Some(akivili_registry::FormKind::WebResource),
+            "an omitted form defaults to web.resource and validates under schema 2"
+        );
+    }
+
+    #[test]
+    fn every_official_form_round_trips_through_the_config_lane() {
+        for (spelling, expected) in [
+            ("wasm.component", akivili_registry::FormKind::WasmComponent),
+            ("process.rpc", akivili_registry::FormKind::ProcessRpc),
+            ("script.ts", akivili_registry::FormKind::ScriptTs),
+            ("web.vue-module", akivili_registry::FormKind::WebVueModule),
+            ("web.resource", akivili_registry::FormKind::WebResource),
+        ] {
+            let text = format!(
+                "\n[[plugin]]\nid = \"form-check\"\nversion = \"1.0.0\"\nprovider = \"p\"\nform = \"{spelling}\"\n"
+            );
+            let source = ConfigListSource::from_toml(&text).expect(spelling);
+            let manifests = source.into_manifests().expect(spelling);
+            assert_eq!(
+                manifests[0].form,
+                Some(expected),
+                "the config lane must accept every official {spelling} spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_form_rejects_loudly() {
+        let text = r#"
+[[plugin]]
+id = "x"
+version = "1.0.0"
+provider = "p"
+form = "web.fake"
+"#;
+        let source = ConfigListSource::from_toml(text).expect("parses");
+        let err = source.into_manifests().unwrap_err();
+        assert!(
+            err.to_string().contains("web.fake"),
+            "the unknown form name must survive, got {err}"
+        );
     }
 
     #[test]
