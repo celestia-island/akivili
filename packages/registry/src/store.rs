@@ -708,4 +708,83 @@ value = 1
         let kind = ResourceKind::new(crate::kinds::WEBUI_STYLE).unwrap();
         assert_eq!(kind.as_str(), "webui.style");
     }
+
+    #[test]
+    fn scan_accepts_schema_2_manifests_and_feeds_their_resources() {
+        // End-to-end: a schema 2 plugin (form, capabilities, contract ref,
+        // trust section) scans, validates, and feeds resources exactly like
+        // a v1 plugin — the new fields are additive at the store level.
+        let v2 = r##"
+schema = 2
+id = "celestia-kanban"
+version = "1.2.0"
+provider = "official"
+form = "web.vue-module"
+capabilities = ["kv.read", "mesh.call:celestia-reports"]
+requires-contract = ["celestia:panel/host@0.1"]
+
+[trust]
+signature = "agent.sig"
+min-trust = "verified-publisher"
+
+[[resources]]
+kind = "webui.module"
+order = 1
+
+[resources.payload.File]
+path = "module.toml"
+sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+"##;
+        let results = scan_with(&[("celestia-kanban", v2, &[("module.toml", "")])]).unwrap();
+        assert_eq!(results.len(), 1, "the schema 2 plugin must be accepted");
+        match &results[0] {
+            ScanResult::Accepted(record) => {
+                assert_eq!(record.manifest.id, "celestia-kanban");
+                assert_eq!(record.manifest.schema, 2);
+                assert_eq!(record.manifest.resources.len(), 1);
+            }
+            other => panic!("expected an accepted scan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_rejects_v2_manifests_that_violate_the_schema_gates() {
+        // v1 smuggling a v2 field must land in rejections, not panic.
+        let smuggler = r#"
+id = "smuggler"
+version = "1"
+provider = "acme"
+capabilities = ["kv.read"]
+"#;
+        let results = scan_with(&[("smuggler", smuggler, &[])]).unwrap();
+        match &results[0] {
+            ScanResult::Rejected(rejection) => {
+                assert!(
+                    rejection.reason.contains("capabilities"),
+                    "got: {}",
+                    rejection.reason
+                );
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+
+        // schema 2 without a form is a rejection too.
+        let formless = r#"
+schema = 2
+id = "formless"
+version = "1.0.0"
+provider = "acme"
+"#;
+        let results = scan_with(&[("formless", formless, &[])]).unwrap();
+        match &results[0] {
+            ScanResult::Rejected(rejection) => {
+                assert!(
+                    rejection.reason.contains("form"),
+                    "got: {}",
+                    rejection.reason
+                );
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
 }

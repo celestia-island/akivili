@@ -96,9 +96,11 @@
 
 pub mod acceptance;
 pub mod audit;
+pub mod capabilities;
 pub mod cli;
 pub mod error;
 pub mod feed;
+pub mod forms;
 pub mod handle;
 pub mod kinds;
 pub mod manifest;
@@ -107,10 +109,15 @@ pub mod store;
 
 pub use acceptance::{HostAcceptance, KindFilter};
 pub use audit::{AuditEvent, AuditLog};
+pub use capabilities::{Capability, VOCABULARY_V1};
 pub use error::{RegistryError, RegistryResult};
 pub use feed::{FeedItem, ResolvedPayload, ResourceFeed};
+pub use forms::FormKind;
 pub use handle::{LocalRegistration, ResourceHandle};
 pub use kinds::ResourceKind;
-pub use manifest::{Payload, PluginManifest, ResourceEntry};
+pub use manifest::{
+    ContractRef, MinTrust, Payload, PluginManifest, ResourceEntry, SCHEMA_V1, SCHEMA_V2,
+    TrustSection,
+};
 pub use registry::{DEFAULT_MAX_PAYLOAD_BYTES, Registry, RegistryOptions};
 pub use store::{PluginRecord, Rejection, ScanResult};

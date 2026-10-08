@@ -10,6 +10,7 @@
 //! akivili-plugin [--store <dir>] [--audit <path>] enable <id>
 //! akivili-plugin [--store <dir>] [--audit <path>] disable <id>
 //! akivili-plugin [--store <dir>] [--audit <path>] audit [N]
+//! akivili-plugin validate <manifest-path>
 //! ```
 //!
 //! `--store` defaults to `./plugins`; `--audit` defaults to
@@ -192,7 +193,8 @@ pub fn usage() -> String {
          check                scan and validate the store (non-zero exit on rejections)\n  \
          enable <id>          enable a plugin\n  \
          disable <id>         disable a plugin\n  \
-         audit [N]            show the last N audit events (default {DEFAULT_AUDIT_TAIL})\n\n\
+         audit [N]            show the last N audit events (default {DEFAULT_AUDIT_TAIL})\n  \
+         validate <path>      parse and validate one manifest file (no store needed)\n\n\
          defaults: --store ./{DEFAULT_STORE_DIR}  --audit <store>/{DEFAULT_AUDIT_FILE}\n"
     )
 }
@@ -218,6 +220,28 @@ fn run_inner(args: &[String]) -> Result<i32, String> {
         .first()
         .ok_or_else(|| "missing command".to_string())?;
     match command.as_str() {
+        "validate" => {
+            // Single-manifest validation for plugin authors: no store, no
+            // audit trail — parse the file and run the same schema
+            // validation the store scanner applies (schema generations,
+            // form gating, capability vocabulary, contract refs).
+            let path = positional
+                .get(1)
+                .ok_or_else(|| "validate requires a manifest path".to_string())?;
+            let text =
+                std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
+            let manifest: crate::manifest::PluginManifest =
+                toml::from_str(&text).map_err(|e| format!("parse error: {e}"))?;
+            manifest.validate().map_err(|e| e.to_string())?;
+            println!(
+                "ok: {} v{} (schema {}, form {})",
+                manifest.id,
+                manifest.version,
+                manifest.schema,
+                manifest.form_or_default()
+            );
+            Ok(0)
+        }
         "list" => {
             // Read-only: quiet open scans without replaying scan events
             // into the audit log, so listing does not grow the trail.
@@ -505,8 +529,78 @@ primary = "#181825"
     #[test]
     fn usage_lists_every_command() {
         let text = usage();
-        for command in ["list", "check", "enable", "disable", "audit"] {
+        for command in ["list", "check", "enable", "disable", "audit", "validate"] {
             assert!(text.contains(command), "usage must mention {command}");
         }
+    }
+
+    #[test]
+    fn validate_accepts_a_schema_2_manifest_without_a_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MANIFEST_FILE);
+        std::fs::write(
+            &path,
+            r##"
+schema = 2
+id = "celestia-kanban"
+version = "1.2.0"
+provider = "official"
+form = "web.vue-module"
+capabilities = ["kv.read", "mesh.call:celestia-reports"]
+requires-contract = ["celestia:panel/host@0.1"]
+"##,
+        )
+        .unwrap();
+        let args = vec!["validate".to_string(), path.display().to_string()];
+        assert_eq!(run(&args), 0, "a valid schema 2 manifest must pass");
+    }
+
+    #[test]
+    fn validate_rejects_bad_manifests_with_exit_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MANIFEST_FILE);
+
+        // v1 manifest smuggling a v2 field.
+        std::fs::write(
+            &path,
+            r#"
+id = "acme"
+version = "1"
+provider = "acme"
+form = "script.ts"
+"#,
+        )
+        .unwrap();
+        let args = vec!["validate".to_string(), path.display().to_string()];
+        assert_eq!(run(&args), 2, "v1 with a v2 field must be rejected");
+
+        // schema 2 with a capability outside the closed vocabulary.
+        std::fs::write(
+            &path,
+            r#"
+schema = 2
+id = "acme"
+version = "1.0.0"
+provider = "acme"
+form = "script.ts"
+capabilities = ["fs.read"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            run(&args),
+            2,
+            "out-of-vocabulary capabilities must be rejected"
+        );
+
+        // missing path argument
+        assert_eq!(run(&["validate".to_string()]), 2);
+
+        // unreadable path
+        let missing = dir.path().join("nope.toml");
+        assert_eq!(
+            run(&["validate".to_string(), missing.display().to_string()]),
+            2
+        );
     }
 }

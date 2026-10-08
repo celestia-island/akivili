@@ -12,6 +12,14 @@ pub const WEBUI_MODULE: &str = "webui.module";
 pub const SANDBOX_ENV: &str = "sandbox.env";
 /// Well-known resource kind: an MCP tool registration.
 pub const TOOL_MCP: &str = "tool.mcp";
+/// Well-known resource kind: a WASM component payload (plugin-fabric form F1).
+pub const WASM_COMPONENT: &str = "wasm.component";
+/// Well-known resource kind: a process-rpc plugin payload (form F2).
+pub const PROCESS_RPC: &str = "process.rpc";
+/// Well-known resource kind: a TypeScript script plugin payload (form F3).
+pub const SCRIPT_TS: &str = "script.ts";
+/// Well-known resource kind: a Vue3+TSX+SCSS webui module (form F4).
+pub const WEB_VUE_MODULE: &str = "web.vue-module";
 
 /// An open-set resource kind tag, e.g. `webui.style`.
 ///
@@ -93,6 +101,10 @@ mod tests {
             WEBUI_MODULE,
             SANDBOX_ENV,
             TOOL_MCP,
+            WASM_COMPONENT,
+            PROCESS_RPC,
+            SCRIPT_TS,
+            WEB_VUE_MODULE,
         ] {
             let parsed = ResourceKind::new(kind).expect("well-known kinds must be valid");
             assert_eq!(parsed.as_str(), kind);
