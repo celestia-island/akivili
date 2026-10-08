@@ -17,6 +17,7 @@ bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 tracing.workspace = true
 
 # The F1 outlet: only consumers who opt into wasm pull the runtime stack
