@@ -99,6 +99,32 @@ mod adapter {
     use std::sync::Arc;
     use tairitsu::{AsyncContainer, Container, Image};
 
+    /// Unwraps the dynamic-path RON for a `result<string, string>` return:
+    /// tairitsu serializes both variants as the Ok-side RON string
+    /// (`Ok("value")` / `Err("boom")`), so the guest's declared error must
+    /// be re-classified here — the Ok arm strips the wrapper, the Err arm
+    /// becomes [`WasmHostError::Guest`].
+    #[cfg_attr(not(feature = "tairitsu"), allow(dead_code))]
+    pub(super) fn parse_run_result(raw: &str) -> Result<String, WasmHostError> {
+        let trimmed = raw.trim();
+        if let Some(inner) = trimmed
+            .strip_prefix("Ok(")
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
+            Ok(inner.trim().trim_matches('"').to_string())
+        } else if let Some(inner) = trimmed
+            .strip_prefix("Err(")
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
+            Err(WasmHostError::Guest(
+                inner.trim().trim_matches('"').to_string(),
+            ))
+        } else {
+            // A bare string (no result wrapper): treat as the payload.
+            Ok(trimmed.trim_matches('"').to_string())
+        }
+    }
+
     /// One loaded F1 plugin: a tairitsu [`AsyncContainer`] wired to the
     /// host's [`HostCapabilities`] through the `host-v0` world imports.
     ///
@@ -218,11 +244,7 @@ mod adapter {
                 .container
                 .call_guest_raw_desc_async("run", &format!("{payload:?}"))
                 .await?;
-            // result<string, string> over the dynamic Val path comes
-            // back as RON for an Ok variant: "value"; Err arrives as
-            // the error RON which call path surfaces as an error string.
-            let trimmed = out.trim().trim_matches('"');
-            Ok(trimmed.to_string())
+            parse_run_result(&out)
         }
 
         /// The dynamic call surface — any export, any RON payload.
@@ -275,7 +297,27 @@ mod tests {
 
 #[cfg(all(test, feature = "tairitsu"))]
 mod adapter_tests {
+    use super::adapter::parse_run_result;
     use super::*;
+
+    #[test]
+    fn run_result_ron_unwrapping_classifies_guest_errors() {
+        assert_eq!(
+            parse_run_result("Ok(\"hello\")").unwrap(),
+            "hello",
+            "the Ok wrapper strips, the inner string survives"
+        );
+        let guest_err = parse_run_result("Err(\"boom\")").unwrap_err();
+        assert!(
+            matches!(&guest_err, crate::WasmHostError::Guest(msg) if msg == "boom"),
+            "the Err arm becomes a Guest error, got {guest_err}"
+        );
+        assert_eq!(
+            parse_run_result("\"bare\"").unwrap(),
+            "bare",
+            "a bare string falls back to the payload"
+        );
+    }
     use std::sync::Arc;
 
     /// A compute-only guest (no imports — the host-api imports stay
@@ -339,5 +381,62 @@ mod adapter_tests {
         // set_fuel — the loud path. (The fuel-enforced happy path rides
         // the B2 pilot with a properly configured image.)
         assert!(host.is_err(), "fuel without engine config must fail loud");
+    }
+}
+
+/// The WIT contract gate: `wit/host.wit` must parse and carry the
+/// world-v0 shape (four host imports, one guest export). Syntax or
+/// shape drift fails here in CI instead of at B2 bind time.
+#[cfg(test)]
+mod wit_contract {
+
+    /// The WIT contract gate: `wit/host.wit` must parse and carry the
+    /// world-v0 shape (four host imports, one guest export). Syntax or
+    /// shape drift fails here in CI instead of at B2 bind time.
+    #[test]
+    fn parses_and_pins_the_world_shape() {
+        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/wit/host.wit"))
+            .expect("wit/host.wit must ship in-tree");
+        let unresolved = wit_parser::UnresolvedPackageGroup::parse("wit/host.wit", &source)
+            .unwrap_or_else(|e| panic!("host.wit must parse: {e:?}"));
+        let mut resolver = wit_parser::Resolve::new();
+        resolver
+            .push_group(unresolved)
+            .unwrap_or_else(|e| panic!("host.wit must resolve: {e:?}"));
+
+        // Resolve.worlds is an Arena<World>: iterate (Id, &World) pairs.
+        let world = resolver
+            .worlds
+            .iter()
+            .find(|(_, world)| world.name == "host-v0")
+            .map(|(_, world)| world)
+            .expect("world host-v0 must exist");
+        let import_names: Vec<String> = world
+            .imports
+            .iter()
+            .filter_map(|(_, item)| extern_name(item))
+            .collect();
+        for expected in ["log", "kv-get", "kv-set", "config-get"] {
+            assert!(
+                import_names.iter().any(|n| n == expected),
+                "world must import {expected}, got {import_names:?}"
+            );
+        }
+        let export_names: Vec<String> = world
+            .exports
+            .iter()
+            .filter_map(|(_, item)| extern_name(item))
+            .collect();
+        assert!(
+            export_names.iter().any(|n| n == "run"),
+            "world must export run, got {export_names:?}"
+        );
+    }
+
+    fn extern_name(item: &wit_parser::WorldItem) -> Option<String> {
+        match item {
+            wit_parser::WorldItem::Function(f) => Some(f.name.clone()),
+            _ => None,
+        }
     }
 }

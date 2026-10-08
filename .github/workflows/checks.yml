@@ -49,3 +49,15 @@ jobs:
 
     - name: Tests
       run: cargo test --workspace
+
+  wasm-host-feature:
+    runs-on: [self-hosted, linux, x64, local]
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile check (tairitsu adapter)
+        run: cargo check -p akivili_wasm_host --features tairitsu --all-targets
+      - name: Clippy (tairitsu adapter)
+        run: cargo clippy -p akivili_wasm_host --features tairitsu --all-targets -- -D warnings
+      - name: Tests (tairitsu adapter)
+        run: cargo test -p akivili_wasm_host --features tairitsu

@@ -32,6 +32,9 @@ wasmtime = { version = "^47", optional = true }
 [dev-dependencies]
 tokio = { version = "^1", features = ["rt", "macros"] }
 wat = "^1"
+# WIT contract gate (test-only): parses wit/host.wit so syntax errors
+# and shape drift fail in CI, not at B2 bind time.
+wit-parser = "^0.252"
 
 [package.metadata.wit]
 # The WIT contract ships in-tree; guests bind against
