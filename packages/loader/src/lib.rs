@@ -423,7 +423,6 @@ mod tests {
 #[cfg(all(test, feature = "wasm"))]
 mod wasm_tests {
     use super::*;
-    use std::sync::Arc;
 
     fn manifest(id: &str) -> PluginManifest {
         PluginManifest {
