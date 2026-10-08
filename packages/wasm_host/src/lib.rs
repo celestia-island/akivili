@@ -440,7 +440,8 @@ mod adapter_tests {
     /// wit-bindgen guest — host string → guest `run` → every host
     /// import (kv-set, kv-get, config-get, log) dispatched into the
     /// host's capability implementation → guest answer → host result
-    /// classification. Skip (not fail) when the wasm target is absent.
+    /// classification. A missing wasm32-wasip2 toolchain skips with a
+    /// dedicated panic message; a pilot build failure fails loudly.
     #[tokio::test]
     async fn f1_pilot_full_round_trip() {
         let Some(wasm) = pilot_wasm() else {
