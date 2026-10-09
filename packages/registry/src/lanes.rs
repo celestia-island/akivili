@@ -68,7 +68,12 @@ mod tests {
         for word in ["state.read", "state.write"] {
             assert!(lane.admits(&Capability::new(word).unwrap()), "{word}");
         }
-        for word in ["log", "kv.read", "http.egress:example.com", "mesh.call:peer"] {
+        for word in [
+            "log",
+            "kv.read",
+            "http.egress:example.com",
+            "mesh.call:peer",
+        ] {
             assert!(!lane.admits(&Capability::new(word).unwrap()), "{word}");
         }
     }
