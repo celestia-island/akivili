@@ -529,6 +529,76 @@ impl<'a, P> ReplaceWindow<'a, P> {
         }
     }
 }
+/// The F2 form's slot payload: a supervised child process speaking
+/// JSON-RPC over stdio (design D5's process lane — the boa IEPL
+/// engine's future home). The supervisor owns spawn/stop; the spine
+/// owns the lifecycle phases.
+pub mod process_slot {
+    use std::process::{Child, Command, Stdio};
+
+    /// A supervised process slot.
+    pub struct ProcessSlot {
+        child: Child,
+        /// The command line, kept for diagnostics.
+        pub command_line: String,
+    }
+
+    /// Everything a spawn can fail with.
+    #[derive(Debug, thiserror::Error)]
+    #[error("process spawn failed: {0}")]
+    pub struct SpawnError(String);
+
+    impl std::fmt::Debug for ProcessSlot {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ProcessSlot")
+                .field("command_line", &self.command_line)
+                .field("pid", &self.child.id())
+                .finish()
+        }
+    }
+
+    impl ProcessSlot {
+        /// Spawn the plugin process with stdio piped (the JSON-RPC
+        /// channel). The caller passes the argv; the fabric does not
+        /// mandate an RPC handshake here — the run-loop wiring lands
+        /// with the protocol wave.
+        pub fn spawn(argv: &[String]) -> Result<Self, SpawnError> {
+            if argv.is_empty() {
+                return Err(SpawnError("empty argv".into()));
+            }
+            let child = Command::new(&argv[0])
+                .args(&argv[1..])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| SpawnError(format!("{}: {e}", argv[0])))?;
+            Ok(Self {
+                child,
+                command_line: argv.join(" "),
+            })
+        }
+
+        /// The child's process id (diagnostics).
+        pub fn pid(&self) -> Option<u32> {
+            Some(self.child.id())
+        }
+
+        /// Drain: signal the child to stop and reap it. Design §5's
+        /// drain for the process form = a graceful stop signal then a
+        /// bounded wait; this v0 uses kill-and-reap (the signal
+        /// vocabulary arrives with the protocol wave).
+        pub fn drain_and_reap(&mut self) -> bool {
+            self.child.kill().is_ok() && self.child.wait().is_ok()
+        }
+
+        /// Whether the child has exited.
+        pub fn is_alive(&mut self) -> bool {
+            matches!(self.child.try_wait(), Ok(None))
+        }
+    }
+}
+
 #[cfg(feature = "wasm")]
 mod wasm_slot {
     use super::PluginLoader;
@@ -678,6 +748,75 @@ mod tests {
             Phase::Serving,
             "abort restores the drained slot to Serving"
         );
+    }
+}
+
+#[cfg(test)]
+mod process_slot_tests {
+    use super::process_slot::ProcessSlot;
+
+    fn sleep_argv() -> Vec<String> {
+        // A portable always-always process: sleep 30.
+        vec!["sleep".to_string(), "30".to_string()]
+    }
+
+    #[test]
+    fn spawn_yields_a_live_child() {
+        let mut slot = ProcessSlot::spawn(&sleep_argv()).expect("sleep spawns");
+        assert!(slot.pid().is_some(), "a live child has a pid");
+        assert!(slot.is_alive(), "a fresh child is alive");
+        assert!(slot.drain_and_reap(), "kill+wait succeeds");
+        assert!(!slot.is_alive(), "the child is reaped");
+    }
+
+    #[test]
+    fn empty_argv_rejects_loudly() {
+        let err = ProcessSlot::spawn(&[]).unwrap_err();
+        assert!(err.to_string().contains("empty argv"), "{err}");
+    }
+
+    #[test]
+    fn missing_binary_rejects_with_the_command_name() {
+        let argv = vec!["definitely-not-a-real-binary-xyz".to_string()];
+        let err = ProcessSlot::spawn(&argv).unwrap_err();
+        assert!(
+            err.to_string().contains("definitely-not-a-real-binary-xyz"),
+            "the command name survives, got {err}"
+        );
+    }
+
+    #[test]
+    fn the_slot_rides_the_lifecycle_spine() {
+        use super::{Phase, PluginSlot};
+        let slot = ProcessSlot::spawn(&sleep_argv()).expect("spawn");
+        let mut slot: PluginSlot<ProcessSlot> = PluginSlot::loaded(
+            akivili_registry::PluginManifest {
+                schema: 1,
+                id: "engine".into(),
+                version: "1".into(),
+                provider: "t".into(),
+                description: None,
+                form: None,
+                capabilities: Vec::new(),
+                requires_contract: Vec::new(),
+                trust: None,
+                resources: Vec::new(),
+            },
+            slot,
+        );
+        slot.init().unwrap();
+        slot.serve().unwrap();
+        slot.drain().unwrap();
+        // The payload's own drain: the process dies before dispose —
+        // and must BE dead (the m4 pin: dropping the drain call leaks
+        // an orphan; the spine test asserts the reaped state).
+        assert!(slot.payload.drain_and_reap());
+        assert!(
+            !slot.payload.is_alive(),
+            "the process must be reaped before dispose"
+        );
+        slot.dispose();
+        assert_eq!(slot.phase(), Phase::Disposed);
     }
 }
 

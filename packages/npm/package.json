@@ -1,6 +1,6 @@
 {
   "name": "@celestia-island/akivili",
-  "version": "0.2.13",
+  "version": "0.2.14",
   "description": "Celestia Plugin Fabric \u2014 TypeScript side of the plugin contract: manifest schema v2 parsing/validation mirroring the Rust akivili_registry, for webui-side plugin tooling",
   "license": "LicenseRef-sysl-1.0",
   "repository": {
