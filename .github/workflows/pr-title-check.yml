@@ -6,7 +6,13 @@ on:
 
 jobs:
   pr-title-check:
+    # The callee deliberately serves forks, but this repo pins the farm lane, so
+    # an unguarded fork pull request would still land its tree on a runner that
+    # lives inside our network. Same gate as the heavy jobs in checks.yml: only
+    # same-repo runs reach the farm, and skipped jobs still report success.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     uses: celestia-island/celestia-devtools/.github/workflows/pr-title-check.yml@master
     with:
-      # Same private-repo lane switch as commit-msg-lint.yml.
+      # Hardcoded farm lane: this repo declares no LINT_RUNNER/LINT_LANE
+      # variables, so the title check rides the self-hosted farm.
       runner: '["self-hosted","linux","x64","local"]'
