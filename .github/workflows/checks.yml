@@ -20,6 +20,11 @@ env:
 jobs:
   check:
     name: Code Checks
+    # Fork pull requests must not reach the self-hosted farm: these runners live
+    # inside our network and execute whatever the checked-out tree contains. The
+    # commit-message and PR-title gates stay open to forks on purpose -- they are
+    # sub-minute, run no pull request code, and hold no secrets.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64, local]
     timeout-minutes: 300
 
@@ -51,6 +56,9 @@ jobs:
       run: cargo test --workspace
 
   wasm-fabric:
+    # Same gate as the check job: the wasm fabric tests also ride the
+    # self-hosted farm and must not run fork-controlled code.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64, local]
     timeout-minutes: 40
     steps:
