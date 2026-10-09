@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use akivili_registry::PluginManifest;
 
 /// Everything the loader can fail with.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum LoaderError {
     /// The list source answered but the answer was unusable.
     #[error("list source error: {0}")]
@@ -83,8 +83,10 @@ impl PluginListSource for StaticListSource {
 /// form = "wasm.component"
 /// ```
 ///
-/// Parsing is strict (unknown fields rejected — `serde(deny_unknown_fields)`),
-/// so a typo in the host config fails loudly at load, not silently at
+/// The top level is a COEXISTING section of the host's config file
+/// (other sections like `[server]` pass through untouched); each
+/// `[[plugin]]` table is strict (`deny_unknown_fields`), so a typo
+/// inside a plugin entry fails loudly at load, not silently at
 /// runtime.
 pub struct ConfigListSource {
     plugins: Vec<ConfigManifest>,
@@ -95,8 +97,11 @@ pub struct ConfigListSource {
 
 impl<'de> serde::Deserialize<'de> for ConfigListSource {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // The config lane embeds in the HOST's own config file — other
+        // sections ([server], [topology]…) must coexist. Only the
+        // [[plugin]] tables themselves are strict (ConfigManifest's
+        // deny_unknown_fields).
         #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
         struct Raw {
             #[serde(default, rename = "plugin")]
             plugin: Vec<ConfigManifest>,
@@ -206,10 +211,9 @@ impl ConfigListSource {
     fn cached(&self) -> Result<Vec<PluginManifest>, LoaderError> {
         // Lazy validation cache: parse once at first read, serve a
         // clone thereafter (the manifests are tiny).
-        match self.validated.get_or_init(|| self.build_manifests()) {
-            Ok(manifests) => Ok(manifests.clone()),
-            Err(e) => Err(LoaderError::Source(e.to_string())),
-        }
+        self.validated
+            .get_or_init(|| self.build_manifests())
+            .clone()
     }
 
     fn build_manifests(&self) -> Result<Vec<PluginManifest>, LoaderError> {
@@ -627,6 +631,22 @@ capabilities = ["kv.read", "mesh.call:celestia-reports"]
         let source = ConfigListSource::from_toml("").expect("empty config parses");
         let loader: PluginLoader<()> = PluginLoader::new(Box::new(source));
         assert_eq!(loader.current_manifests().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn foreign_sections_coexist_with_plugin_tables() {
+        let text = r#"
+[server]
+listen = "0.0.0.0:8424"
+
+[[plugin]]
+id = "theme-pack"
+version = "1.0.0"
+provider = "official"
+"#;
+        let source = ConfigListSource::from_toml(text).expect("foreign sections coexist");
+        let loader: PluginLoader<()> = PluginLoader::new(Box::new(source));
+        assert_eq!(loader.current_manifests().unwrap().len(), 1);
     }
 
     #[test]
