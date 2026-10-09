@@ -807,8 +807,14 @@ mod process_slot_tests {
         slot.init().unwrap();
         slot.serve().unwrap();
         slot.drain().unwrap();
-        // The payload's own drain: the process dies before dispose.
+        // The payload's own drain: the process dies before dispose —
+        // and must BE dead (the m4 pin: dropping the drain call leaks
+        // an orphan; the spine test asserts the reaped state).
         assert!(slot.payload.drain_and_reap());
+        assert!(
+            !slot.payload.is_alive(),
+            "the process must be reaped before dispose"
+        );
         slot.dispose();
         assert_eq!(slot.phase(), Phase::Disposed);
     }
