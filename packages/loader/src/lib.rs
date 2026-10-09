@@ -50,6 +50,14 @@ pub trait PluginListSource: Send + Sync {
     fn plugin_manifests(&self) -> Result<Vec<PluginManifest>, LoaderError>;
 }
 
+/// Any `Arc`'d source is a source — hosts share one snapshot source
+/// between their fetch task and any number of loaders.
+impl<T: PluginListSource> PluginListSource for std::sync::Arc<T> {
+    fn plugin_manifests(&self) -> Result<Vec<PluginManifest>, LoaderError> {
+        (**self).plugin_manifests()
+    }
+}
+
 /// A static list source for tests and local hosts: manifests handed in
 /// directly, no IO.
 #[derive(Default)]
@@ -221,6 +229,79 @@ impl ConfigListSource {
             .iter()
             .map(|p| p.clone().into_manifest())
             .collect()
+    }
+}
+
+/// A snapshot-fed list source for topology-driven hosts (design D7's
+/// evernight lane).
+///
+/// The A4-2 adjudication on the sync-trait shape: the loader's
+/// synchronous `PluginListSource` stays — the HOST runs the async
+/// topology fetch (its own task/cadence, its own error surface) and
+/// **publishes validated snapshots** through
+/// [`TopologyListSource::publish`]. The loader never blocks on the
+/// network, the host owns refresh timing, and a failed fetch never
+/// masquerades as "no plugins" (the last good snapshot keeps serving
+/// until a better one lands; `take_fetch_error` surfaces the fetch
+/// failure out-of-band).
+pub struct TopologyListSource {
+    inner: std::sync::RwLock<TopologySnapshot>,
+}
+
+struct TopologySnapshot {
+    manifests: Vec<PluginManifest>,
+    fetch_error: Option<String>,
+}
+
+impl Default for TopologyListSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TopologyListSource {
+    /// An empty source (no snapshot published yet).
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::RwLock::new(TopologySnapshot {
+                manifests: Vec::new(),
+                fetch_error: None,
+            }),
+        }
+    }
+
+    /// Publish a validated snapshot (the host's async topology task
+    /// calls this on every successful fetch). Validation is the
+    /// host's responsibility — the manifests pass through verbatim;
+    /// a host that wants the config lane's strictness composes
+    /// `ConfigListSource::into_manifests` on its side.
+    pub fn publish(&self, manifests: Vec<PluginManifest>) {
+        let mut guard = self.inner.write().expect("topology lock");
+        guard.manifests = manifests;
+        guard.fetch_error = None;
+    }
+
+    /// Record a fetch failure without disturbing the last good
+    /// snapshot (the host's error surface reads it via
+    /// [`Self::take_fetch_error`]).
+    pub fn record_fetch_error(&self, reason: String) {
+        let mut guard = self.inner.write().expect("topology lock");
+        guard.fetch_error = Some(reason);
+    }
+
+    /// Take the pending fetch error, if any (out-of-band diagnostics —
+    /// the loader's `plugin_manifests` keeps answering from the last
+    /// good snapshot).
+    pub fn take_fetch_error(&self) -> Option<String> {
+        let mut guard = self.inner.write().expect("topology lock");
+        guard.fetch_error.take()
+    }
+}
+
+impl PluginListSource for TopologyListSource {
+    fn plugin_manifests(&self) -> Result<Vec<PluginManifest>, LoaderError> {
+        let guard = self.inner.read().expect("topology lock");
+        Ok(guard.manifests.clone())
     }
 }
 
@@ -752,6 +833,75 @@ capabilities = ["fs.read"]
             loader.current_manifests().is_err(),
             "out-of-vocabulary words reject"
         );
+    }
+}
+
+#[cfg(test)]
+mod topology_source_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn topo_manifest(id: &str) -> PluginManifest {
+        PluginManifest {
+            schema: 1,
+            id: id.to_string(),
+            version: "1".to_string(),
+            provider: "mesh".to_string(),
+            description: None,
+            form: None,
+            capabilities: Vec::new(),
+            requires_contract: Vec::new(),
+            trust: None,
+            resources: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_unpublished_source_answers_empty() {
+        let source = std::sync::Arc::new(TopologyListSource::new());
+        let loader: PluginLoader<()> = PluginLoader::new(Box::new(Arc::clone(&source)) as Box<_>);
+        assert_eq!(loader.current_manifests().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_published_snapshot_serves() {
+        let source = Arc::new(TopologyListSource::new());
+        source.publish(vec![topo_manifest("node-a"), topo_manifest("node-b")]);
+        let loader: PluginLoader<()> = PluginLoader::new(Box::new(Arc::clone(&source)) as Box<_>);
+        let manifests = loader.current_manifests().unwrap();
+        assert_eq!(manifests.len(), 2);
+        assert_eq!(manifests[0].id, "node-a");
+    }
+
+    #[test]
+    fn a_fetch_failure_keeps_the_last_good_snapshot() {
+        let source = Arc::new(TopologyListSource::new());
+        source.publish(vec![topo_manifest("good")]);
+        source.record_fetch_error("topology unreachable".into());
+
+        // The loader keeps answering from the last good snapshot…
+        let loader: PluginLoader<()> = PluginLoader::new(Box::new(Arc::clone(&source)) as Box<_>);
+        assert_eq!(loader.current_manifests().unwrap().len(), 1);
+
+        // …and the fetch failure surfaces out-of-band, exactly once.
+        let err = source.take_fetch_error().unwrap();
+        assert!(err.contains("topology unreachable"), "{err}");
+        assert!(
+            source.take_fetch_error().is_none(),
+            "the error is taken exactly once"
+        );
+    }
+
+    #[test]
+    fn a_new_snapshot_after_a_failure_clears_the_error() {
+        let source = Arc::new(TopologyListSource::new());
+        source.record_fetch_error("first fetch failed".into());
+        source.publish(vec![topo_manifest("recovered")]);
+        assert!(
+            source.take_fetch_error().is_none(),
+            "publish clears the error"
+        );
+        assert_eq!(source.plugin_manifests().unwrap()[0].id, "recovered");
     }
 }
 
