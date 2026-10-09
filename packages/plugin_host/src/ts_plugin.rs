@@ -377,7 +377,10 @@ impl TsPluginData {
     }
 }
 
-pub(crate) struct TsPlugin {
+/// The live boa engine for one script plugin (public since the loader's
+/// script outlet holds it — C1): owns the JS context, the host-function
+/// injection and the dispatch surface (`handle_request` / `on_message`).
+pub struct TsPlugin {
     context: boa_engine::Context,
     plugin_name: String,
     host_api: Arc<HostFunctions>,
@@ -385,10 +388,12 @@ pub(crate) struct TsPlugin {
 }
 
 impl TsPlugin {
-    pub(crate) fn create_and_load(
-        host_api: Arc<HostFunctions>,
-        data: &TsPluginData,
-    ) -> Result<Self> {
+    /// The plugin's name (diagnostics).
+    pub fn plugin_name(&self) -> &str {
+        &self.plugin_name
+    }
+
+    pub fn create_and_load(host_api: Arc<HostFunctions>, data: &TsPluginData) -> Result<Self> {
         let mut plugin = Self::new_inner(host_api, &data.plugin_name)?;
         plugin.load_script(data)?;
         Ok(plugin)
