@@ -38,12 +38,18 @@ pub const MAX_MCP_TOOLS_GLOBAL: usize = 256;
 /// every hop URL against the guard allow-list (mirrors the legacy adapter's
 /// `ReqwestHttpClient`). The client's DNS resolution runs through the guard
 /// itself, so connect-time addresses are validated (no rebinding window).
+///
+/// The client must also ignore ambient proxy variables: under `HTTP_PROXY`/
+/// `HTTPS_PROXY` reqwest hands the URL to the proxy, whose upstream resolution
+/// bypasses the guard resolver — allow-listed hosts then fail with the proxy's
+/// 502 and non-allow-listed ones escape address validation entirely.
 fn build_http_client(guard: &NetworkGuard) -> reqwest::Client {
     let timeout = std::time::Duration::from_secs(guard.policy().connect_timeout_secs);
     let max_hops = guard.max_redirect_hops() as usize;
     let guard_clone = guard.clone();
     reqwest::Client::builder()
         .timeout(timeout)
+        .no_proxy()
         .dns_resolver(guard.clone())
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= max_hops
