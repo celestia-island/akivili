@@ -344,6 +344,11 @@ impl Phase {
 /// A single loaded plugin walking the lifecycle spine. The generic
 /// `Payload` is the form-specific handle (a wasm host, a process
 /// supervisor, a boa context); the spine itself never inspects it.
+///
+/// The payload needs no `Send`: the loader and its slots live on one
+/// thread by construction (the boa engine's context is thread-local —
+/// C1's adjudication); hosts that want cross-thread loading wrap the
+/// whole loader in their own channel/supervisor.
 pub struct PluginSlot<P> {
     /// The manifest this slot was loaded from.
     pub manifest: PluginManifest,
@@ -458,10 +463,7 @@ impl<P> PluginLoader<P> {
     }
 }
 
-impl<P> PluginLoader<P>
-where
-    P: Send,
-{
+impl<P> PluginLoader<P> {
     /// Open a replace window: the CURRENT slot (if serving) moves to
     /// Draining **but stays in the map** — calls keep routing to it
     /// until the new slot reaches Serving at commit. The new slot
@@ -611,11 +613,19 @@ pub mod process_slot {
 /// free of the JS engine stack.
 #[cfg(feature = "script")]
 pub mod script_slot {
-    use akivili_plugin_host::ts_plugin::{TsLanguage, TsPluginData};
+    use akivili_plugin_host::plugin_state::HostFunctions;
+    use akivili_plugin_host::ts_plugin::{TsLanguage, TsPlugin, TsPluginData};
+    use std::sync::Arc;
 
-    /// A script plugin slot payload.
+    /// A script plugin slot payload — the LIVE boa engine (C1): the
+    /// script compiles AND instantiates at LOAD time (a bad script dies
+    /// before the slot ever serves), the host functions inject through
+    /// the D8 seam (`Arc<HostFunctions>`), and dispatch rides the same
+    /// engine for the slot's whole life.
     pub struct ScriptSlot {
-        plugin: TsPluginData,
+        #[allow(dead_code)] // diagnostics: the source-of-truth data
+        data: TsPluginData,
+        engine: TsPlugin,
     }
 
     /// Everything a script slot can fail with.
@@ -624,26 +634,100 @@ pub mod script_slot {
     pub struct ScriptSlotError(String);
 
     impl ScriptSlot {
-        /// Build a slot from plugin source (TypeScript by default —
-        /// the IEPL tool language; JavaScript accepted verbatim).
-        pub fn from_source(plugin_name: &str, code: &str) -> Self {
-            Self {
-                plugin: TsPluginData::new(plugin_name, code, TsLanguage::TypeScript),
-            }
+        /// Spawn a slot from plugin source: SWC-transpiles (once,
+        /// cached), instantiates the boa engine, injects the host's
+        /// function surface, and evaluates the script — all failures
+        /// surface HERE, at load, never at first dispatch.
+        pub fn spawn(
+            host_api: Arc<HostFunctions>,
+            plugin_name: &str,
+            code: &str,
+        ) -> Result<Self, ScriptSlotError> {
+            let data = TsPluginData::new(plugin_name, code, TsLanguage::TypeScript);
+            let engine = TsPlugin::create_and_load(host_api, &data)
+                .map_err(|e| ScriptSlotError(format!("load: {e}")))?;
+            Ok(Self { data, engine })
         }
 
         /// The plugin's name (diagnostics).
         pub fn plugin_name(&self) -> &str {
-            self.plugin.plugin_name()
+            self.engine.plugin_name()
         }
 
-        /// The transpiled JS — compiles (SWC) once, caches across
-        /// dispatches. Exposed for the host's dispatch wiring; a bad
-        /// script fails HERE, at load, not at first dispatch.
-        pub fn compiled_js(&self) -> Result<&str, ScriptSlotError> {
-            self.plugin
-                .transpiled_js_pub()
-                .map_err(|e| ScriptSlotError(e.to_string()))
+        /// Dispatch an HTTP-shaped request to the script's
+        /// `handleRequest` (the IEPL tool contract).
+        pub fn handle_request(
+            &mut self,
+            method: &str,
+            path: &str,
+            headers: &str,
+            body: &str,
+        ) -> Result<String, ScriptSlotError> {
+            self.engine
+                .handle_request(method, path, headers, body)
+                .map_err(|e| ScriptSlotError(format!("dispatch: {e}")))
+        }
+
+        /// Dispatch a chat-shaped message to `onMessage` (None when the
+        /// script defines no handler or answers null).
+        pub fn on_message(
+            &mut self,
+            platform: &str,
+            message: &str,
+        ) -> Result<Option<String>, ScriptSlotError> {
+            self.engine
+                .on_message(platform, message)
+                .map_err(|e| ScriptSlotError(format!("dispatch: {e}")))
+        }
+    }
+
+    impl super::PluginLoader<ScriptSlot> {
+        /// Load a script plugin over the host's function surface and
+        /// ride it through the full spine (replace → commit) — the C1
+        /// orchestration entry.
+        pub fn load_script(
+            &mut self,
+            manifest: akivili_registry::PluginManifest,
+            host_api: Arc<HostFunctions>,
+            code: &str,
+        ) -> Result<(), super::LoaderError> {
+            let slot = ScriptSlot::spawn(host_api, &manifest.id, code).map_err(|e| {
+                super::LoaderError::Artifact {
+                    plugin_id: manifest.id.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
+            self.replace(manifest, slot)?.commit()
+        }
+
+        /// Dispatch an HTTP-shaped request through a SERVING slot (the
+        /// phase gate mirrors the wasm outlet's run()).
+        pub fn handle_request(
+            &mut self,
+            plugin_id: &str,
+            method: &str,
+            path: &str,
+            headers: &str,
+            body: &str,
+        ) -> Result<String, super::LoaderError> {
+            let slot = self
+                .slot_mut(plugin_id)
+                .ok_or_else(|| super::LoaderError::Lifecycle {
+                    plugin_id: plugin_id.to_string(),
+                    reason: "plugin is not loaded".to_string(),
+                })?;
+            if !slot.phase().serves() {
+                return Err(super::LoaderError::Lifecycle {
+                    plugin_id: plugin_id.to_string(),
+                    reason: format!("plugin is not serving (phase {:?})", slot.phase()),
+                });
+            }
+            slot.payload
+                .handle_request(method, path, headers, body)
+                .map_err(|e| super::LoaderError::Artifact {
+                    plugin_id: plugin_id.to_string(),
+                    reason: e.to_string(),
+                })
         }
     }
 }
@@ -1096,12 +1180,24 @@ mod topology_source_tests {
 #[cfg(all(test, feature = "script"))]
 mod script_slot_tests {
     use super::script_slot::ScriptSlot;
-    use super::{Phase, PluginSlot};
+    use super::{Phase, PluginLoader, PluginSlot};
+    use akivili_plugin_host::plugin_state::HostFunctions;
     use akivili_registry::PluginManifest;
+    use std::sync::Arc;
 
-    const GOOD_TS: &str = "export const tool = () => 1 + 1;";
+    /// A well-formed IEPL tool script: handleRequest answers with the
+    /// path it was given.
+    const GOOD_TS: &str = r#"
+var handleRequest = function (method, path, headers, body) {
+    return JSON.stringify({ echoed: path });
+};
+"#;
     /// A script the SWC pipeline must reject (unterminated template).
     const BAD_TS: &str = "const s = `unterminated";
+
+    fn host_api() -> Arc<HostFunctions> {
+        Arc::new(HostFunctions::default())
+    }
 
     fn manifest(id: &str) -> PluginManifest {
         PluginManifest {
@@ -1119,22 +1215,32 @@ mod script_slot_tests {
     }
 
     #[test]
-    fn a_good_script_compiles_at_load_time() {
-        let slot = ScriptSlot::from_source("good", GOOD_TS);
-        assert!(slot.compiled_js().is_ok(), "SWC accepts valid TS");
+    fn a_good_script_spawns_and_dispatches() {
+        let mut slot = ScriptSlot::spawn(host_api(), "good", GOOD_TS).expect("valid TS spawns");
         assert_eq!(slot.plugin_name(), "good");
+        let answer = slot
+            .handle_request("GET", "/x", "{}", "")
+            .expect("dispatch answers");
+        assert!(
+            answer.contains("/x"),
+            "the echoed path survives, got {answer}"
+        );
+        // onMessage is absent — a None answer, not an error.
+        assert!(slot.on_message("web", "hi").unwrap().is_none());
     }
 
     #[test]
-    fn a_bad_script_fails_at_load_not_at_dispatch() {
-        let slot = ScriptSlot::from_source("bad", BAD_TS);
-        let err = slot.compiled_js().unwrap_err();
+    fn a_bad_script_dies_at_spawn_not_at_dispatch() {
+        let err = match ScriptSlot::spawn(host_api(), "bad", BAD_TS) {
+            Err(e) => e,
+            Ok(_) => panic!("a bad script must die at spawn"),
+        };
         assert!(!err.to_string().is_empty());
     }
 
     #[test]
     fn the_script_slot_rides_the_lifecycle_spine() {
-        let payload = ScriptSlot::from_source("engine", GOOD_TS);
+        let payload = ScriptSlot::spawn(host_api(), "engine", GOOD_TS).expect("spawn");
         let mut slot: PluginSlot<ScriptSlot> = PluginSlot::loaded(manifest("engine"), payload);
         slot.init().unwrap();
         slot.serve().unwrap();
@@ -1142,9 +1248,30 @@ mod script_slot_tests {
         slot.drain().unwrap();
         slot.dispose();
         assert_eq!(slot.phase(), Phase::Disposed);
-        // The payload survives dispose (unlike the process form) —
-        // script state is host-side by design.
-        assert_eq!(slot.payload.plugin_name(), "engine");
+    }
+
+    /// The C1 orchestration headline: load through the loader, dispatch
+    /// through the spine's phase gate, refuse after drain.
+    #[test]
+    fn the_loader_orchestrates_script_dispatch() {
+        let mut loader: PluginLoader<ScriptSlot> =
+            PluginLoader::new(Box::new(super::StaticListSource::default()));
+        loader
+            .load_script(manifest("tool"), host_api(), GOOD_TS)
+            .expect("load rides the spine");
+        assert_eq!(loader.slots()["tool"].phase(), Phase::Serving);
+
+        let answer = loader
+            .handle_request("tool", "GET", "/fabric", "{}", "")
+            .expect("serving slots dispatch");
+        assert!(answer.contains("/fabric"), "got {answer}");
+
+        // Drain — the dispatch must now refuse loudly.
+        loader.slot_mut("tool").unwrap().drain().unwrap();
+        let err = loader
+            .handle_request("tool", "GET", "/fabric", "{}", "")
+            .expect_err("drained slots refuse");
+        assert!(err.to_string().contains("not serving"), "{err}");
     }
 }
 
