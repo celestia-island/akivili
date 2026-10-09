@@ -589,7 +589,7 @@ pub mod process_slot {
         /// bounded wait; this v0 uses kill-and-reap (the signal
         /// vocabulary arrives with the protocol wave).
         pub fn drain_and_reap(&mut self) -> bool {
-            matches!(self.child.kill(), Ok(())) && matches!(self.child.wait(), Ok(_))
+            self.child.kill().is_ok() && self.child.wait().is_ok()
         }
 
         /// Whether the child has exited.
@@ -787,7 +787,7 @@ mod process_slot_tests {
 
     #[test]
     fn the_slot_rides_the_lifecycle_spine() {
-        use super::{Phase, PluginLoader, PluginSlot};
+        use super::{Phase, PluginSlot};
         let slot = ProcessSlot::spawn(&sleep_argv()).expect("spawn");
         let mut slot: PluginSlot<ProcessSlot> = PluginSlot::loaded(
             akivili_registry::PluginManifest {
