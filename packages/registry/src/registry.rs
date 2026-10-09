@@ -1750,11 +1750,18 @@ min-trust = "signed"
             Err(e) => panic!("the keyed lane must accept a validly signed plugin: {e}"),
         }
 
-        // Without the key (plain open): the same plugin fails closed.
-        match Registry::open(&root.join("plugins"), &audit) {
-            Ok(_) => panic!("the unsigned lane must reject the demanding plugin"),
-            Err(_) => {}
-        }
+        // Without the key (plain open): the scan still succeeds (other
+        // plugins load), but the demanding plugin fails closed — it is
+        // absent from the accepted set.
+        let plain =
+            Registry::open(&root.join("plugins"), &audit).expect("the unsigned lane still opens");
+        assert!(
+            plain
+                .plugins()
+                .iter()
+                .all(|r| r.manifest.id != "signed-plugin"),
+            "the demanding plugin must fail closed without keys"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
