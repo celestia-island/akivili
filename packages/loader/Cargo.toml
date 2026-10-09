@@ -23,10 +23,14 @@ tracing.workspace = true
 # The F1 outlet: only consumers who opt into wasm pull the runtime stack
 # (the D9 weight discipline — the loader core itself stays tairitsu-free).
 akivili_wasm_host = { path = "../wasm_host", optional = true }
+# The F3 outlet: script plugins ride the boa IEPL stack (plugin_host);
+# hosts that never run scripts stay free of the JS engine.
+akivili_plugin_host = { path = "../plugin_host", optional = true }
 
 [features]
 default = []
 wasm = ["dep:akivili_wasm_host", "akivili_wasm_host/tairitsu"]
+script = ["dep:akivili_plugin_host"]
 
 [dev-dependencies]
 tempfile.workspace = true
