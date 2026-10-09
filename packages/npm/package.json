@@ -1,7 +1,7 @@
 {
   "name": "@celestia-island/akivili",
   "version": "0.2.13",
-  "description": "Celestia Plugin Fabric — TypeScript side of the plugin contract: manifest schema v2 parsing/validation mirroring the Rust akivili_registry, for webui-side plugin tooling",
+  "description": "Celestia Plugin Fabric \u2014 TypeScript side of the plugin contract: manifest schema v2 parsing/validation mirroring the Rust akivili_registry, for webui-side plugin tooling",
   "license": "LicenseRef-sysl-1.0",
   "repository": {
     "type": "git",
@@ -26,8 +26,8 @@
     "prepack": "pnpm run build"
   },
   "devDependencies": {
-    "typescript": "^*",
-    "vitest": "^*"
+    "typescript": "^5",
+    "vitest": "^3"
   },
   "publishConfig": {
     "access": "public"
