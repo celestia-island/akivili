@@ -63,7 +63,11 @@ jobs:
     runs-on: [self-hosted, linux, x64, local]
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
       - name: Install wasm32-wasip2 target
         run: rustup target add wasm32-wasip2
       - name: Compile check (tairitsu adapter)
