@@ -20,10 +20,11 @@ env:
 jobs:
   check:
     name: Code Checks
-    # Fork pull requests must not reach the self-hosted farm: these runners live
-    # inside our network and execute whatever the checked-out tree contains. The
-    # commit-message and PR-title gates stay open to forks on purpose -- they are
-    # sub-minute, run no pull request code, and hold no secrets.
+    # Fork pull requests must not run this job: it compiles and tests the
+    # checked-out tree on runners that live inside our network. The sub-minute
+    # commit-message and PR-title gates stay open to forks on purpose -- they
+    # execute no pull request code and hold no secrets (the PR-title caller does
+    # check the tree out on the farm lane, by the 2026-10-06 owner decision).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64, local]
     timeout-minutes: 300
