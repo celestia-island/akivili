@@ -64,6 +64,13 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+      # `rustup` below lives in ~/.cargo/bin, which is NOT in the systemd unit's
+      # default PATH on every farm runner — without an explicit toolchain step
+      # this job passed or failed by runner lottery ("rustup: command not found").
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
       - name: Install wasm32-wasip2 target
         run: rustup target add wasm32-wasip2
       - name: Compile check (tairitsu adapter)
