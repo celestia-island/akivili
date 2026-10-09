@@ -357,6 +357,13 @@ impl TsPluginData {
         &self.plugin_name
     }
 
+    /// The transpiled JS, public for host adapters (the loader's
+    /// script slot calls this at LOAD time so a bad script fails
+    /// before the slot ever serves).
+    pub fn transpiled_js_pub(&self) -> Result<&str> {
+        self.transpiled_js()
+    }
+
     fn transpiled_js(&self) -> Result<&str> {
         if let Some(cached) = self.compiled_js.get() {
             return Ok(cached);

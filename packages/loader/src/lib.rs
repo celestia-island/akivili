@@ -599,6 +599,55 @@ pub mod process_slot {
     }
 }
 
+/// The F3 form's slot payload: a script plugin riding the boa IEPL
+/// runtime (akivili_plugin_host's `TsPluginData`). The loader side is
+/// a thin adapter — the heavy machinery (SWC transpile cache, boa
+/// sandbox, host functions) stays in plugin_host where it already
+/// lives; this module just gives the script form the same loader-spine
+/// treatment as the wasm and process forms (design D5).
+///
+/// Feature `script` pulls plugin_host (and transitively boa) — the
+/// D9 weight discipline: hosts that never run script plugins stay
+/// free of the JS engine stack.
+#[cfg(feature = "script")]
+pub mod script_slot {
+    use akivili_plugin_host::ts_plugin::{TsLanguage, TsPluginData};
+
+    /// A script plugin slot payload.
+    pub struct ScriptSlot {
+        plugin: TsPluginData,
+    }
+
+    /// Everything a script slot can fail with.
+    #[derive(Debug, thiserror::Error)]
+    #[error("script slot error: {0}")]
+    pub struct ScriptSlotError(String);
+
+    impl ScriptSlot {
+        /// Build a slot from plugin source (TypeScript by default —
+        /// the IEPL tool language; JavaScript accepted verbatim).
+        pub fn from_source(plugin_name: &str, code: &str) -> Self {
+            Self {
+                plugin: TsPluginData::new(plugin_name, code, TsLanguage::TypeScript),
+            }
+        }
+
+        /// The plugin's name (diagnostics).
+        pub fn plugin_name(&self) -> &str {
+            self.plugin.plugin_name()
+        }
+
+        /// The transpiled JS — compiles (SWC) once, caches across
+        /// dispatches. Exposed for the host's dispatch wiring; a bad
+        /// script fails HERE, at load, not at first dispatch.
+        pub fn compiled_js(&self) -> Result<&str, ScriptSlotError> {
+            self.plugin
+                .transpiled_js_pub()
+                .map_err(|e| ScriptSlotError(e.to_string()))
+        }
+    }
+}
+
 #[cfg(feature = "wasm")]
 mod wasm_slot {
     use super::PluginLoader;
@@ -1041,6 +1090,61 @@ mod topology_source_tests {
             "publish clears the error"
         );
         assert_eq!(source.plugin_manifests().unwrap()[0].id, "recovered");
+    }
+}
+
+#[cfg(all(test, feature = "script"))]
+mod script_slot_tests {
+    use super::script_slot::ScriptSlot;
+    use super::{Phase, PluginSlot};
+    use akivili_registry::PluginManifest;
+
+    const GOOD_TS: &str = "export const tool = () => 1 + 1;";
+    /// A script the SWC pipeline must reject (unterminated template).
+    const BAD_TS: &str = "const s = `unterminated";
+
+    fn manifest(id: &str) -> PluginManifest {
+        PluginManifest {
+            schema: 1,
+            id: id.into(),
+            version: "1".into(),
+            provider: "t".into(),
+            description: None,
+            form: None,
+            capabilities: Vec::new(),
+            requires_contract: Vec::new(),
+            trust: None,
+            resources: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_good_script_compiles_at_load_time() {
+        let slot = ScriptSlot::from_source("good", GOOD_TS);
+        assert!(slot.compiled_js().is_ok(), "SWC accepts valid TS");
+        assert_eq!(slot.plugin_name(), "good");
+    }
+
+    #[test]
+    fn a_bad_script_fails_at_load_not_at_dispatch() {
+        let slot = ScriptSlot::from_source("bad", BAD_TS);
+        let err = slot.compiled_js().unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn the_script_slot_rides_the_lifecycle_spine() {
+        let payload = ScriptSlot::from_source("engine", GOOD_TS);
+        let mut slot: PluginSlot<ScriptSlot> = PluginSlot::loaded(manifest("engine"), payload);
+        slot.init().unwrap();
+        slot.serve().unwrap();
+        assert!(slot.phase().serves());
+        slot.drain().unwrap();
+        slot.dispose();
+        assert_eq!(slot.phase(), Phase::Disposed);
+        // The payload survives dispose (unlike the process form) —
+        // script state is host-side by design.
+        assert_eq!(slot.payload.plugin_name(), "engine");
     }
 }
 
