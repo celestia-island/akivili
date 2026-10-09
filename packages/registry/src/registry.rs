@@ -1740,7 +1740,11 @@ min-trust = "signed"
             .open(&root.join("plugins"), &audit);
         match registry {
             Ok(registry) => {
-                let record = registry.record("signed-plugin").expect("present");
+                let record = registry
+                    .plugins()
+                    .iter()
+                    .find(|r| r.manifest.id == "signed-plugin")
+                    .expect("present");
                 assert_eq!(record.manifest.id, "signed-plugin");
             }
             Err(e) => panic!("the keyed lane must accept a validly signed plugin: {e}"),
