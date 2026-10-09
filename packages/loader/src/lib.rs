@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use akivili_registry::PluginManifest;
 
 /// Everything the loader can fail with.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum LoaderError {
     /// The list source answered but the answer was unusable.
     #[error("list source error: {0}")]
@@ -83,8 +83,10 @@ impl PluginListSource for StaticListSource {
 /// form = "wasm.component"
 /// ```
 ///
-/// Parsing is strict (unknown fields rejected — `serde(deny_unknown_fields)`),
-/// so a typo in the host config fails loudly at load, not silently at
+/// The top level is a COEXISTING section of the host's config file
+/// (other sections like `[server]` pass through untouched); each
+/// `[[plugin]]` table is strict (`deny_unknown_fields`), so a typo
+/// inside a plugin entry fails loudly at load, not silently at
 /// runtime.
 pub struct ConfigListSource {
     plugins: Vec<ConfigManifest>,
@@ -95,8 +97,11 @@ pub struct ConfigListSource {
 
 impl<'de> serde::Deserialize<'de> for ConfigListSource {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // The config lane embeds in the HOST's own config file — other
+        // sections ([server], [topology]…) must coexist. Only the
+        // [[plugin]] tables themselves are strict (ConfigManifest's
+        // deny_unknown_fields).
         #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
         struct Raw {
             #[serde(default, rename = "plugin")]
             plugin: Vec<ConfigManifest>,
@@ -206,10 +211,9 @@ impl ConfigListSource {
     fn cached(&self) -> Result<Vec<PluginManifest>, LoaderError> {
         // Lazy validation cache: parse once at first read, serve a
         // clone thereafter (the manifests are tiny).
-        match self.validated.get_or_init(|| self.build_manifests()) {
-            Ok(manifests) => Ok(manifests.clone()),
-            Err(e) => Err(LoaderError::Source(e.to_string())),
-        }
+        self.validated
+            .get_or_init(|| self.build_manifests())
+            .clone()
     }
 
     fn build_manifests(&self) -> Result<Vec<PluginManifest>, LoaderError> {
@@ -630,6 +634,22 @@ capabilities = ["kv.read", "mesh.call:celestia-reports"]
     }
 
     #[test]
+    fn foreign_sections_coexist_with_plugin_tables() {
+        let text = r#"
+[server]
+listen = "0.0.0.0:8424"
+
+[[plugin]]
+id = "theme-pack"
+version = "1.0.0"
+provider = "official"
+"#;
+        let source = ConfigListSource::from_toml(text).expect("foreign sections coexist");
+        let loader: PluginLoader<()> = PluginLoader::new(Box::new(source));
+        assert_eq!(loader.current_manifests().unwrap().len(), 1);
+    }
+
+    #[test]
     fn unknown_fields_fail_loudly() {
         let text = r#"
 [[plugin]]
@@ -756,6 +776,25 @@ mod wasm_tests {
         }
     }
 
+    /// The wasm_host B2 pattern, ported (R3's A4-2 register): a missing
+    /// toolchain is the one legitimate skip; a pilot BUILD failure must
+    /// fail loudly — a CI green check must always mean the round-trip
+    /// really ran.
+    fn ensure_pilot_toolchain_present() {
+        let out = std::process::Command::new("rustup")
+            .args(["target", "list", "--installed"])
+            .output();
+        let installed = out
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        if !installed.contains("wasm32-wasip2") {
+            panic!(
+                "SKIP (toolchain): wasm32-wasip2 target not installed — \
+                 CI installs it; locally run `rustup target add wasm32-wasip2`"
+            );
+        }
+    }
+
     fn pilot_wasm() -> Option<bytes::Bytes> {
         let status = std::process::Command::new(env!("CARGO"))
             .args([
@@ -791,8 +830,8 @@ mod wasm_tests {
     #[tokio::test]
     async fn loader_serves_a_wasm_plugin_end_to_end() {
         let Some(wasm) = pilot_wasm() else {
-            eprintln!("SKIP: wasm target unavailable");
-            return;
+            ensure_pilot_toolchain_present();
+            panic!("pilot build failed with the toolchain present — see stderr");
         };
         let mut loader: PluginLoader<WasmPluginHost<InMemoryCapabilities>> =
             PluginLoader::new(Box::new(StaticListSource::default()));
@@ -814,8 +853,8 @@ mod wasm_tests {
     #[tokio::test]
     async fn hot_replace_preserves_host_state() {
         let Some(wasm) = pilot_wasm() else {
-            eprintln!("SKIP: wasm target unavailable");
-            return;
+            ensure_pilot_toolchain_present();
+            panic!("pilot build failed with the toolchain present — see stderr");
         };
         let capabilities = caps();
         let mut loader: PluginLoader<WasmPluginHost<InMemoryCapabilities>> =
@@ -846,8 +885,8 @@ mod wasm_tests {
     #[tokio::test]
     async fn run_refuses_a_non_serving_slot() {
         let Some(wasm) = pilot_wasm() else {
-            eprintln!("SKIP: wasm target unavailable");
-            return;
+            ensure_pilot_toolchain_present();
+            panic!("pilot build failed with the toolchain present — see stderr");
         };
         let mut loader: PluginLoader<WasmPluginHost<InMemoryCapabilities>> =
             PluginLoader::new(Box::new(StaticListSource::default()));
