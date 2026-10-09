@@ -776,6 +776,25 @@ mod wasm_tests {
         }
     }
 
+    /// The wasm_host B2 pattern, ported (R3's A4-2 register): a missing
+    /// toolchain is the one legitimate skip; a pilot BUILD failure must
+    /// fail loudly — a CI green check must always mean the round-trip
+    /// really ran.
+    fn ensure_pilot_toolchain_present() {
+        let out = std::process::Command::new("rustup")
+            .args(["target", "list", "--installed"])
+            .output();
+        let installed = out
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        if !installed.contains("wasm32-wasip2") {
+            panic!(
+                "SKIP (toolchain): wasm32-wasip2 target not installed — \
+                 CI installs it; locally run `rustup target add wasm32-wasip2`"
+            );
+        }
+    }
+
     fn pilot_wasm() -> Option<bytes::Bytes> {
         let status = std::process::Command::new(env!("CARGO"))
             .args([
@@ -811,8 +830,8 @@ mod wasm_tests {
     #[tokio::test]
     async fn loader_serves_a_wasm_plugin_end_to_end() {
         let Some(wasm) = pilot_wasm() else {
-            eprintln!("SKIP: wasm target unavailable");
-            return;
+            ensure_pilot_toolchain_present();
+            panic!("pilot build failed with the toolchain present — see stderr");
         };
         let mut loader: PluginLoader<WasmPluginHost<InMemoryCapabilities>> =
             PluginLoader::new(Box::new(StaticListSource::default()));
@@ -834,8 +853,8 @@ mod wasm_tests {
     #[tokio::test]
     async fn hot_replace_preserves_host_state() {
         let Some(wasm) = pilot_wasm() else {
-            eprintln!("SKIP: wasm target unavailable");
-            return;
+            ensure_pilot_toolchain_present();
+            panic!("pilot build failed with the toolchain present — see stderr");
         };
         let capabilities = caps();
         let mut loader: PluginLoader<WasmPluginHost<InMemoryCapabilities>> =
@@ -866,8 +885,8 @@ mod wasm_tests {
     #[tokio::test]
     async fn run_refuses_a_non_serving_slot() {
         let Some(wasm) = pilot_wasm() else {
-            eprintln!("SKIP: wasm target unavailable");
-            return;
+            ensure_pilot_toolchain_present();
+            panic!("pilot build failed with the toolchain present — see stderr");
         };
         let mut loader: PluginLoader<WasmPluginHost<InMemoryCapabilities>> =
             PluginLoader::new(Box::new(StaticListSource::default()));
