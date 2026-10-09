@@ -1179,7 +1179,7 @@ mod topology_source_tests {
 
 #[cfg(all(test, feature = "script"))]
 mod script_slot_tests {
-    use super::script_slot::{ScriptSlot, ScriptSlotError};
+    use super::script_slot::ScriptSlot;
     use super::{Phase, PluginLoader, PluginSlot};
     use akivili_plugin_host::plugin_state::HostFunctions;
     use akivili_registry::PluginManifest;
