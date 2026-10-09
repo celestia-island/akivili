@@ -107,6 +107,7 @@ pub mod lanes;
 pub mod manifest;
 pub mod registry;
 pub mod store;
+pub mod trust;
 
 pub use acceptance::{HostAcceptance, KindFilter};
 pub use audit::{AuditEvent, AuditLog};

@@ -153,6 +153,30 @@ pub enum MinTrust {
     VerifiedPublisher,
 }
 
+impl TrustSection {
+    /// Whether this section demands a signature at all.
+    #[must_use]
+    pub fn requires_signature(&self) -> bool {
+        self.signature.is_some() || self.min_trust != MinTrust::Unsigned
+    }
+}
+
+/// The distribution trust verdict for one plugin (C4): what the scan
+/// surface computes from the manifest's `[trust]` section and the
+/// plugin directory's bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustVerdict {
+    /// No signature demanded — local-dev lane.
+    UnsignedOk,
+    /// Demanded and delivered: the signature file exists and verifies
+    /// over the plugin payload under the publisher key.
+    SignedOk { key_id: String },
+    /// Demanded but the directory carries no usable signature.
+    UnsignedButDemanded,
+    /// A signature file is present but fails verification.
+    SignatureMismatch { reason: String },
+}
+
 /// A contract world reference: `celestia:<domain>/<world>@<major>.<minor>`.
 ///
 /// References the WIT world a plugin requires (e.g. `celestia:panel/host@0.1`)
