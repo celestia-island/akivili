@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn a_demanded_but_missing_signature_fails_closed() {
-        let trust = section(Some("agent.sig".into()), MinTrust::Signed);
+        let trust = section(Some("agent.sig"), MinTrust::Signed);
         let verdict =
             verify_plugin_signature(&trust, None, b"payload", &[]).expect("verdict computes");
         assert_eq!(verdict, TrustVerdict::UnsignedButDemanded);
@@ -100,7 +100,7 @@ mod tests {
             key_id: "test-key".into(),
             bytes: signing.verifying_key().to_bytes(),
         }];
-        let trust = section(Some("agent.sig".into()), MinTrust::Signed);
+        let trust = section(Some("agent.sig"), MinTrust::Signed);
         let verdict = verify_plugin_signature(&trust, Some(&signature.to_bytes()), payload, &keys)
             .expect("verdict computes");
         assert_eq!(
@@ -120,7 +120,7 @@ mod tests {
             key_id: "real-key".into(),
             bytes: signing.verifying_key().to_bytes(),
         }];
-        let trust = section(Some("agent.sig".into()), MinTrust::Signed);
+        let trust = section(Some("agent.sig"), MinTrust::Signed);
         let verdict = verify_plugin_signature(
             &trust,
             Some(&signature.to_bytes()),
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn malformed_signature_bytes_are_a_loud_error() {
-        let trust = section(Some("agent.sig".into()), MinTrust::Signed);
+        let trust = section(Some("agent.sig"), MinTrust::Signed);
         let err = verify_plugin_signature(&trust, Some(&[1u8; 8]), b"p", &[])
             .expect_err("garbage bytes must not verify");
         assert!(err.to_string().contains("malformed signature"), "{err}");
