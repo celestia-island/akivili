@@ -63,7 +63,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, local]
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # `rustup` below lives in ~/.cargo/bin, which is NOT in the systemd unit's
       # default PATH on every farm runner — without an explicit toolchain step
       # this job passed or failed by runner lottery ("rustup: command not found").
