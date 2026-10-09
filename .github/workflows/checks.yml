@@ -64,9 +64,10 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
-      # `rustup` below lives in ~/.cargo/bin, which is NOT in the systemd unit's
-      # default PATH on every farm runner — without an explicit toolchain step
-      # this job passed or failed by runner lottery ("rustup: command not found").
+      # `rustup` lives in ~/.cargo/bin, which is not on the farm unit's default
+      # PATH, and this job never installed a toolchain -- so the target step below
+      # failed with "rustup: command not found" on every runner until this step
+      # was added. The explicit toolchain step is what makes it runnable at all.
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
