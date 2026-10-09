@@ -17,17 +17,19 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
     "prepack": "pnpm run build"
   },
   "devDependencies": {
-    "typescript": "^5.9.0",
-    "vitest": "^3.0.0"
+    "typescript": "^*",
+    "vitest": "^*"
   },
   "publishConfig": {
-    "access": "restricted"
+    "access": "public"
   }
 }

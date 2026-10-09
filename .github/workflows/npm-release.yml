@@ -29,7 +29,7 @@ jobs:
       - name: Install dependencies
         run: |
           cd packages/npm
-          pnpm install --no-frozen-lockfile
+          pnpm install --frozen-lockfile
 
       - name: Build
         run: |
@@ -52,6 +52,6 @@ jobs:
       - name: Publish
         run: |
           cd packages/npm
-          pnpm publish --access restricted --no-git-checks
+          pnpm publish --access public --provenance --no-git-checks
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
