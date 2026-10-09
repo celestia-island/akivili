@@ -14,6 +14,7 @@ use crate::error::{RegistryError, RegistryResult};
 use crate::manifest::{MinTrust, TrustSection, TrustVerdict};
 
 /// One publisher key's material, identified for verdict diagnostics.
+#[derive(Debug, Clone)]
 pub struct PublisherKey {
     /// A stable key id (e.g. a fingerprint prefix) for diagnostics.
     pub key_id: String,

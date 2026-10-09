@@ -28,6 +28,12 @@ pub const DEFAULT_MAX_PAYLOAD_BYTES: u64 = 8 * 1024 * 1024;
 pub struct RegistryOptions {
     pub(crate) audit_scan_replay: bool,
     pub(crate) max_payload_bytes: u64,
+    /// Publisher keys for the distribution trust gate (C4): when
+    /// non-empty the scan runs `scan_with_keys` — signature-demanding
+    /// plugins must verify under one of these or the scan rejects them
+    /// (fail-closed). Empty (the default) keeps the unsigned lane:
+    /// demanding plugins are rejected regardless, unsigned ones load.
+    pub(crate) publisher_keys: Vec<crate::trust::PublisherKey>,
 }
 
 impl Default for RegistryOptions {
@@ -35,6 +41,7 @@ impl Default for RegistryOptions {
         Self {
             audit_scan_replay: true,
             max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
+            publisher_keys: Vec::new(),
         }
     }
 }
@@ -43,6 +50,12 @@ impl RegistryOptions {
     /// The default options (equivalent to [`Registry::open`]).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets the publisher keys for the distribution trust gate (C4).
+    pub fn publisher_keys(mut self, keys: Vec<crate::trust::PublisherKey>) -> Self {
+        self.publisher_keys = keys;
+        self
     }
 
     /// Skips replaying the scan into the audit log at open — the quiet
@@ -186,7 +199,16 @@ impl Registry {
 
         let state_path = store_dir.join(STATE_FILE);
         let state = EnabledState::load(&state_path)?;
-        let scan = store::scan(store_dir, &state, options.max_payload_bytes)?;
+        let scan = if options.publisher_keys.is_empty() {
+            store::scan(store_dir, &state, options.max_payload_bytes)?
+        } else {
+            store::scan_with_keys(
+                store_dir,
+                &state,
+                options.max_payload_bytes,
+                &options.publisher_keys,
+            )?
+        };
 
         let mut records = Vec::new();
         let mut rejections = Vec::new();
@@ -1672,5 +1694,74 @@ sha256 = "{}"
             err.to_string().contains("cannot read plugin store"),
             "got: {err}"
         );
+    }
+    // ── The publisher-keys builder option (C4-3) ───────────────────
+
+    #[test]
+    fn the_builder_keys_switch_the_scan_into_the_trust_lane() {
+        use crate::trust::PublisherKey;
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::rngs::OsRng;
+
+        let root = std::env::temp_dir().join(format!(
+            "akivili-reg-keys-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let plugin = root.join("plugins/signed-plugin");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(
+            plugin.join("akivili.plugin.toml"),
+            r#"schema = 2
+id = "signed-plugin"
+version = "1.0.0"
+provider = "official"
+form = "web.vue-module"
+
+[trust]
+signature = "agent.sig"
+min-trust = "signed"
+"#,
+        )
+        .unwrap();
+        let signing = SigningKey::generate(&mut OsRng);
+        let signature = signing.sign(b"");
+        std::fs::write(plugin.join("agent.sig"), signature.to_bytes()).unwrap();
+        let audit = root.join("audit.jsonl");
+
+        // With the key: the plugin scans in.
+        let registry = Registry::options()
+            .publisher_keys(vec![PublisherKey {
+                key_id: "builder-key".into(),
+                bytes: signing.verifying_key().to_bytes(),
+            }])
+            .open(&root.join("plugins"), &audit);
+        match registry {
+            Ok(registry) => {
+                let record = registry
+                    .plugins()
+                    .iter()
+                    .find(|r| r.manifest.id == "signed-plugin")
+                    .expect("present");
+                assert_eq!(record.manifest.id, "signed-plugin");
+            }
+            Err(e) => panic!("the keyed lane must accept a validly signed plugin: {e}"),
+        }
+
+        // Without the key (plain open): the scan still succeeds (other
+        // plugins load), but the demanding plugin fails closed — it is
+        // absent from the accepted set.
+        let plain =
+            Registry::open(&root.join("plugins"), &audit).expect("the unsigned lane still opens");
+        assert!(
+            plain
+                .plugins()
+                .iter()
+                .all(|r| r.manifest.id != "signed-plugin"),
+            "the demanding plugin must fail closed without keys"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
