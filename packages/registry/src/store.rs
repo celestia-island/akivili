@@ -378,43 +378,43 @@ fn validate_dir(
 
     // The trust gate (C4-2): plugins demanding a signature must verify
     // under a listed publisher key — fail-closed on every failure shape.
-    if let Some(trust) = &manifest.trust {
-        if trust.requires_signature() {
-            let signature_bytes = trust.signature.as_ref().and_then(|sig_path| {
-                let full = confined_payload_path(dir, std::path::Path::new(sig_path)).ok()?;
-                read_capped(&full, max_payload_bytes)
-                    .ok()
-                    .map(|b| b.to_vec())
-            });
-            let verdict = match crate::trust::verify_plugin_signature(
-                trust,
-                signature_bytes.as_deref(),
-                &payload_bytes,
-                publisher_keys,
-            ) {
-                Ok(verdict) => verdict,
-                Err(e) => {
-                    return Err(reject(
-                        Some(manifest.id.clone()),
-                        format!("trust gate: {e}"),
-                    ));
-                }
-            };
-            match verdict {
-                crate::manifest::TrustVerdict::UnsignedOk => {}
-                crate::manifest::TrustVerdict::SignedOk { .. } => {}
-                crate::manifest::TrustVerdict::UnsignedButDemanded => {
-                    return Err(reject(
+    if let Some(trust) = &manifest.trust
+        && trust.requires_signature()
+    {
+        let signature_bytes = trust.signature.as_ref().and_then(|sig_path| {
+            let full = confined_payload_path(dir, std::path::Path::new(sig_path)).ok()?;
+            read_capped(&full, max_payload_bytes)
+                .ok()
+                .map(|b| b.to_vec())
+        });
+        let verdict = match crate::trust::verify_plugin_signature(
+            trust,
+            signature_bytes.as_deref(),
+            &payload_bytes,
+            publisher_keys,
+        ) {
+            Ok(verdict) => verdict,
+            Err(e) => {
+                return Err(reject(
+                    Some(manifest.id.clone()),
+                    format!("trust gate: {e}"),
+                ));
+            }
+        };
+        match verdict {
+            crate::manifest::TrustVerdict::UnsignedOk => {}
+            crate::manifest::TrustVerdict::SignedOk { .. } => {}
+            crate::manifest::TrustVerdict::UnsignedButDemanded => {
+                return Err(reject(
                         Some(manifest.id.clone()),
                         "trust gate: a signature is demanded but the plugin directory carries no usable signature file".to_string(),
                     ));
-                }
-                crate::manifest::TrustVerdict::SignatureMismatch { reason } => {
-                    return Err(reject(
-                        Some(manifest.id.clone()),
-                        format!("trust gate: signature mismatch — {reason}"),
-                    ));
-                }
+            }
+            crate::manifest::TrustVerdict::SignatureMismatch { reason } => {
+                return Err(reject(
+                    Some(manifest.id.clone()),
+                    format!("trust gate: signature mismatch — {reason}"),
+                ));
             }
         }
     }
@@ -914,9 +914,12 @@ color = "red"
 
     #[test]
     fn scan_accepts_schema_2_manifests_and_feeds_their_resources() {
-        // End-to-end: a schema 2 plugin (form, capabilities, contract ref,
-        // trust section) scans, validates, and feeds resources exactly like
-        // a v1 plugin — the new fields are additive at the store level.
+        // End-to-end: a schema 2 plugin (form, capabilities, contract
+        // ref) scans, validates, and feeds resources exactly like a v1
+        // plugin — those fields are additive at the store level. The
+        // [trust] section is NOT additive since C4-2: a demanding
+        // section is enforced (see the trust-gate tests below), so this
+        // fixture stays in the unsigned lane.
         let v2 = r##"
 schema = 2
 id = "celestia-kanban"
@@ -925,10 +928,6 @@ provider = "official"
 form = "web.vue-module"
 capabilities = ["kv.read", "mesh.call:celestia-reports"]
 requires-contract = ["celestia:panel/host@0.1"]
-
-[trust]
-signature = "agent.sig"
-min-trust = "verified-publisher"
 
 [[resources]]
 kind = "webui.module"
