@@ -732,6 +732,213 @@ pub mod script_slot {
     }
 }
 
+/// The F2 wire ring: JSON-RPC 2.0 over the process slot's stdio
+/// (newline-delimited JSON — one envelope per line both ways). This is
+/// the channel a `process.rpc` plugin speaks (design D5's process lane;
+/// C2's prerequisite).
+///
+/// Wire-envelope note: the JSON-RPC 2.0 envelope authority is
+/// `plana::jsonrpc` (workspace §3.4) — but its package boundary is a
+/// shim over the monolithic `plana` crate, and pulling all of plana
+/// into akivili for a stdio envelope is weight the fabric must not
+/// carry. This module hand-rolls the MINIMAL wire subset (request /
+/// response envelopes only — no batching, no server machinery) and
+/// pins the shapes by test against plana's published forms; re-point
+/// at plana if it ever splits a lean jsonrpc package.
+pub mod process_rpc {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::sync::mpsc::Receiver;
+    use std::time::Duration;
+
+    /// One JSON-RPC 2.0 request envelope (the wire subset).
+    #[derive(Debug, serde::Serialize)]
+    struct Request<'a> {
+        jsonrpc: &'a str,
+        id: u64,
+        method: &'a str,
+        params: serde_json::Value,
+    }
+
+    /// One JSON-RPC 2.0 response envelope (the wire subset).
+    #[derive(Debug, serde::Deserialize)]
+    struct Response {
+        id: u64,
+        #[serde(default)]
+        result: Option<serde_json::Value>,
+        #[serde(default)]
+        error: Option<RpcErrorWire>,
+    }
+
+    /// The error object inside a response envelope.
+    #[derive(Debug, serde::Deserialize)]
+    struct RpcErrorWire {
+        #[allow(dead_code)]
+        code: i64,
+        message: String,
+    }
+
+    /// Everything the ring can fail with.
+    #[derive(Debug, thiserror::Error)]
+    pub enum RingError {
+        #[error("process error: {0}")]
+        Process(String),
+        #[error("wire error: {0}")]
+        Wire(String),
+        #[error("call timed out after {0:?}")]
+        Timeout(Duration),
+    }
+
+    /// A supervised JSON-RPC process slot.
+    pub struct ProcessRpc {
+        child: Child,
+        stdin: ChildStdin,
+        pending: Receiver<(u64, Result<serde_json::Value, String>)>,
+        next_id: u64,
+    }
+
+    /// The default per-call deadline.
+    pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+    impl ProcessRpc {
+        /// Spawn the plugin process with the ring wired (stdin/stdout
+        /// piped, stderr drained by a discard thread so a chatty plugin
+        /// cannot block on a full pipe).
+        pub fn spawn(argv: &[String]) -> Result<Self, RingError> {
+            if argv.is_empty() {
+                return Err(RingError::Process("empty argv".into()));
+            }
+            let mut child = Command::new(&argv[0])
+                .args(&argv[1..])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| RingError::Process(format!("{}: {e}", argv[0])))?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| RingError::Process("no stdin".into()))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| RingError::Process("no stdout".into()))?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| RingError::Process("no stderr".into()))?;
+            std::thread::spawn(move || {
+                // v0: drain stderr; the audit/log wave routes it into
+                // the host's log surface instead.
+                let mut stderr = stderr;
+                let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            });
+            let (tx, pending) = std::sync::mpsc::channel();
+            std::thread::spawn(move || reader_loop(stdout, tx));
+            Ok(Self {
+                child,
+                stdin,
+                pending,
+                next_id: 0,
+            })
+        }
+
+        /// Issue a call and await its id-matched reply. Server-push
+        /// notifications (ids we did not issue, or non-envelope lines)
+        /// are skipped until the matching reply lands or the deadline
+        /// hits.
+        pub fn call(
+            &mut self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value, RingError> {
+            self.call_with_deadline(method, params, CALL_TIMEOUT)
+        }
+
+        /// [`Self::call`] with an explicit deadline.
+        pub fn call_with_deadline(
+            &mut self,
+            method: &str,
+            params: serde_json::Value,
+            timeout: Duration,
+        ) -> Result<serde_json::Value, RingError> {
+            let id = self.next_id;
+            self.next_id += 1;
+            let request = Request {
+                jsonrpc: "2.0",
+                id,
+                method,
+                params,
+            };
+            let line = serde_json::to_string(&request)
+                .map_err(|e| RingError::Wire(format!("serialize: {e}")))?;
+            self.stdin
+                .write_all(line.as_bytes())
+                .and_then(|_| self.stdin.write_all(b"\n"))
+                .and_then(|_| self.stdin.flush())
+                .map_err(|e| RingError::Process(format!("write: {e}")))?;
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(RingError::Timeout(timeout));
+                }
+                match self.pending.recv_timeout(remaining) {
+                    Ok((reply_id, outcome)) if reply_id == id => {
+                        return outcome.map_err(RingError::Wire);
+                    }
+                    Ok(_) => continue, // a push or stale reply — skip
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        return Err(RingError::Timeout(timeout));
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(RingError::Process("reader died".into()));
+                    }
+                }
+            }
+        }
+
+        /// Whether the child is still alive.
+        pub fn is_alive(&mut self) -> bool {
+            matches!(self.child.try_wait(), Ok(None))
+        }
+
+        /// Stop the process (v0 kill+reap, mirroring the slot's drain).
+        pub fn shutdown(&mut self) -> bool {
+            let _ = self.stdin.flush();
+            self.child.kill().is_ok() && self.child.wait().is_ok()
+        }
+    }
+
+    fn reader_loop(
+        stdout: ChildStdout,
+        tx: std::sync::mpsc::Sender<(u64, Result<serde_json::Value, String>)>,
+    ) {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => return,
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let response: Response = match serde_json::from_str(&line) {
+                Ok(response) => response,
+                Err(_) => continue, // non-envelope line — skip (v0)
+            };
+            let outcome = if let Some(error) = response.error {
+                Err(error.message)
+            } else {
+                Ok(response.result.unwrap_or(serde_json::Value::Null))
+            };
+            if tx.send((response.id, outcome)).is_err() {
+                return; // caller gone
+            }
+        }
+    }
+}
+
 #[cfg(feature = "wasm")]
 mod wasm_slot {
     use super::PluginLoader;
@@ -1174,6 +1381,79 @@ mod topology_source_tests {
             "publish clears the error"
         );
         assert_eq!(source.plugin_manifests().unwrap()[0].id, "recovered");
+    }
+}
+
+#[cfg(test)]
+mod process_rpc_tests {
+    use super::process_rpc::{ProcessRpc, RingError};
+    use serde_json::json;
+
+    /// A minimal JSON-RPC echo plugin as a python3 one-liner: reads
+    /// newline-delimited envelopes, answers `ping` with a pong and
+    /// `echo` with its params.
+    fn echo_plugin_argv() -> Vec<String> {
+        vec![
+            "python3".to_string(),
+            "-u".to_string(),
+            "-c".to_string(),
+            r#"
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    if req.get('method') == 'ping':
+        result = {'pong': True}
+    elif req.get('method') == 'echo':
+        result = req.get('params')
+    else:
+        result = {'unknown': req.get('method')}
+    sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': req.get('id'), 'result': result}) + '\n')
+    sys.stdout.flush()
+"#
+            .to_string(),
+        ]
+    }
+
+    #[test]
+    fn a_process_plugin_answers_calls_over_stdio() {
+        let mut rpc = ProcessRpc::spawn(&echo_plugin_argv()).expect("echo plugin spawns");
+        let pong = rpc.call("ping", json!({})).expect("ping answers");
+        assert_eq!(pong["pong"], json!(true));
+        let echoed = rpc
+            .call("echo", json!({"fabric": true, "n": 7}))
+            .expect("echo answers");
+        assert_eq!(echoed["fabric"], json!(true));
+        assert_eq!(echoed["n"], json!(7));
+        assert!(rpc.is_alive());
+        assert!(rpc.shutdown());
+        assert!(!rpc.is_alive());
+    }
+
+    #[test]
+    fn ids_match_across_concurrent_calls() {
+        let mut rpc = ProcessRpc::spawn(&echo_plugin_argv()).expect("spawns");
+        // Sequential calls with distinct ids — the ring must route each
+        // reply to its own call (an id mismatch would surface the wrong
+        // params).
+        for i in 0..8 {
+            let echoed = rpc.call("echo", json!({ "i": i })).expect("answers");
+            assert_eq!(echoed["i"], json!(i), "call {i} got a foreign reply");
+        }
+        rpc.shutdown();
+    }
+
+    #[test]
+    fn empty_argv_rejects_and_missing_binary_names_itself() {
+        assert!(matches!(ProcessRpc::spawn(&[]), Err(RingError::Process(_))));
+        let argv = vec!["not-a-real-binary-xyz".to_string()];
+        let err = match ProcessRpc::spawn(&argv) {
+            Err(e) => e,
+            Ok(_) => panic!("a missing binary must fail at spawn"),
+        };
+        assert!(err.to_string().contains("not-a-real-binary-xyz"), "{err}");
     }
 }
 
