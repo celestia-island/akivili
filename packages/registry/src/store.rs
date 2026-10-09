@@ -765,22 +765,62 @@ color = "red"
         root
     }
 
+    /// A two-file schema-2 trust fixture: the payload is BOTH files'
+    /// bytes in manifest order (the concatenation contract), so the
+    /// signature covers a non-empty ordered body.
+    fn two_file_trust_manifest() -> String {
+        let alpha = b"alpha payload bytes".to_vec();
+        let beta = b"beta payload bytes".to_vec();
+        let sha = |b: &[u8]| sha256_hex(b);
+        format!(
+            r#"schema = 2
+id = "signed-plugin"
+version = "1.0.0"
+provider = "official"
+form = "web.vue-module"
+
+[trust]
+signature = "agent.sig"
+min-trust = "signed"
+
+[[resources]]
+kind = "webui.style"
+order = 1
+
+[resources.payload.File]
+path = "alpha.bin"
+sha256 = "{sha_a}"
+
+[[resources]]
+kind = "webui.style"
+order = 2
+
+[resources.payload.File]
+path = "beta.bin"
+sha256 = "{sha_b}"
+"#,
+            sha_a = sha(&alpha),
+            sha_b = sha(&beta),
+        )
+    }
+
     #[test]
     fn a_validly_signed_plugin_scans_in_under_its_key() {
         use ed25519_dalek::{Signer, SigningKey};
         use rand::rngs::OsRng;
 
         let signing = SigningKey::generate(&mut OsRng);
-        // The payload is resource bytes in manifest order — the single
-        // inline resource contributes none, so the signature covers the
-        // empty concatenation.
-        let signature = signing.sign(&[]);
+        // The payload is resource bytes in manifest order — alpha then
+        // beta, a NON-empty ordered body.
+        let signature = signing.sign(b"alpha payload bytesbeta payload bytes");
         let root = trust_scan_root("ok");
         std::fs::write(
             root.join("signed-plugin/akivili.plugin.toml"),
-            trust_manifest(Some("agent.sig")),
+            two_file_trust_manifest(),
         )
         .unwrap();
+        std::fs::write(root.join("signed-plugin/alpha.bin"), b"alpha payload bytes").unwrap();
+        std::fs::write(root.join("signed-plugin/beta.bin"), b"beta payload bytes").unwrap();
         std::fs::write(root.join("signed-plugin/agent.sig"), signature.to_bytes()).unwrap();
         let keys = vec![crate::trust::PublisherKey {
             key_id: "scan-key".into(),
@@ -798,6 +838,49 @@ color = "red"
             matches!(results.first(), Some(ScanResult::Accepted(_))),
             "a validly signed plugin scans in, got {results:?}"
         );
+    }
+
+    /// The concatenation ORDER is load-bearing: a signature made over
+    /// the reversed body must NOT verify (the m2 pin — the payload
+    /// assembly follows manifest order, not filename or size).
+    #[test]
+    fn the_payload_concatenation_order_is_load_bearing() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::rngs::OsRng;
+
+        let signing = SigningKey::generate(&mut OsRng);
+        let signature = signing.sign(b"beta payload bytesalpha payload bytes");
+        let root = trust_scan_root("order");
+        std::fs::write(
+            root.join("signed-plugin/akivili.plugin.toml"),
+            two_file_trust_manifest(),
+        )
+        .unwrap();
+        std::fs::write(root.join("signed-plugin/alpha.bin"), b"alpha payload bytes").unwrap();
+        std::fs::write(root.join("signed-plugin/beta.bin"), b"beta payload bytes").unwrap();
+        std::fs::write(root.join("signed-plugin/agent.sig"), signature.to_bytes()).unwrap();
+        let keys = vec![crate::trust::PublisherKey {
+            key_id: "order-key".into(),
+            bytes: signing.verifying_key().to_bytes(),
+        }];
+        let results = scan_with_keys(
+            &root,
+            &EnabledState::default(),
+            crate::registry::DEFAULT_MAX_PAYLOAD_BYTES,
+            &keys,
+        )
+        .expect("scan runs");
+        let _ = std::fs::remove_dir_all(&root);
+        match results.first() {
+            Some(ScanResult::Rejected(rejection)) => {
+                assert!(
+                    rejection.reason.contains("signature mismatch"),
+                    "{}",
+                    rejection.reason
+                );
+            }
+            other => panic!("expected rejection for the reversed body, got {other:?}"),
+        }
     }
 
     #[test]
