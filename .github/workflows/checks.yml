@@ -63,3 +63,5 @@ jobs:
         run: cargo clippy -p akivili_wasm_host --features tairitsu --all-targets -- -D warnings
       - name: Tests (tairitsu adapter)
         run: cargo test -p akivili_wasm_host --features tairitsu
+      - name: Tests (loader wasm face)
+        run: cargo test -p akivili_loader --features wasm

@@ -70,6 +70,156 @@ impl PluginListSource for StaticListSource {
     }
 }
 
+/// A local-host list source: the host's own configuration, declared as
+/// inline manifest tables (design D7's "自身配置回落" lane). The TOML
+/// shape mirrors the on-disk `akivili.plugin.toml` minus resources —
+/// a config-driven host needs no store:
+///
+/// ```toml
+/// [[plugin]]
+/// id = "hello-f1"
+/// version = "1.0.0"
+/// provider = "official"
+/// form = "wasm.component"
+/// ```
+///
+/// Parsing is strict (unknown fields rejected — `serde(deny_unknown_fields)`),
+/// so a typo in the host config fails loudly at load, not silently at
+/// runtime.
+pub struct ConfigListSource {
+    plugins: Vec<ConfigManifest>,
+    /// Lazily-validated manifests (parse once at first read; the
+    /// validation errors surface on EVERY read until fixed).
+    validated: std::sync::OnceLock<Result<Vec<PluginManifest>, LoaderError>>,
+}
+
+impl<'de> serde::Deserialize<'de> for ConfigListSource {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            #[serde(default, rename = "plugin")]
+            plugin: Vec<ConfigManifest>,
+        }
+        let raw = Raw::deserialize(d)?;
+        Ok(Self {
+            plugins: raw.plugin,
+            validated: std::sync::OnceLock::new(),
+        })
+    }
+}
+
+/// One `[[plugin]]` table — the config-side manifest shape (a strict
+/// subset of `akivili.plugin.toml` v2: no resources, no payloads).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigManifest {
+    /// Plugin id (manifest v2 rule applies on conversion).
+    pub id: String,
+    /// Loose version string (the config lane keeps the host's own
+    /// spelling; strictness lands on conversion).
+    pub version: String,
+    /// Who ships the plugin.
+    pub provider: String,
+    /// The plugin form (defaults to `web.resource` when absent).
+    #[serde(default)]
+    pub form: Option<String>,
+    /// Declared capabilities (closed vocabulary, validated on
+    /// conversion).
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+impl ConfigListSource {
+    /// Parse from TOML text.
+    pub fn from_toml(text: &str) -> Result<Self, LoaderError> {
+        toml::from_str(text).map_err(|e| LoaderError::Source(format!("config parse: {e}")))
+    }
+
+    /// Validate the config against the manifest rules and produce the
+    /// manifests (id syntax, form vocabulary, closed capability words
+    /// — the same validators the store applies, so config-driven and
+    /// store-driven plugins cannot drift).
+    pub fn into_manifests(self) -> Result<Vec<PluginManifest>, LoaderError> {
+        self.plugins
+            .into_iter()
+            .map(|p| p.into_manifest())
+            .collect()
+    }
+}
+
+impl ConfigManifest {
+    fn into_manifest(self) -> Result<PluginManifest, LoaderError> {
+        // Reuse the registry's validators: build a v2 manifest and let
+        // PluginManifest::validate enforce the id rule, form spelling
+        // and closed capability vocabulary.
+        let form = match self.form.as_deref() {
+            None => akivili_registry::FormKind::WebResource,
+            Some("wasm.component") => akivili_registry::FormKind::WasmComponent,
+            Some("process.rpc") => akivili_registry::FormKind::ProcessRpc,
+            Some("script.ts") => akivili_registry::FormKind::ScriptTs,
+            Some("web.vue-module") => akivili_registry::FormKind::WebVueModule,
+            Some("web.resource") => akivili_registry::FormKind::WebResource,
+            Some(other) => {
+                return Err(LoaderError::Source(format!(
+                    "config plugin '{}' has unknown form '{other}'",
+                    self.id
+                )));
+            }
+        };
+        let capabilities = self
+            .capabilities
+            .iter()
+            .map(|c| {
+                akivili_registry::Capability::new(c)
+                    .map_err(|e| LoaderError::Source(format!("config plugin '{}': {e}", self.id)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let manifest = PluginManifest {
+            schema: 2,
+            id: self.id,
+            version: self.version,
+            provider: self.provider,
+            description: None,
+            form: Some(form),
+            capabilities,
+            requires_contract: Vec::new(),
+            trust: None,
+            resources: Vec::new(),
+        };
+        manifest
+            .validate()
+            .map_err(|e| LoaderError::Source(format!("config plugin: {e}")))?;
+        Ok(manifest)
+    }
+}
+
+impl PluginListSource for ConfigListSource {
+    fn plugin_manifests(&self) -> Result<Vec<PluginManifest>, LoaderError> {
+        // The source carries already-validated manifests (from_toml →
+        // into_manifests at construction); serving them is infallible.
+        self.cached()
+    }
+}
+
+impl ConfigListSource {
+    fn cached(&self) -> Result<Vec<PluginManifest>, LoaderError> {
+        // Lazy validation cache: parse once at first read, serve a
+        // clone thereafter (the manifests are tiny).
+        match self.validated.get_or_init(|| self.build_manifests()) {
+            Ok(manifests) => Ok(manifests.clone()),
+            Err(e) => Err(LoaderError::Source(e.to_string())),
+        }
+    }
+
+    fn build_manifests(&self) -> Result<Vec<PluginManifest>, LoaderError> {
+        self.plugins
+            .iter()
+            .map(|p| p.clone().into_manifest())
+            .collect()
+    }
+}
+
 /// A failing source — the loader's loud-path pin (a source error must
 /// propagate, never silently produce an empty host).
 #[derive(Default)]
@@ -268,9 +418,12 @@ pub struct ReplaceWindow<'a, P> {
 
 impl<'a, P> ReplaceWindow<'a, P> {
     /// Commit: the new slot enters Serving and takes the map entry;
-    /// the drained slot (if any) is disposed. On a serve failure the
-    /// window is NOT consumed — the caller may retry commit or abort,
-    /// the plugin never disappears.
+    /// the drained slot (if any) is disposed. A serve failure consumes
+    /// the window (the replacement is lost) — but the CURRENT slot
+    /// stays in the map, so the plugin never disappears; the caller
+    /// retries with a fresh replace. (In practice the new slot is
+    /// always Initialized when commit runs, so this path is
+    /// unreachable through the public API.)
     pub fn commit(self) -> Result<(), LoaderError> {
         let mut new = self.new;
         new.serve()?;
@@ -421,8 +574,9 @@ mod tests {
         // Replace: the current slot drains IN the map (still reachable),
         // the new one serves after commit — the plugin never disappears.
         let window = loader.replace(manifest("p"), ()).unwrap();
-        // The current slot is Draining but STILL in the map (abort()
-        // below demonstrates the restore path on the same shape).
+        // The current slot is Draining but STILL in the map — the
+        // sibling `abort_restores_the_drained_slot` test proves the
+        // restore path on this same shape.
         window.commit().unwrap();
         assert_eq!(loader.slots()["p"].phase(), Phase::Serving);
     }
@@ -438,6 +592,145 @@ mod tests {
             loader.slots()["p"].phase(),
             Phase::Serving,
             "abort restores the drained slot to Serving"
+        );
+    }
+}
+
+#[cfg(test)]
+mod config_source_tests {
+    use super::*;
+
+    #[test]
+    fn parses_and_validates_a_config() {
+        let text = r#"
+[[plugin]]
+id = "hello-f1"
+version = "1.0.0"
+provider = "official"
+form = "wasm.component"
+capabilities = ["kv.read", "mesh.call:celestia-reports"]
+"#;
+        let source = ConfigListSource::from_toml(text).expect("config parses");
+        let loader: PluginLoader<()> = PluginLoader::new(Box::new(source));
+        let manifests = loader.current_manifests().expect("valid manifests");
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].id, "hello-f1");
+        assert_eq!(
+            manifests[0].form,
+            Some(akivili_registry::FormKind::WasmComponent)
+        );
+        assert_eq!(manifests[0].capabilities.len(), 2);
+    }
+
+    #[test]
+    fn empty_config_is_a_valid_empty_source() {
+        let source = ConfigListSource::from_toml("").expect("empty config parses");
+        let loader: PluginLoader<()> = PluginLoader::new(Box::new(source));
+        assert_eq!(loader.current_manifests().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn unknown_fields_fail_loudly() {
+        let text = r#"
+[[plugin]]
+id = "x"
+version = "1"
+provider = "p"
+typo-field = true
+"#;
+        assert!(
+            ConfigListSource::from_toml(text).is_err(),
+            "unknown fields must reject"
+        );
+    }
+
+    #[test]
+    fn validation_errors_surface_on_every_read() {
+        let text = r#"
+[[plugin]]
+id = "-bad-id"
+version = "1.0.0"
+provider = "p"
+"#;
+        let source = ConfigListSource::from_toml(text).expect("parses (validation is lazy)");
+        let loader: PluginLoader<()> = PluginLoader::new(Box::new(source));
+        let err = loader.current_manifests().unwrap_err();
+        assert!(err.to_string().contains("bad-id"), "{err}");
+        // The error is cached — every read reports it, never an empty list.
+        assert!(loader.current_manifests().is_err());
+    }
+
+    #[test]
+    fn omitted_form_defaults_to_web_resource() {
+        let text = r#"
+[[plugin]]
+id = "theme-pack"
+version = "1.0.0"
+provider = "official"
+"#;
+        let source = ConfigListSource::from_toml(text).expect("parses");
+        let loader: PluginLoader<()> = PluginLoader::new(Box::new(source));
+        let manifests = loader.current_manifests().expect("defaults validate");
+        assert_eq!(
+            manifests[0].form,
+            Some(akivili_registry::FormKind::WebResource),
+            "an omitted form defaults to web.resource and validates under schema 2"
+        );
+    }
+
+    #[test]
+    fn every_official_form_round_trips_through_the_config_lane() {
+        for (spelling, expected) in [
+            ("wasm.component", akivili_registry::FormKind::WasmComponent),
+            ("process.rpc", akivili_registry::FormKind::ProcessRpc),
+            ("script.ts", akivili_registry::FormKind::ScriptTs),
+            ("web.vue-module", akivili_registry::FormKind::WebVueModule),
+            ("web.resource", akivili_registry::FormKind::WebResource),
+        ] {
+            let text = format!(
+                "\n[[plugin]]\nid = \"form-check\"\nversion = \"1.0.0\"\nprovider = \"p\"\nform = \"{spelling}\"\n"
+            );
+            let source = ConfigListSource::from_toml(&text).expect(spelling);
+            let manifests = source.into_manifests().expect(spelling);
+            assert_eq!(
+                manifests[0].form,
+                Some(expected),
+                "the config lane must accept every official {spelling} spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_form_rejects_loudly() {
+        let text = r#"
+[[plugin]]
+id = "x"
+version = "1.0.0"
+provider = "p"
+form = "web.fake"
+"#;
+        let source = ConfigListSource::from_toml(text).expect("parses");
+        let err = source.into_manifests().unwrap_err();
+        assert!(
+            err.to_string().contains("web.fake"),
+            "the unknown form name must survive, got {err}"
+        );
+    }
+
+    #[test]
+    fn closed_vocabulary_enforced_on_config_plugins() {
+        let text = r#"
+[[plugin]]
+id = "x"
+version = "1.0.0"
+provider = "p"
+capabilities = ["fs.read"]
+"#;
+        let source = ConfigListSource::from_toml(text).expect("parses");
+        let loader: PluginLoader<()> = PluginLoader::new(Box::new(source));
+        assert!(
+            loader.current_manifests().is_err(),
+            "out-of-vocabulary words reject"
         );
     }
 }
