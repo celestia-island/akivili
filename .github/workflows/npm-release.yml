@@ -1,0 +1,57 @@
+name: npm Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g. 0.2.12)"
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish @celestia-island/akivili to npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org/
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 11
+
+      - name: Install dependencies
+        run: |
+          cd packages/npm
+          pnpm install --frozen-lockfile
+
+      - name: Build
+        run: |
+          cd packages/npm
+          pnpm run build
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            v="${{ github.event.inputs.version }}"
+          else
+            v="0.0.0"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: Bump version
+        run: |
+          cd packages/npm
+          npm version "${{ steps.ver.outputs.version }}" --no-git-tag-version --allow-same-version
+      - name: Publish
+        run: |
+          cd packages/npm
+          pnpm publish --access public --provenance --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
