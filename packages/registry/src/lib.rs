@@ -103,6 +103,7 @@ pub mod feed;
 pub mod forms;
 pub mod handle;
 pub mod kinds;
+pub mod lanes;
 pub mod manifest;
 pub mod registry;
 pub mod store;
