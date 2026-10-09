@@ -9,10 +9,10 @@ importers:
   .:
     devDependencies:
       typescript:
-        specifier: ^5.9.0
+        specifier: ^5
         version: 5.9.3
       vitest:
-        specifier: ^3.0.0
+        specifier: ^3
         version: 3.2.7
 
 packages:
