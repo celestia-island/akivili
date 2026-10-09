@@ -235,6 +235,20 @@ pub fn scan(
     state: &EnabledState,
     max_payload_bytes: u64,
 ) -> RegistryResult<Vec<ScanResult>> {
+    // The unsigned lane: no publisher keys configured, so a plugin
+    // demanding a signature fails closed at the trust gate (C4-2).
+    scan_with_keys(root, state, max_payload_bytes, &[])
+}
+
+/// [`scan`] with a publisher key list — the trust-gated lane: plugins
+/// demanding a signature must verify under one of `keys` or the scan
+/// rejects them (fail-closed, Celestia Plugin Fabric C4-2).
+pub fn scan_with_keys(
+    root: &Path,
+    state: &EnabledState,
+    max_payload_bytes: u64,
+    publisher_keys: &[crate::trust::PublisherKey],
+) -> RegistryResult<Vec<ScanResult>> {
     let entries = fs::read_dir(root).map_err(|e| {
         RegistryError::Io(std::io::Error::new(
             e.kind(),
@@ -252,7 +266,7 @@ pub fn scan(
     let mut results = Vec::new();
     let mut seen: HashMap<String, PathBuf> = HashMap::new();
     for dir in dirs {
-        match validate_dir(&dir, &seen, max_payload_bytes) {
+        match validate_dir(&dir, &seen, max_payload_bytes, publisher_keys) {
             Ok(manifest) => {
                 let record = PluginRecord {
                     enabled: state.get(&manifest.id),
@@ -274,6 +288,7 @@ fn validate_dir(
     dir: &Path,
     seen: &HashMap<String, PathBuf>,
     max_payload_bytes: u64,
+    publisher_keys: &[crate::trust::PublisherKey],
 ) -> Result<PluginManifest, Rejection> {
     let reject = |plugin_id: Option<String>, reason: String| Rejection {
         dir: dir.to_path_buf(),
@@ -317,6 +332,9 @@ fn validate_dir(
         ));
     }
 
+    // The payload assembly for the trust gate: resource file bytes in
+    // manifest order (the C4 concatenation contract).
+    let mut payload_bytes: Vec<u8> = Vec::new();
     for entry in &manifest.resources {
         if let Payload::File { path, sha256 } = &entry.payload {
             let full = match confined_payload_path(dir, path) {
@@ -351,6 +369,50 @@ fn validate_dir(
                             path.display(),
                             entry.kind
                         ),
+                    ));
+                }
+            }
+            payload_bytes.extend_from_slice(&bytes);
+        }
+    }
+
+    // The trust gate (C4-2): plugins demanding a signature must verify
+    // under a listed publisher key — fail-closed on every failure shape.
+    if let Some(trust) = &manifest.trust {
+        if trust.requires_signature() {
+            let signature_bytes = trust.signature.as_ref().and_then(|sig_path| {
+                let full = confined_payload_path(dir, std::path::Path::new(sig_path)).ok()?;
+                read_capped(&full, max_payload_bytes)
+                    .ok()
+                    .map(|b| b.to_vec())
+            });
+            let verdict = match crate::trust::verify_plugin_signature(
+                trust,
+                signature_bytes.as_deref(),
+                &payload_bytes,
+                publisher_keys,
+            ) {
+                Ok(verdict) => verdict,
+                Err(e) => {
+                    return Err(reject(
+                        Some(manifest.id.clone()),
+                        format!("trust gate: {e}"),
+                    ));
+                }
+            };
+            match verdict {
+                crate::manifest::TrustVerdict::UnsignedOk => {}
+                crate::manifest::TrustVerdict::SignedOk { .. } => {}
+                crate::manifest::TrustVerdict::UnsignedButDemanded => {
+                    return Err(reject(
+                        Some(manifest.id.clone()),
+                        "trust gate: a signature is demanded but the plugin directory carries no usable signature file".to_string(),
+                    ));
+                }
+                crate::manifest::TrustVerdict::SignatureMismatch { reason } => {
+                    return Err(reject(
+                        Some(manifest.id.clone()),
+                        format!("trust gate: signature mismatch — {reason}"),
                     ));
                 }
             }
@@ -661,6 +723,147 @@ value = 1
                 assert_eq!(rej.plugin_id.as_deref(), Some("dup"));
             }
             ScanResult::Accepted(_) => panic!("must be rejected"),
+        }
+    }
+
+    // ── The trust gate over real scans (C4-2) ──────────────────────
+
+    fn trust_manifest(sig: Option<&str>) -> String {
+        let sig_line = sig
+            .map(|p| format!("signature = \"{p}\""))
+            .unwrap_or_default();
+        format!(
+            r#"schema = 2
+id = "signed-plugin"
+version = "1.0.0"
+provider = "official"
+form = "web.vue-module"
+
+[trust]
+{sig_line}
+min-trust = "signed"
+
+[[resources]]
+kind = "webui.style"
+name = "main"
+
+[resources.payload.Inline]
+color = "red"
+"#
+        )
+    }
+
+    fn trust_scan_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "akivili-trust-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("signed-plugin")).unwrap();
+        root
+    }
+
+    #[test]
+    fn a_validly_signed_plugin_scans_in_under_its_key() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::rngs::OsRng;
+
+        let signing = SigningKey::generate(&mut OsRng);
+        // The payload is resource bytes in manifest order — the single
+        // inline resource contributes none, so the signature covers the
+        // empty concatenation.
+        let signature = signing.sign(&[]);
+        let root = trust_scan_root("ok");
+        std::fs::write(
+            root.join("signed-plugin/akivili.plugin.toml"),
+            trust_manifest(Some("agent.sig")),
+        )
+        .unwrap();
+        std::fs::write(root.join("signed-plugin/agent.sig"), signature.to_bytes()).unwrap();
+        let keys = vec![crate::trust::PublisherKey {
+            key_id: "scan-key".into(),
+            bytes: signing.verifying_key().to_bytes(),
+        }];
+        let results = scan_with_keys(
+            &root,
+            &EnabledState::default(),
+            crate::registry::DEFAULT_MAX_PAYLOAD_BYTES,
+            &keys,
+        )
+        .expect("scan runs");
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(results.first(), Some(ScanResult::Accepted(_))),
+            "a validly signed plugin scans in, got {results:?}"
+        );
+    }
+
+    #[test]
+    fn a_signature_demanding_plugin_fails_closed_without_keys() {
+        let root = trust_scan_root("nokeys");
+        std::fs::write(
+            root.join("signed-plugin/akivili.plugin.toml"),
+            trust_manifest(Some("agent.sig")),
+        )
+        .unwrap();
+        let results = scan_with_keys(
+            &root,
+            &EnabledState::default(),
+            crate::registry::DEFAULT_MAX_PAYLOAD_BYTES,
+            &[],
+        )
+        .expect("scan runs");
+        let _ = std::fs::remove_dir_all(&root);
+        match results.first() {
+            Some(ScanResult::Rejected(rejection)) => {
+                assert!(
+                    rejection.reason.contains("no usable signature file"),
+                    "{}",
+                    rejection.reason
+                );
+            }
+            other => panic!("expected rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tampered_signature_is_rejected_with_the_reason() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::rngs::OsRng;
+
+        let signing = SigningKey::generate(&mut OsRng);
+        let other = SigningKey::generate(&mut OsRng);
+        let signature = other.sign(&[]);
+        let root = trust_scan_root("tamper");
+        std::fs::write(
+            root.join("signed-plugin/akivili.plugin.toml"),
+            trust_manifest(Some("agent.sig")),
+        )
+        .unwrap();
+        std::fs::write(root.join("signed-plugin/agent.sig"), signature.to_bytes()).unwrap();
+        let keys = vec![crate::trust::PublisherKey {
+            key_id: "real".into(),
+            bytes: signing.verifying_key().to_bytes(),
+        }];
+        let results = scan_with_keys(
+            &root,
+            &EnabledState::default(),
+            crate::registry::DEFAULT_MAX_PAYLOAD_BYTES,
+            &keys,
+        )
+        .expect("scan runs");
+        let _ = std::fs::remove_dir_all(&root);
+        match results.first() {
+            Some(ScanResult::Rejected(rejection)) => {
+                assert!(
+                    rejection.reason.contains("signature mismatch"),
+                    "{}",
+                    rejection.reason
+                );
+            }
+            other => panic!("expected rejection, got {other:?}"),
         }
     }
 
