@@ -62,6 +62,7 @@
 //! id = "acmestyle"
 //! version = "1.0.0"
 //! provider = "acme"
+//! form = "web.resource"
 //!
 //! [[resources]]
 //! kind = "webui.style"
@@ -111,15 +112,16 @@ pub mod trust;
 
 pub use acceptance::{HostAcceptance, KindFilter};
 pub use audit::{AuditEvent, AuditLog};
-pub use capabilities::{Capability, VOCABULARY_V1};
+pub use capabilities::{Capability, VOCABULARY};
 pub use error::{RegistryError, RegistryResult};
 pub use feed::{FeedItem, ResolvedPayload, ResourceFeed};
 pub use forms::FormKind;
 pub use handle::{LocalRegistration, ResourceHandle};
 pub use kinds::ResourceKind;
 pub use manifest::{
-    ContractRef, MinTrust, Payload, PluginManifest, ResourceEntry, SCHEMA_V1, SCHEMA_V2,
-    TrustSection,
+    ConfigSection, ContractRef, MigrationEngine, MigrationEntry, MinTrust, Payload, PluginManifest,
+    ResourceEntry, RollbackPolicy, SCHEMA, SystemSection, TrustSection, UnknownVersionPolicy,
+    UpgradeMode, UpgradeSection, UpgradeStrategy,
 };
 pub use registry::{DEFAULT_MAX_PAYLOAD_BYTES, Registry, RegistryOptions};
 pub use store::{PluginRecord, Rejection, ScanResult};

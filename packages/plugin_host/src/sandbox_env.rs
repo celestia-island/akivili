@@ -303,6 +303,7 @@ mod tests {
 id = "beta"
 version = "0.1.0"
 provider = "test"
+form = "web.resource"
 
 [[resources]]
 kind = "sandbox.env"
@@ -318,6 +319,7 @@ AKIVILI_BETA_ONLY = "yes"
 id = "alpha"
 version = "1.2.0"
 provider = "test"
+form = "web.resource"
 
 [[resources]]
 kind = "sandbox.env"
@@ -333,6 +335,7 @@ AKIVILI_TRACE = "off"
 id = "gamma"
 version = "1.0.0"
 provider = "test"
+form = "web.resource"
 
 [[resources]]
 kind = "sandbox.env"
@@ -348,6 +351,7 @@ AKIVILI_COUNT = 3
 id = "delta"
 version = "1.0.0"
 provider = "test"
+form = "web.resource"
 
 [[resources]]
 kind = "sandbox.env"
@@ -362,6 +366,7 @@ order = 30
 id = "epsilon"
 version = "1.0.0"
 provider = "test"
+form = "web.resource"
 
 [[resources]]
 kind = "sandbox.env"
@@ -376,6 +381,7 @@ path = "env.json"
 id = "zeta"
 version = "1.0.0"
 provider = "test"
+form = "web.resource"
 
 [[resources]]
 kind = "sandbox.env"

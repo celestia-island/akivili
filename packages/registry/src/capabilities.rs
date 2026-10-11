@@ -81,7 +81,7 @@ impl Capability {
 }
 
 /// The closed v1 vocabulary: `(word, takes_parameter)`.
-pub const VOCABULARY_V1: &[(&str, bool)] = &[
+pub const VOCABULARY: &[(&str, bool)] = &[
     (CAP_LOG, false),
     (CAP_KV_READ, false),
     (CAP_KV_WRITE, false),
@@ -105,11 +105,11 @@ pub const VOCABULARY_V1: &[(&str, bool)] = &[
 fn is_valid_capability(raw: &str) -> bool {
     let Some((base, param)) = raw.split_once(':') else {
         // Plain word: must be a parameter-less vocabulary entry.
-        return VOCABULARY_V1
+        return VOCABULARY
             .iter()
             .any(|(word, takes_param)| !takes_param && word == &raw);
     };
-    let takes_param = VOCABULARY_V1
+    let takes_param = VOCABULARY
         .iter()
         .any(|(word, takes_param)| *takes_param && *word == base);
     if !takes_param || param.is_empty() {
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn accepts_every_plain_vocabulary_word() {
-        for (word, takes_param) in VOCABULARY_V1 {
+        for (word, takes_param) in VOCABULARY {
             if !takes_param {
                 let cap = Capability::new(word).expect("plain words must validate");
                 assert_eq!(cap.param(), None);

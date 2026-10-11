@@ -238,7 +238,10 @@ fn run_inner(args: &[String]) -> Result<i32, String> {
                 manifest.id,
                 manifest.version,
                 manifest.schema,
-                manifest.form_or_default()
+                manifest
+                    .form
+                    .map(|f| f.to_string())
+                    .unwrap_or_else(|| "missing".to_string())
             );
             Ok(0)
         }
@@ -331,6 +334,7 @@ mod tests {
 id = "acmetheme"
 version = "1.4.0"
 provider = "acme"
+form = "web.resource"
 
 [[resources]]
 kind = "webui.theme"
@@ -541,7 +545,7 @@ primary = "#181825"
         std::fs::write(
             &path,
             r##"
-schema = 2
+schema = 1
 id = "celestia-kanban"
 version = "1.2.0"
 provider = "official"
@@ -552,7 +556,7 @@ requires-contract = ["celestia:panel/host@0.1"]
         )
         .unwrap();
         let args = vec!["validate".to_string(), path.display().to_string()];
-        assert_eq!(run(&args), 0, "a valid schema 2 manifest must pass");
+        assert_eq!(run(&args), 0, "a valid fabric manifest must pass");
     }
 
     #[test]
@@ -560,7 +564,7 @@ requires-contract = ["celestia:panel/host@0.1"]
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(MANIFEST_FILE);
 
-        // v1 manifest smuggling a v2 field.
+        // A non-SemVer version is rejected.
         std::fs::write(
             &path,
             r#"
@@ -572,13 +576,13 @@ form = "script.ts"
         )
         .unwrap();
         let args = vec!["validate".to_string(), path.display().to_string()];
-        assert_eq!(run(&args), 2, "v1 with a v2 field must be rejected");
+        assert_eq!(run(&args), 2, "non-SemVer version must be rejected");
 
-        // schema 2 with a capability outside the closed vocabulary.
+        // A capability outside the closed vocabulary.
         std::fs::write(
             &path,
             r#"
-schema = 2
+schema = 1
 id = "acme"
 version = "1.0.0"
 provider = "acme"
