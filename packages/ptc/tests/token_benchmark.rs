@@ -127,7 +127,7 @@ import { report } from 'hubris'; report({ text: combined });
         "\n╔══════════════════════════════════════════════════════════════════════════════════════╗"
     );
     eprintln!(
-        "║ PTC Token Consumption Benchmark                                                     ║"
+        "║ PTC Token Consumption Benchmark                                                      ║"
     );
     eprintln!(
         "╠══════════════════════════════════════════════════════════════════════════════════════╣"
