@@ -10,14 +10,14 @@ members = [
     "examples/hello-f1",
     "packages/guard",
     "packages/plugin_host",
-    "packages/iepl",
+    "packages/ptc",
     "packages/registry",
     "packages/wasm_host",
     "packages/loader",
 ]
 
 [workspace.package]
-version = "0.2.21"
+version = "0.2.22"
 edition = "2024"
 rust-version = "1.91"
 authors = ["langyo <langyo.china@gmail.com>"]

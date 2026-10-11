@@ -1,11 +1,11 @@
-//! Agent plugin host — IEPL TypeScript runtime + tool router.
+//! Agent plugin host — PTC TypeScript runtime + tool router.
 //!
 //! Extracted from entelecheia `packages/shared/plugin_host` (PLAN.md §11).
 //! Replaces the former WASM-based plugin system. Agent packages are composed
-//! of IEPL TypeScript tool definitions, skill prompts, and optional binary
+//! of PTC TypeScript tool definitions, skill prompts, and optional binary
 //! backends. This crate provides:
 //!
-//! - [`TsPlugin`]: Executes IEPL TypeScript tool code in the Boa JS sandbox.
+//! - [`TsPlugin`]: Executes PTC TypeScript tool code in the Boa JS sandbox.
 //! - [`PluginRouter`]: Central registry that dispatches MCP tool calls to
 //!   the correct agent package by tool name.
 //! - [`PluginState`]: Host API surface exposed to TS tools.

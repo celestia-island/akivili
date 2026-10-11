@@ -1,6 +1,6 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
-use akivili_iepl::IeplEngine;
+use akivili_ptc::PtcEngine;
 
 const TS_SIMPLE: &str = r#"
 import { navigate } from 'web_automation';
@@ -61,21 +61,21 @@ async function complexWorkflow(targetUrl: string, maxSteps: number): Promise<Ste
 "#;
 
 fn bench_transpile_small(c: &mut Criterion) {
-    let engine = IeplEngine::new();
+    let engine = PtcEngine::new();
     c.bench_function("transpile_small", |b| {
         b.iter(|| engine.transpile(black_box(TS_SIMPLE)))
     });
 }
 
 fn bench_transpile_medium(c: &mut Criterion) {
-    let engine = IeplEngine::new();
+    let engine = PtcEngine::new();
     c.bench_function("transpile_medium", |b| {
         b.iter(|| engine.transpile(black_box(TS_MEDIUM)))
     });
 }
 
 fn bench_transpile_large(c: &mut Criterion) {
-    let engine = IeplEngine::new();
+    let engine = PtcEngine::new();
     c.bench_function("transpile_large", |b| {
         b.iter(|| engine.transpile(black_box(TS_LARGE)))
     });
@@ -83,7 +83,7 @@ fn bench_transpile_large(c: &mut Criterion) {
 
 fn bench_validate_ast(c: &mut Criterion) {
     c.bench_function("validate_ast", |b| {
-        b.iter(|| akivili_iepl::validate_ast(black_box(TS_MEDIUM)))
+        b.iter(|| akivili_ptc::validate_ast(black_box(TS_MEDIUM)))
     });
 }
 

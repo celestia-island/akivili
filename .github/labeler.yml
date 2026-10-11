@@ -4,8 +4,8 @@
 plugin-host:
   - packages/plugin_host/**
 
-iepl:
-  - packages/iepl/**
+ptc:
+  - packages/ptc/**
 
 docs:
   - docs/**

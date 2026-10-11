@@ -6,7 +6,7 @@
 //! high-performance transpilation and adds a mandatory AST-level security validation pass.
 //!
 //! The design is centred on two concerns:
-//! 1. **Transpilation** ([`IeplEngine`]) — strips TypeScript type annotations and downlevels
+//! 1. **Transpilation** ([`PtcEngine`]) — strips TypeScript type annotations and downlevels
 //!    modern syntax to a target JavaScript version suitable for embedding.
 //! 2. **Security** ([`validate_ast`]) — walks the parsed AST to reject forbidden constructs
 //!    (dynamic code execution, dangerous globals, etc.) before any code is emitted.
@@ -21,4 +21,4 @@ pub mod engine;
 pub mod security_constants;
 
 pub use ast_validator::{AstViolation, validate_ast};
-pub use engine::{IeplEngine, TranspileResult};
+pub use engine::{PtcEngine, TranspileResult};

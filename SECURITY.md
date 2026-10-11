@@ -66,7 +66,7 @@ surfaces of this repository.
 
 ## Known hardening notes
 
-- The SWC transpile pipeline runs the AST security validator (`akivili_iepl`)
+- The SWC transpile pipeline runs the AST security validator (`akivili_ptc`)
   before any code is evaluated: forbidden globals, dynamic code execution and
   unsafe timer usage are rejected.
 - Egress HTTP from plugins is gated by `NetworkGuard` (URL allow-list policy).

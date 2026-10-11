@@ -18,17 +18,17 @@ pub struct TranspileResult {
     pub js_code: String,
 }
 
-pub struct IeplEngine {
+pub struct PtcEngine {
     cm: Rc<SourceMap>,
 }
 
-impl Default for IeplEngine {
+impl Default for PtcEngine {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl IeplEngine {
+impl PtcEngine {
     pub fn new() -> Self {
         Self {
             cm: Rc::new(SourceMap::default()),
@@ -58,7 +58,7 @@ impl IeplEngine {
 
     fn transpile_inner(&self, ts_code: &str) -> Result<TranspileResult> {
         let fm = self.cm.new_source_file(
-            FileName::Custom("iepl-input".into()).into(),
+            FileName::Custom("ptc-input".into()).into(),
             ts_code.to_string(),
         );
 
@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn test_simple_transpile() -> Result<()> {
-        let engine = IeplEngine::new();
+        let engine = PtcEngine::new();
         let ts = r#"const x: number = 42; console.log(x);"#;
         let result = engine.transpile(ts)?;
         assert!(result.js_code.contains("42"));
@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn test_type_strip() -> Result<()> {
-        let engine = IeplEngine::new();
+        let engine = PtcEngine::new();
         let ts = r#"
 interface Foo { name: string; age: number; }
 const foo: Foo = { name: "test", age: 1 };
@@ -139,7 +139,7 @@ console.log(foo.name);
 
     #[test]
     fn test_async_function() -> Result<()> {
-        let engine = IeplEngine::new();
+        let engine = PtcEngine::new();
         let ts = r#"
 async function fetchData(url: string): Promise<string> {
     return "data";
@@ -153,7 +153,7 @@ async function fetchData(url: string): Promise<string> {
 
     #[test]
     fn test_parse_error() -> Result<()> {
-        let engine = IeplEngine::new();
+        let engine = PtcEngine::new();
         let ts = r#"const x: number = ;"#;
         let result = engine.transpile(ts);
         assert!(result.is_err());
@@ -168,7 +168,7 @@ async function fetchData(url: string): Promise<string> {
 
     #[test]
     fn test_tool_call_style() -> Result<()> {
-        let engine = IeplEngine::new();
+        let engine = PtcEngine::new();
         let ts = r#"
 import { navigate } from 'web_automation';
 const result: string = await navigate({ browser_id: "b1", url: "http://test.com" });
@@ -182,7 +182,7 @@ console.log(result);
 
     #[test]
     fn test_ast_validation_rejects_eval() -> Result<()> {
-        let engine = IeplEngine::new();
+        let engine = PtcEngine::new();
         let ts = r#"eval("console.log(1)")"#;
         let result = engine.transpile(ts);
         assert!(result.is_err());
@@ -193,7 +193,7 @@ console.log(result);
 
     #[test]
     fn test_ast_validation_rejects_process() -> Result<()> {
-        let engine = IeplEngine::new();
+        let engine = PtcEngine::new();
         let ts = r#"const x = process.env"#;
         let result = engine.transpile(ts);
         assert!(result.is_err());
@@ -204,7 +204,7 @@ console.log(result);
 
     #[test]
     fn test_arrow_with_type_params() -> Result<()> {
-        let engine = IeplEngine::new();
+        let engine = PtcEngine::new();
         let ts = r#"
 const parse = <T>(input: string): T => {
     return JSON.parse(input) as T;
@@ -219,7 +219,7 @@ const parse = <T>(input: string): T => {
 
     #[test]
     fn test_async_await_complex() -> Result<()> {
-        let engine = IeplEngine::new();
+        let engine = PtcEngine::new();
         let ts = r#"
 import { navigate } from 'web_automation';
 async function processItems(items: string[]): Promise<void> {

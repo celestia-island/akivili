@@ -697,7 +697,7 @@ fn validate_ast_with_syntax(code: &str, syntax: Syntax, label: &str) -> Result<V
 
     GLOBALS.set(&Default::default(), || {
         let fm = cm.new_source_file(
-            FileName::Custom(format!("iepl-validate-{}", label.to_lowercase())).into(),
+            FileName::Custom(format!("ptc-validate-{}", label.to_lowercase())).into(),
             code.to_string(),
         );
 

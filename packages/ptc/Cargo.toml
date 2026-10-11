@@ -1,5 +1,5 @@
 [package]
-name = "akivili_iepl"
+name = "akivili_ptc"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -25,5 +25,5 @@ swc_core = { workspace = true, features = [
 criterion = "^0.5"
 
 [[bench]]
-name = "iepl_bench"
+name = "ptc_bench"
 harness = false
