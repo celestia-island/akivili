@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-use akivili_iepl::IeplEngine;
+use akivili_ptc::PtcEngine;
 
 fn estimate_tokens(text: &str) -> usize {
     (text.len() as f64 / 4.0).ceil() as usize
@@ -16,7 +16,7 @@ struct BenchmarkResult {
 }
 
 fn run_benchmark(label: &str, ts_code: &str) -> Result<BenchmarkResult> {
-    let engine = IeplEngine::new();
+    let engine = PtcEngine::new();
     let source_len = ts_code.len();
     let source_tokens = estimate_tokens(ts_code);
 
@@ -127,7 +127,7 @@ import { report } from 'hubris'; report({ text: combined });
         "\n╔══════════════════════════════════════════════════════════════════════════════════════╗"
     );
     eprintln!(
-        "║ IEPL Token Consumption Benchmark                                                     ║"
+        "║ PTC Token Consumption Benchmark                                                      ║"
     );
     eprintln!(
         "╠══════════════════════════════════════════════════════════════════════════════════════╣"

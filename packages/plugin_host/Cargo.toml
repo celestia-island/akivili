@@ -12,7 +12,7 @@ publish.workspace = true
 
 [dependencies]
 akivili_guard = { path = "../guard" }
-akivili_iepl = { path = "../iepl" }
+akivili_ptc = { path = "../ptc" }
 akivili_registry = { path = "../registry" }
 plana_domain_skills = { git = "https://github.com/celestia-island/plana.git", branch = "master" }
 plana_infra_utils = { git = "https://github.com/celestia-island/plana.git", branch = "master" }

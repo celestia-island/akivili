@@ -27,7 +27,7 @@ function onMessage(platform, message): string | null;         // bot 消息处�
 ## 3. 执行管线
 
 ```
-plugin.ts ──► IeplEngine.transpile() (SWC TS→JS + AST 安全校验)
+plugin.ts ──► PtcEngine.transpile() (SWC TS→JS + AST 安全校验)
            ──► Boa Context (RuntimeLimits: 1M loop / 256 recursion / 1024 stack)
            ──► thread_local CURRENT_HOST_API ──► dispatch_host_fn ──► HostFunctions
 ```

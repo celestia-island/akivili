@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 ///   it on the tairitsu runtime stack (wasmtime server-side, the browser
 ///   glue on the webui side); hot reload is container-instance swap.
 /// - [`FormKind::ProcessRpc`] — F2, an external process speaking JSON-RPC
-///   over UDS/stdio/WS. Native core components (e.g. the boa IEPL engine)
+///   over UDS/stdio/WS. Native core components (e.g. the boa PTC engine)
 ///   take this form; hot reload is supervisor restart plus drain.
 /// - [`FormKind::ScriptTs`] — F3, a TypeScript script plugin executed in
 ///   the boa sandbox (the akivili plugin host's existing form).

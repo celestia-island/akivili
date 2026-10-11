@@ -532,7 +532,7 @@ impl<'a, P> ReplaceWindow<'a, P> {
     }
 }
 /// The F2 form's slot payload: a supervised child process speaking
-/// JSON-RPC over stdio (design D5's process lane — the boa IEPL
+/// JSON-RPC over stdio (design D5's process lane — the boa PTC
 /// engine's future home). The supervisor owns spawn/stop; the spine
 /// owns the lifecycle phases.
 pub mod process_slot {
@@ -601,7 +601,7 @@ pub mod process_slot {
     }
 }
 
-/// The F3 form's slot payload: a script plugin riding the boa IEPL
+/// The F3 form's slot payload: a script plugin riding the boa PTC
 /// runtime (akivili_plugin_host's `TsPluginData`). The loader side is
 /// a thin adapter — the heavy machinery (SWC transpile cache, boa
 /// sandbox, host functions) stays in plugin_host where it already
@@ -655,7 +655,7 @@ pub mod script_slot {
         }
 
         /// Dispatch an HTTP-shaped request to the script's
-        /// `handleRequest` (the IEPL tool contract).
+        /// `handleRequest` (the PTC tool contract).
         pub fn handle_request(
             &mut self,
             method: &str,
@@ -1465,7 +1465,7 @@ mod script_slot_tests {
     use akivili_registry::PluginManifest;
     use std::sync::Arc;
 
-    /// A well-formed IEPL tool script: handleRequest answers with the
+    /// A well-formed PTC tool script: handleRequest answers with the
     /// path it was given.
     const GOOD_TS: &str = r#"
 var handleRequest = function (method, path, headers, body) {

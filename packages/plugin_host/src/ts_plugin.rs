@@ -368,7 +368,7 @@ impl TsPluginData {
         if let Some(cached) = self.compiled_js.get() {
             return Ok(cached);
         }
-        let engine = akivili_iepl::IeplEngine::new();
+        let engine = akivili_ptc::PtcEngine::new();
         let transpiled = engine
             .transpile(&self.code)
             .map_err(|e| anyhow!("TS transpilation failed: {}", e))?;
@@ -496,7 +496,7 @@ impl TsPlugin {
     /// post-transpile output for TS plugins so swc lowering cannot smuggle
     /// forbidden constructs into the emitted code). Rejects on any violation.
     fn validate_js(code: &str) -> Result<()> {
-        match akivili_iepl::ast_validator::validate_js_ast(code) {
+        match akivili_ptc::ast_validator::validate_js_ast(code) {
             Ok(violations) if violations.is_empty() => Ok(()),
             Ok(violations) => {
                 let details: Vec<String> = violations

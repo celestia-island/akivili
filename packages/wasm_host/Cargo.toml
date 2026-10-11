@@ -13,7 +13,7 @@ publish.workspace = true
 [features]
 default = []
 # The tairitsu-backed adapter: pulls the wasm runtime stack ONLY for
-# hosts that opt in (the D9 weight discipline — registry/loader/iepl/
+# hosts that opt in (the D9 weight discipline — registry/loader/ptc/
 # plugin_host/guard never see wasmtime).
 tairitsu = ["dep:tairitsu", "dep:wasmtime"]
 

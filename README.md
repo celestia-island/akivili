@@ -12,8 +12,8 @@ Layer-3 community agents.
 - **Plugin host** (`packages/plugin_host`) — loads and dispatches TypeScript plugins
   (`handleRequest` / `onMessage` / `name` globals) on the Boa JS engine, with host
   capabilities injected via `dispatch` / `registerMcpTool`.
-- **TypeScript execution pipeline** (`packages/iepl`) — TS→JS transpilation with SWC
-  plus AST safety validation, shared with the IEPL engine consumers.
+- **TypeScript execution pipeline** (`packages/ptc`) — TS→JS transpilation with SWC
+  plus AST safety validation, shared with the PTC engine consumers.
 - **Plugin registry** (`packages/registry`) — discoverable, uninstallable, auditable
   plugin resources for any host runtime (detailed below), plus the
   `akivili-plugin` CLI for humans and ops.
@@ -131,7 +131,7 @@ SySL-1.0 — see [LICENSE](LICENSE).
 
 ```
 packages/plugin_host/   plugin host core (Boa TS runtime, router, state)
-packages/iepl/          TypeScript → JavaScript pipeline (SWC + Boa)
+packages/ptc/           TypeScript → JavaScript pipeline (SWC + Boa)
 packages/registry/      plugin registry (manifests, feed, audit, akivili-plugin CLI)
 packages/guard/         egress network guard (URL/IP policy, DNS-rebinding-safe)
 docs/                   architecture & contract documentation
