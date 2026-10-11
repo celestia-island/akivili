@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// The plugin **form**: how a host loads and runs the plugin (schema 2).
+/// The plugin **form**: how a host loads and runs the plugin.
 ///
 /// The forms follow the plugin-fabric shape taxonomy:
 ///
@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 /// - [`FormKind::WebVueModule`] — F4, a Vue3 + TSX + SCSS webui module.
 /// - [`FormKind::WebResource`] — F4, a declarative web resource
 ///   (style/theme/token payloads; never executes code).
+/// - [`FormKind::SystemHost`] — the host binary itself (the thing that
+///   initializes the entire system). Requires `class = "system"` on the
+///   manifest; upgrade mode is cold (or rolling via self-handover for
+///   hosts that can run two copies).
 ///
 /// Serialization is the wire spelling (`wasm.component` &c.), so TOML
 /// manifests and JSON descriptors agree; unknown spellings fail to
@@ -31,6 +35,8 @@ pub enum FormKind {
     WebVueModule,
     #[serde(rename = "web.resource")]
     WebResource,
+    #[serde(rename = "system.host")]
+    SystemHost,
 }
 
 impl FormKind {
@@ -42,6 +48,7 @@ impl FormKind {
             Self::ScriptTs => "script.ts",
             Self::WebVueModule => "web.vue-module",
             Self::WebResource => "web.resource",
+            Self::SystemHost => "system.host",
         }
     }
 }
@@ -64,6 +71,7 @@ mod tests {
             ("script.ts", FormKind::ScriptTs),
             ("web.vue-module", FormKind::WebVueModule),
             ("web.resource", FormKind::WebResource),
+            ("system.host", FormKind::SystemHost),
         ] {
             let parsed: FormKind = serde_json::from_str(&format!("\"{wire}\"")).expect(wire);
             assert_eq!(parsed, form);

@@ -7,8 +7,8 @@ import {
   type PluginManifest,
 } from "./index";
 
-const v2 = (over: Partial<PluginManifest> = {}): PluginManifest => ({
-  schema: 2,
+const base = (over: Partial<PluginManifest> = {}): PluginManifest => ({
+  schema: 1,
   id: "celestia-kanban",
   version: "1.2.0",
   provider: "official",
@@ -17,40 +17,49 @@ const v2 = (over: Partial<PluginManifest> = {}): PluginManifest => ({
 });
 
 describe("validateManifest", () => {
-  it("accepts a full schema 2 manifest", () => {
-    const m = v2({
+  it("accepts a full fabric manifest", () => {
+    const m = base({
       capabilities: ["kv.read", "http.egress:api.github.com", "mesh.call:celestia-reports"],
       requiresContract: ["celestia:host/guest@0.1"],
     });
     expect(validateManifest(m)).toEqual([]);
   });
 
-  it("gates v2 fields under schema 1", () => {
-    const issues = validateManifest(
-      v2({ schema: 1, capabilities: ["kv.read"] } as Partial<PluginManifest>),
-    );
-    expect(issues.some((i) => i.field === "capabilities")).toBe(true);
+  it("rejects schema values other than 1", () => {
+    expect(validateManifest(base({ schema: 2 } as Partial<PluginManifest>)).some((i) => i.field === "schema")).toBe(true);
+    expect(validateManifest(base({ schema: 3 } as Partial<PluginManifest>)).some((i) => i.field === "schema")).toBe(true);
   });
 
-  it("requires semver under schema 2", () => {
-    expect(validateManifest(v2({ version: "1.2" })).some((i) => i.field === "version")).toBe(true);
-    expect(validateManifest(v2({ version: "1.2.3-rc.1" }))).toEqual([]);
+  it("requires semver", () => {
+    expect(validateManifest(base({ version: "1.2" })).some((i) => i.field === "version")).toBe(true);
+    expect(validateManifest(base({ version: "1" })).some((i) => i.field === "version")).toBe(true);
+    expect(validateManifest(base({ version: "1.2.3-rc.1" }))).toEqual([]);
+    expect(validateManifest(base({ version: "1.2.3+build.5" }))).toEqual([]);
   });
 
-  it("requires a form under schema 2 and rejects unknown spellings", () => {
-    const noForm = { ...v2() } as Partial<PluginManifest>;
+  it("requires a form and rejects unknown spellings", () => {
+    const noForm = { ...base() } as Partial<PluginManifest>;
     delete noForm.form;
     expect(validateManifest(noForm as PluginManifest).some((i) => i.field === "form")).toBe(true);
     expect(
-      validateManifest(v2({ form: "web.esmodule" as PluginManifest["form"] })).some(
+      validateManifest(base({ form: "web.esmodule" as PluginManifest["form"] })).some(
         (i) => i.field === "form",
       ),
     ).toBe(true);
   });
 
-  it("relaxes the id rule for schema 2 only", () => {
-    expect(validateManifest(v2({ id: "celestia-kanban" }))).toEqual([]);
-    expect(validateManifest(v2({ schema: 1, id: "hyphen-not-allowed" } as Partial<PluginManifest>)).length).toBeGreaterThan(0);
+  it("accepts hyphenated ids (the unified rule)", () => {
+    expect(validateManifest(base({ id: "celestia-kanban" }))).toEqual([]);
+    expect(validateManifest(base({ id: "acme-plugin" }))).toEqual([]);
+    expect(validateManifest(base({ id: "-leading" })).some((i) => i.field === "id")).toBe(true);
+    expect(validateManifest(base({ id: "UpperCase" })).some((i) => i.field === "id")).toBe(true);
+  });
+
+  it("enforces the class ⇔ system.host binding", () => {
+    expect(validateManifest(base({ form: "system.host" })).some((i) => i.field === "class")).toBe(true);
+    expect(validateManifest(base({ class: "system" })).some((i) => i.field === "class")).toBe(true);
+    expect(validateManifest(base({ form: "system.host", class: "system" }))).toEqual([]);
+    expect(validateManifest(base({ form: "system.host", class: "panel" })).some((i) => i.field === "class")).toBe(true);
   });
 });
 
@@ -78,7 +87,7 @@ describe("validateCapability", () => {
 describe("parseManifest", () => {
   it("parses and validates a store-shaped TOML text", () => {
     const text = [
-      "schema = 2",
+      "schema = 1",
       'id = "celestia-kanban"',
       'version = "1.2.0"',
       'provider = "official"',
@@ -95,13 +104,14 @@ describe("parseManifest", () => {
   });
 
   it("pin every form spelling against the Rust enum", () => {
-    // The five Rust FormKind spellings — any drift here is a test red.
+    // The six Rust FormKind spellings — any drift here is a test red.
     expect(FORM_KINDS).toEqual([
       "wasm.component",
       "process.rpc",
       "script.ts",
       "web.vue-module",
       "web.resource",
+      "system.host",
     ]);
   });
 });

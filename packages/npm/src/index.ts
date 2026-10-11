@@ -2,21 +2,21 @@
  * @celestia-island/akivili — the TypeScript side of the Celestia Plugin
  * Fabric plugin contract.
  *
- * This module mirrors the Rust `akivili_registry` manifest schema v2
- * (akivili #33): the same field gating, the same closed capability
- * vocabulary, the same form spellings. The Rust side stays the
+ * This module mirrors the Rust `akivili_registry` manifest schema
+ * (unified: schema 1, the only generation). The Rust side stays the
  * authority; this port exists so webui-side tooling (manifest pickers,
  * catalog validation, plugin authoring aids) validates exactly what the
  * store will accept — no drift.
  */
 
-/** The plugin form — how a host loads and runs the plugin (schema 2). */
+/** The plugin form — how a host loads and runs the plugin. */
 export type FormKind =
   | "wasm.component"
   | "process.rpc"
   | "script.ts"
   | "web.vue-module"
-  | "web.resource";
+  | "web.resource"
+  | "system.host";
 
 /** The canonical form spellings (open in TS, but pinned by tests). */
 export const FORM_KINDS: readonly FormKind[] = [
@@ -25,6 +25,7 @@ export const FORM_KINDS: readonly FormKind[] = [
   "script.ts",
   "web.vue-module",
   "web.resource",
+  "system.host",
 ];
 
 /** The closed capability vocabulary, v1 (mirrors capabilities.rs). */
@@ -58,20 +59,51 @@ const PARAMETERIZED = new Set([
   "mesh.subscribe",
 ]);
 
-/** A parsed `akivili.plugin.toml` manifest (schema 1 or 2). */
+/** A parsed `akivili.plugin.toml` manifest (schema 1, the only generation). */
 export interface PluginManifest {
   schema: number;
   id: string;
   version: string;
   provider: string;
   description?: string;
-  form?: FormKind;
+  form: FormKind;
+  class?: string;
+  platforms?: string[];
+  titleI18n?: Record<string, string>;
+  descriptionI18n?: Record<string, string>;
   capabilities?: string[];
   /** Wire key: `requires-contract` in TOML. */
   requiresContract?: string[];
   trust?: {
     signature?: string;
     minTrust?: "unsigned" | "signed" | "verified-publisher";
+  };
+  upgrade?: {
+    mode: "rolling" | "hot" | "cold";
+    strategy?: string;
+    rollback?: "auto" | "manual";
+    drainTimeout?: string;
+    minReady?: number;
+    idleRestart?: boolean;
+    forceWindow?: string;
+    generations?: number;
+  };
+  migrations?: Array<{
+    id: string;
+    engine: "sql" | "sea-orm";
+    up: string;
+    down?: string;
+    sha256: string;
+  }>;
+  config?: {
+    file: string;
+    formatVersion: string;
+    onUnknownVersion?: "refuse" | "default";
+  };
+  system?: {
+    bootstrap: string[];
+    supervisor: string;
+    artifact?: string;
   };
 }
 
@@ -81,8 +113,7 @@ export interface ManifestIssue {
   message: string;
 }
 
-const ID_V1 = /^[a-z0-9]+$/;
-const ID_V2 = /^[a-z0-9][a-z0-9-]*$/;
+const ID = /^[a-z0-9][a-z0-9-]*$/;
 const SEMVER =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
 const CONTRACT_REF = /^celestia:[a-z0-9-]+(\.[a-z0-9-]+)*\/[a-z0-9-]+@(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
@@ -135,43 +166,36 @@ export function validateManifest(m: PluginManifest): ManifestIssue[] {
   const issues: ManifestIssue[] = [];
   const push = (field: string, message: string) => issues.push({ field, message });
 
-  if (m.schema !== 1 && m.schema !== 2) {
-    push("schema", `unsupported schema version ${m.schema} (expected 1 or 2)`);
-    return issues; // gating fields depend on the schema; stop here.
+  if (m.schema !== 1) {
+    push("schema", `unsupported schema version ${m.schema} (this host speaks schema 1)`);
+    return issues;
   }
 
-  const idRule = m.schema === 1 ? ID_V1 : ID_V2;
-  if (!idRule.test(m.id)) {
-    push("id", `'${m.id}' fails the schema ${m.schema} id rule`);
+  if (!ID.test(m.id)) {
+    push("id", `'${m.id}' fails the ^[a-z0-9][a-z0-9-]*$ id rule`);
   }
-  if (m.schema === 1) {
-    if (!/^\d+(\.\d+)*$/.test(m.version)) {
-      push("version", `'${m.version}' must be dot-separated numeric segments`);
+  if (!SEMVER.test(m.version)) {
+    push("version", `'${m.version}' must be SemVer`);
+  }
+  if (m.form === undefined) {
+    push("form", "a 'form' field is required");
+  } else if (!FORM_KINDS.includes(m.form)) {
+    push("form", `'${m.form}' is not a known form spelling`);
+  }
+  for (const word of m.capabilities ?? []) {
+    const issue = validateCapability(word);
+    if (issue) issues.push(issue);
+  }
+  for (const ref of m.requiresContract ?? []) {
+    if (!CONTRACT_REF.test(ref)) {
+      push("requires-contract", `'${ref}' must be celestia:<domain>/<world>@<major>.<minor>`);
     }
-    for (const v2Field of ["form", "capabilities", "requiresContract", "trust"] as const) {
-      if (m[v2Field] !== undefined) {
-        const wire = v2Field === "requiresContract" ? "requires-contract" : v2Field;
-        push(v2Field, `field '${wire}' requires schema = 2`);
-      }
-    }
-  } else {
-    if (!SEMVER.test(m.version)) {
-      push("version", `'${m.version}' must be SemVer`);
-    }
-    if (m.form === undefined) {
-      push("form", "schema 2 requires a 'form' field");
-    } else if (!FORM_KINDS.includes(m.form)) {
-      push("form", `'${m.form}' is not a known form spelling`);
-    }
-    for (const word of m.capabilities ?? []) {
-      const issue = validateCapability(word);
-      if (issue) issues.push(issue);
-    }
-    for (const ref of m.requiresContract ?? []) {
-      if (!CONTRACT_REF.test(ref)) {
-        push("requires-contract", `'${ref}' must be celestia:<domain>/<world>@<major>.<minor>`);
-      }
-    }
+  }
+  // class ⇔ system.host is a bidirectional binding.
+  const isSystemClass = m.class === "system";
+  const isSystemHost = m.form === "system.host";
+  if (isSystemClass !== isSystemHost) {
+    push("class", `class '${m.class}' and form '${m.form}' disagree: class = "system" ⇔ form = system.host`);
   }
   return issues;
 }

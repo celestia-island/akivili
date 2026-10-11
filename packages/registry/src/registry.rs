@@ -689,6 +689,7 @@ mod tests {
 id = "alpha"
 version = "1.2.0"
 provider = "test"
+form = "web.resource"
 
 [[resources]]
 kind = "webui.theme"
@@ -718,6 +719,7 @@ HTTP_PROXY = "http://192.0.2.1:7890"
 id = "beta"
 version = "0.1.0"
 provider = "test"
+form = "web.resource"
 
 [[resources]]
 kind = "webui.style"
@@ -732,6 +734,7 @@ body = "serif"
 id = "gamma"
 version = "2.0.0"
 provider = "other"
+form = "web.resource"
 
 [[resources]]
 kind = "webui.style"
@@ -754,6 +757,7 @@ body = "monospace"
 id = "{id}"
 version = "0.1.0"
 provider = "test"
+form = "web.resource"
 
 [[resources]]
 kind = "webui.style"
@@ -1250,6 +1254,7 @@ path = "{path}"
 id = "beta"
 version = "0.1.0"
 provider = "test"
+form = "web.resource"
 
 [[resources]]
 kind = "webui.style"
@@ -1714,7 +1719,7 @@ sha256 = "{}"
         std::fs::create_dir_all(&plugin).unwrap();
         std::fs::write(
             plugin.join("akivili.plugin.toml"),
-            r#"schema = 2
+            r#"schema = 1
 id = "signed-plugin"
 version = "1.0.0"
 provider = "official"

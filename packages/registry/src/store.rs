@@ -35,7 +35,13 @@ pub struct Rejection {
 }
 
 /// The per-source outcome of a store scan, in scan (directory-name) order.
+///
+/// The size difference between variants is accepted: `PluginRecord` grew
+/// with the fabric fields (i18n maps, upgrade/migration/config sections)
+/// and each scan produces one result per plugin directory — the enum is
+/// consumed immediately and never stored in long-lived collections.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ScanResult {
     /// Discovered and fully validated (syntax, payload existence, digests,
     /// unique id).
@@ -461,6 +467,7 @@ mod tests {
 id = "{id}"
 version = "1.0.0"
 provider = "test"
+form = "web.resource"
 
 [[resources]]
 kind = "webui.style"
@@ -733,7 +740,7 @@ value = 1
             .map(|p| format!("signature = \"{p}\""))
             .unwrap_or_default();
         format!(
-            r#"schema = 2
+            r#"schema = 1
 id = "signed-plugin"
 version = "1.0.0"
 provider = "official"
@@ -765,7 +772,7 @@ color = "red"
         root
     }
 
-    /// A two-file schema-2 trust fixture: the payload is BOTH files'
+    /// A two-file trust fixture: the payload is BOTH files'
     /// bytes in manifest order (the concatenation contract), so the
     /// signature covers a non-empty ordered body.
     fn two_file_trust_manifest() -> String {
@@ -773,7 +780,7 @@ color = "red"
         let beta = b"beta payload bytes".to_vec();
         let sha = |b: &[u8]| sha256_hex(b);
         format!(
-            r#"schema = 2
+            r#"schema = 1
 id = "signed-plugin"
 version = "1.0.0"
 provider = "official"
@@ -996,15 +1003,15 @@ sha256 = "{sha_b}"
     }
 
     #[test]
-    fn scan_accepts_schema_2_manifests_and_feeds_their_resources() {
-        // End-to-end: a schema 2 plugin (form, capabilities, contract
-        // ref) scans, validates, and feeds resources exactly like a v1
-        // plugin — those fields are additive at the store level. The
-        // [trust] section is NOT additive since C4-2: a demanding
+    fn scan_accepts_fabric_manifests_and_feeds_their_resources() {
+        // End-to-end: a fabric plugin (form, capabilities, contract
+        // ref) scans, validates, and feeds resources exactly like a
+        // plain plugin — those fields are additive at the store level.
+        // The [trust] section is NOT additive since C4-2: a demanding
         // section is enforced (see the trust-gate tests below), so this
         // fixture stays in the unsigned lane.
-        let v2 = r##"
-schema = 2
+        let fabric = r##"
+schema = 1
 id = "celestia-kanban"
 version = "1.2.0"
 provider = "official"
@@ -1020,12 +1027,12 @@ order = 1
 path = "module.toml"
 sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 "##;
-        let results = scan_with(&[("celestia-kanban", v2, &[("module.toml", "")])]).unwrap();
-        assert_eq!(results.len(), 1, "the schema 2 plugin must be accepted");
+        let results = scan_with(&[("celestia-kanban", fabric, &[("module.toml", "")])]).unwrap();
+        assert_eq!(results.len(), 1, "the fabric plugin must be accepted");
         match &results[0] {
             ScanResult::Accepted(record) => {
                 assert_eq!(record.manifest.id, "celestia-kanban");
-                assert_eq!(record.manifest.schema, 2);
+                assert_eq!(record.manifest.schema, 1);
                 assert_eq!(record.manifest.resources.len(), 1);
             }
             other => panic!("expected an accepted scan, got {other:?}"),
@@ -1033,19 +1040,19 @@ sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     }
 
     #[test]
-    fn scan_rejects_v2_manifests_that_violate_the_schema_gates() {
-        // v1 smuggling a v2 field must land in rejections, not panic.
-        let smuggler = r#"
-id = "smuggler"
+    fn scan_rejects_manifests_that_violate_the_gates() {
+        // A manifest with a non-SemVer version must land in rejections.
+        let bad_version = r#"
+id = "badversion"
 version = "1"
 provider = "acme"
-capabilities = ["kv.read"]
+form = "web.resource"
 "#;
-        let results = scan_with(&[("smuggler", smuggler, &[])]).unwrap();
+        let results = scan_with(&[("badversion", bad_version, &[])]).unwrap();
         match &results[0] {
             ScanResult::Rejected(rejection) => {
                 assert!(
-                    rejection.reason.contains("capabilities"),
+                    rejection.reason.contains("SemVer"),
                     "got: {}",
                     rejection.reason
                 );
@@ -1053,9 +1060,9 @@ capabilities = ["kv.read"]
             other => panic!("expected a rejection, got {other:?}"),
         }
 
-        // schema 2 without a form is a rejection too.
+        // A manifest without a form is a rejection too.
         let formless = r#"
-schema = 2
+schema = 1
 id = "formless"
 version = "1.0.0"
 provider = "acme"

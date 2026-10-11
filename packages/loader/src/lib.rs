@@ -189,16 +189,15 @@ impl ConfigManifest {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let manifest = PluginManifest {
-            schema: 2,
+            schema: akivili_registry::SCHEMA,
             id: self.id,
             version: self.version,
             provider: self.provider,
             description: None,
             form: Some(form),
             capabilities,
-            requires_contract: Vec::new(),
-            trust: None,
             resources: Vec::new(),
+            ..PluginManifest::default()
         };
         manifest
             .validate()
@@ -1017,6 +1016,7 @@ mod tests {
                 order: 0,
                 payload: Payload::Inline(serde_json::json!({})),
             }],
+            ..PluginManifest::default()
         }
     }
 
@@ -1141,6 +1141,7 @@ mod process_slot_tests {
                 requires_contract: Vec::new(),
                 trust: None,
                 resources: Vec::new(),
+                ..akivili_registry::PluginManifest::default()
             },
             slot,
         );
@@ -1332,6 +1333,7 @@ mod topology_source_tests {
             requires_contract: Vec::new(),
             trust: None,
             resources: Vec::new(),
+            ..PluginManifest::default()
         }
     }
 
@@ -1491,6 +1493,7 @@ var handleRequest = function (method, path, headers, body) {
             requires_contract: Vec::new(),
             trust: None,
             resources: Vec::new(),
+            ..PluginManifest::default()
         }
     }
 
@@ -1573,6 +1576,7 @@ mod wasm_tests {
             requires_contract: Vec::new(),
             trust: None,
             resources: Vec::new(),
+            ..PluginManifest::default()
         }
     }
 
