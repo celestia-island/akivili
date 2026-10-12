@@ -220,7 +220,10 @@ fn dispatch_host_fn(
             }
         }
         "kv-get" => {
-            let key = params["key"].as_str().unwrap_or("").to_string();
+            // Audit akivili-R1-2: the kv store is host-global — keys are
+            // transparently namespaced by plugin id so two plugins can
+            // never read or overwrite each other's state.
+            let key = namespaced_kv_key(plugin_name, params["key"].as_str().unwrap_or(""));
             let result = api.host_block_on(api.kv_get(&key));
             match result {
                 Some(v) => PluginResult::with_value(serde_json::Value::String(v)),
@@ -228,7 +231,8 @@ fn dispatch_host_fn(
             }
         }
         "kv-set" => {
-            let key = params["key"].as_str().unwrap_or("").to_string();
+            // Same namespace rule as kv-get (audit akivili-R1-2).
+            let key = namespaced_kv_key(plugin_name, params["key"].as_str().unwrap_or(""));
             let value = params["value"].as_str().unwrap_or("").to_string();
             api.host_block_on(api.kv_set(&key, &value));
             PluginResult::ok()
@@ -266,6 +270,13 @@ fn dispatch_host_fn(
             PluginResult::err(format!("unknown tool: {}", tool_name))
         }
     }
+}
+
+/// Audit akivili-R1-2: namespace a plugin-supplied kv key under its
+/// plugin id — the host kv store is shared, and without the prefix any
+/// plugin could read or overwrite another plugin's state.
+fn namespaced_kv_key(plugin_name: &str, key: &str) -> String {
+    format!("{plugin_name}:{key}")
 }
 
 const PLUGIN_BOILERPLATE: &str = r#"
@@ -834,6 +845,60 @@ var handleRequest = function(method, path, headers, body) {
         Ok(())
     }
 
+    /// Audit akivili-R1-2: two plugins sharing the host kv store must
+    /// not read or overwrite each other's state — keys are transparently
+    /// namespaced by plugin id at the dispatch gate.
+    #[test]
+    fn kv_state_is_namespaced_per_plugin() -> Result<()> {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
+            let host_api = make_host_api_with_grants(&["kv.read", "kv.write"]);
+            let run = |plugin: &str, js: &str| {
+                let plugin = plugin.to_string();
+                let js = js.to_string();
+                let api = host_api.clone();
+                async move {
+                    let api2 = api.clone();
+                    let data = TsPluginData::new(&plugin, &js, TsLanguage::JavaScript);
+                    let res: Result<String, Error> = tokio::task::spawn_blocking(move || {
+                        let mut plugin = TsPlugin::create_and_load(api2, &data)?;
+                        plugin.handle_request("POST", "/test", "{}", "{}")
+                    })
+                    .await?;
+                    res
+                }
+            };
+            // Plugin A writes "from-a" under its namespace.
+            let a = run(
+                "plugin-a",
+                r#"
+var handleRequest = function(m, p, h, b) {
+    dispatch("kv-set", { key: "shared", value: "from-a" });
+    return "a-done";
+};
+"#,
+            )
+            .await?;
+            assert_eq!(a, "a-done");
+
+            // Plugin B must NOT read plugin A's value under the same key.
+            let b = run(
+                "plugin-b",
+                r#"
+var handleRequest = function(m, p, h, b) {
+    return JSON.stringify(dispatch("kv-get", { key: "shared" }));
+};
+"#,
+            )
+            .await?;
+            let parsed: serde_json::Value = serde_json::from_str(&b)?;
+            assert!(
+                parsed["value"].is_null(),
+                "plugin B must not read plugin A's state: {b}"
+            );
+            Ok::<(), Error>(())
+        })
+    }
     #[test]
     fn register_mcp_tool() -> Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
