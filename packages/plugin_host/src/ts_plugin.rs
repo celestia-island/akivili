@@ -146,6 +146,21 @@ fn dispatch_host_fn(
     tool_name: &str,
     params: serde_json::Value,
 ) -> serde_json::Value {
+    // Audit akivili-R1-1: per-plugin grant arbitration at the single
+    // dispatch entry — the manifest's capability list is the only
+    // source of authority for host tools. `log` is outside the gate
+    // (the vocabulary marks it always-granted); `env-get` reads only
+    // the plugin's own sandbox environment (scoped by construction);
+    // `config-get` reads the plugin's own configuration section.
+    if let Some(denial) = api.grants().check_dispatch(tool_name, &params) {
+        warn!(
+            plugin = plugin_name,
+            tool = tool_name,
+            reason = %denial,
+            "host tool dispatch denied by capability grant"
+        );
+        return PluginResult::err(format!("capability denied: {tool_name} ({denial})"));
+    }
     match tool_name {
         "http-request" => {
             let method = params["method"].as_str().unwrap_or("GET").to_string();
@@ -205,7 +220,10 @@ fn dispatch_host_fn(
             }
         }
         "kv-get" => {
-            let key = params["key"].as_str().unwrap_or("").to_string();
+            // Audit akivili-R1-2: the kv store is host-global — keys are
+            // transparently namespaced by plugin id so two plugins can
+            // never read or overwrite each other's state.
+            let key = namespaced_kv_key(plugin_name, params["key"].as_str().unwrap_or(""));
             let result = api.host_block_on(api.kv_get(&key));
             match result {
                 Some(v) => PluginResult::with_value(serde_json::Value::String(v)),
@@ -213,7 +231,8 @@ fn dispatch_host_fn(
             }
         }
         "kv-set" => {
-            let key = params["key"].as_str().unwrap_or("").to_string();
+            // Same namespace rule as kv-get (audit akivili-R1-2).
+            let key = namespaced_kv_key(plugin_name, params["key"].as_str().unwrap_or(""));
             let value = params["value"].as_str().unwrap_or("").to_string();
             api.host_block_on(api.kv_set(&key, &value));
             PluginResult::ok()
@@ -251,6 +270,13 @@ fn dispatch_host_fn(
             PluginResult::err(format!("unknown tool: {}", tool_name))
         }
     }
+}
+
+/// Audit akivili-R1-2: namespace a plugin-supplied kv key under its
+/// plugin id — the host kv store is shared, and without the prefix any
+/// plugin could read or overwrite another plugin's state.
+fn namespaced_kv_key(plugin_name: &str, key: &str) -> String {
+    format!("{plugin_name}:{key}")
 }
 
 const PLUGIN_BOILERPLATE: &str = r#"
@@ -688,14 +714,18 @@ mod tests {
     use anyhow::{Error, Result};
 
     fn make_host_api() -> Arc<HostFunctions> {
-        Arc::new(HostFunctions::new())
+        make_host_api_with_grants(&[])
+    }
+
+    fn make_host_api_with_grants(words: &[&str]) -> Arc<HostFunctions> {
+        Arc::new(HostFunctions::new().with_grants(grants(words)))
     }
 
     #[test]
     fn load_and_handle_request() -> Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
-            let host_api = make_host_api();
+            let host_api = make_host_api_with_grants(&["tool.register"]);
             let data = TsPluginData::new(
                 "test-plugin",
                 r#"
@@ -778,11 +808,19 @@ var handleRequest = function(method, path, headers, body) {
         Ok(())
     }
 
+    /// Test helper: a grant set from raw words (audit akivili-R1-1 —
+    /// the fail-closed default requires tests to declare what they use).
+    fn grants(words: &[&str]) -> crate::grants::GrantSet {
+        crate::grants::GrantSet::from_raw_words(
+            words.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
+        )
+    }
+
     #[test]
     fn dispatch_kv_roundtrip() -> Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
-            let host_api = make_host_api();
+            let host_api = make_host_api_with_grants(&["kv.read", "kv.write"]);
             let data = TsPluginData::new(
                 "kv-plugin",
                 r#"
@@ -807,11 +845,65 @@ var handleRequest = function(method, path, headers, body) {
         Ok(())
     }
 
+    /// Audit akivili-R1-2: two plugins sharing the host kv store must
+    /// not read or overwrite each other's state — keys are transparently
+    /// namespaced by plugin id at the dispatch gate.
+    #[test]
+    fn kv_state_is_namespaced_per_plugin() -> Result<()> {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
+            let host_api = make_host_api_with_grants(&["kv.read", "kv.write"]);
+            let run = |plugin: &str, js: &str| {
+                let plugin = plugin.to_string();
+                let js = js.to_string();
+                let api = host_api.clone();
+                async move {
+                    let api2 = api.clone();
+                    let data = TsPluginData::new(&plugin, &js, TsLanguage::JavaScript);
+                    let res: Result<String, Error> = tokio::task::spawn_blocking(move || {
+                        let mut plugin = TsPlugin::create_and_load(api2, &data)?;
+                        plugin.handle_request("POST", "/test", "{}", "{}")
+                    })
+                    .await?;
+                    res
+                }
+            };
+            // Plugin A writes "from-a" under its namespace.
+            let a = run(
+                "plugin-a",
+                r#"
+var handleRequest = function(m, p, h, b) {
+    dispatch("kv-set", { key: "shared", value: "from-a" });
+    return "a-done";
+};
+"#,
+            )
+            .await?;
+            assert_eq!(a, "a-done");
+
+            // Plugin B must NOT read plugin A's value under the same key.
+            let b = run(
+                "plugin-b",
+                r#"
+var handleRequest = function(m, p, h, b) {
+    return JSON.stringify(dispatch("kv-get", { key: "shared" }));
+};
+"#,
+            )
+            .await?;
+            let parsed: serde_json::Value = serde_json::from_str(&b)?;
+            assert!(
+                parsed["value"].is_null(),
+                "plugin B must not read plugin A's state: {b}"
+            );
+            Ok::<(), Error>(())
+        })
+    }
     #[test]
     fn register_mcp_tool() -> Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
-            let host_api = make_host_api();
+            let host_api = make_host_api_with_grants(&["mcp.register"]);
             let host_api_clone = host_api.clone();
             let data = TsPluginData::new(
                 "tool-plugin",
@@ -914,7 +1006,7 @@ var handleRequest = function(method, path, headers, body) {
     fn handle_request_not_defined() -> Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
-            let host_api = make_host_api();
+            let host_api = make_host_api_with_grants(&["tool.register"]);
             let data = TsPluginData::new("empty", r#"var x = 42;"#, TsLanguage::JavaScript);
             let result = tokio::task::spawn_blocking(move || {
                 let mut plugin = TsPlugin::create_and_load(host_api, &data)?;
@@ -975,7 +1067,7 @@ var handleRequest = function(method, path, headers, body) {
     fn on_message_handler() -> Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
-            let host_api = make_host_api();
+            let host_api = make_host_api_with_grants(&["event.forward"]);
             let data = TsPluginData::new(
                 "bot-plugin",
                 r#"
@@ -1107,7 +1199,11 @@ var onMessage = function(platform, message) {
             let guard =
                 crate::guard::NetworkGuard::new(crate::guard::NetworkGuardPolicy::permissive())
                     .with_resolver(Arc::new(|_: &str| vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]));
-            let host_api = Arc::new(HostFunctions::new().with_network_guard(guard));
+            let host_api = Arc::new(
+                HostFunctions::new()
+                    .with_grants(crate::grants::GrantSet::from_raw_words(["http.egress"]))
+                    .with_network_guard(guard),
+            );
 
             let script = format!(
                 r#"
@@ -1168,7 +1264,11 @@ var handleRequest = function(m, p, h, b) {{
             let guard =
                 crate::guard::NetworkGuard::new(crate::guard::NetworkGuardPolicy::permissive())
                     .with_resolver(Arc::new(|_: &str| vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]));
-            let host_api = Arc::new(HostFunctions::new().with_network_guard(guard));
+            let host_api = Arc::new(
+                HostFunctions::new()
+                    .with_grants(crate::grants::GrantSet::from_raw_words(["http.egress"]))
+                    .with_network_guard(guard),
+            );
 
             let threads: Vec<_> = (0..CLIENTS)
                 .map(|i| {
@@ -1219,8 +1319,11 @@ var handleRequest = function(m, p, h, b) {{
             let bus = Arc::new(RecordingBus {
                 published: Mutex::new(Vec::new()),
             });
-            let host_api =
-                Arc::new(HostFunctions::new().with_pubsub_bus(bus.clone() as Arc<dyn PubSubBus>));
+            let host_api = Arc::new(
+                HostFunctions::new()
+                    .with_grants(crate::grants::GrantSet::from_raw_words(["event.forward"]))
+                    .with_pubsub_bus(bus.clone() as Arc<dyn PubSubBus>),
+            );
 
             let out = eval_on_bare_thread(
                 host_api,
@@ -1270,7 +1373,15 @@ var handleRequest = function(m, p, h, b) {
             let config = [("plugin.mode".to_string(), "fast".to_string())]
                 .into_iter()
                 .collect();
-            let host_api = Arc::new(HostFunctions::new().with_config(config));
+            let host_api = Arc::new(
+                HostFunctions::new()
+                    .with_grants(crate::grants::GrantSet::from_raw_words([
+                        "kv.read",
+                        "kv.write",
+                        "config.read",
+                    ]))
+                    .with_config(config),
+            );
 
             let out = eval_on_bare_thread(
                 host_api,
@@ -1295,7 +1406,15 @@ var handleRequest = function(m, p, h, b) {
             let config = [("shared.key".to_string(), "yes".to_string())]
                 .into_iter()
                 .collect();
-            let host_api = Arc::new(HostFunctions::new().with_config(config));
+            let host_api = Arc::new(
+                HostFunctions::new()
+                    .with_grants(crate::grants::GrantSet::from_raw_words([
+                        "kv.read",
+                        "kv.write",
+                        "config.read",
+                    ]))
+                    .with_config(config),
+            );
 
             let threads: Vec<_> = (0..4)
                 .map(|i| {

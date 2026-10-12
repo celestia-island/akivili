@@ -195,7 +195,15 @@ pub trait HostApiProvider: Send + Sync + 'static {
     fn subscribe_trigger(&self, plugin_name: &str, topic_pattern: &str) -> Result<()>;
 }
 
+use crate::grants::GrantSet;
+
 pub struct HostFunctions {
+    /// Declared capabilities for the plugin whose scripts these host
+    /// functions serve (audit akivili-R1-1). Empty = deny everything
+    /// except the always-granted `log` tool — fail-closed by default;
+    /// hosts feed the manifest's capability list via
+    /// [`HostFunctions::with_grants`].
+    grants: Arc<GrantSet>,
     kv_store: Arc<RwLock<HashMap<String, String>>>,
     config: Arc<RwLock<HashMap<String, String>>>,
     mcp_registry: Arc<PluginMcpRegistry>,
@@ -235,6 +243,7 @@ impl HostFunctions {
         let guard = NetworkGuard::with_default_policy();
         let http_client = build_http_client(&guard);
         Self {
+            grants: Arc::new(GrantSet::empty()),
             kv_store: Arc::new(RwLock::new(HashMap::new())),
             config: Arc::new(RwLock::new(HashMap::new())),
             mcp_registry: Arc::new(PluginMcpRegistry::new()),
@@ -246,6 +255,19 @@ impl HostFunctions {
             sandbox_env: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             host_rt: OnceLock::new(),
         }
+    }
+
+    /// Feed the plugin manifest's declared capabilities (audit
+    /// akivili-R1-1). Without this the grant set stays empty and every
+    /// gated host tool is refused — fail-closed by default.
+    pub fn with_grants(mut self, grants: GrantSet) -> Self {
+        self.grants = Arc::new(grants);
+        self
+    }
+
+    /// The plugin's declared capability set.
+    pub fn grants(&self) -> &GrantSet {
+        &self.grants
     }
 
     pub fn with_config(mut self, config: HashMap<String, String>) -> Self {

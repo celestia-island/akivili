@@ -14,6 +14,7 @@
 #![allow(clippy::type_complexity)]
 
 pub use akivili_guard as guard;
+pub mod grants;
 pub mod plugin_router;
 pub mod plugin_state;
 pub mod sandbox_env;

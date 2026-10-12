@@ -298,7 +298,10 @@ mod tests {
     use anyhow::Context;
 
     fn make_host_api() -> Arc<HostFunctions> {
-        Arc::new(HostFunctions::new())
+        Arc::new(
+            HostFunctions::new()
+                .with_grants(crate::grants::GrantSet::from_raw_words(["mcp.register"])),
+        )
     }
 
     #[test]
