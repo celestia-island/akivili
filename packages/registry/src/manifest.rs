@@ -473,13 +473,13 @@ impl PluginManifest {
                 // same kind declared both as a resource and as an
                 // attachment would double-register on any host that
                 // consumes both feeds.
-                if let Some(kind) = &attachment.kind {
-                    if self.resources.iter().any(|entry| &entry.kind == kind) {
-                        return Err(RegistryError::InvalidManifest(format!(
-                            "kind '{}' is declared both as a resource and as an attachment",
-                            kind
-                        )));
-                    }
+                if let Some(kind) = &attachment.kind
+                    && self.resources.iter().any(|entry| &entry.kind == kind)
+                {
+                    return Err(RegistryError::InvalidManifest(format!(
+                        "kind '{}' is declared both as a resource and as an attachment",
+                        kind
+                    )));
                 }
                 // Capabilities narrow the plugin-level grant, never widen.
                 for word in &attachment.capabilities {
