@@ -5,8 +5,12 @@
  * This module mirrors the Rust `akivili_registry` manifest schema
  * (unified: schema 1, the only generation). The Rust side stays the
  * authority; this port exists so webui-side tooling (manifest pickers,
- * catalog validation, plugin authoring aids) validates exactly what the
- * store will accept — no drift.
+ * catalog validation, plugin authoring aids) validates the same shape
+ * the store will accept. Known mirror gaps (documented, deliberate):
+ * the upgrade form×mode matrix is not validated here (neither at plugin
+ * level nor per attachment), `[[resources]]` is not parsed (the minimal
+ * TOML reader skips tables, so the one-kind-one-channel rule cannot be
+ * mirrored), and issues are collected rather than first-error.
  */
 
 /** The plugin form — how a host loads and runs the plugin. */
