@@ -1376,7 +1376,9 @@ var handleRequest = function(m, p, h, b) {
             let host_api = Arc::new(
                 HostFunctions::new()
                     .with_grants(crate::grants::GrantSet::from_raw_words([
-                        "kv.read", "kv.write",
+                        "kv.read",
+                        "kv.write",
+                        "config.read",
                     ]))
                     .with_config(config),
             );
@@ -1407,7 +1409,9 @@ var handleRequest = function(m, p, h, b) {
             let host_api = Arc::new(
                 HostFunctions::new()
                     .with_grants(crate::grants::GrantSet::from_raw_words([
-                        "kv.read", "kv.write",
+                        "kv.read",
+                        "kv.write",
+                        "config.read",
                     ]))
                     .with_config(config),
             );

@@ -104,11 +104,13 @@ impl GrantSet {
         if tool == "log" {
             return None;
         }
-        // Plugin-scoped by construction: `env-get` reads only the
-        // environment injected for THIS plugin's sandbox; `config-get`
-        // reads only the plugin's own configuration section. Neither
-        // crosses a plugin boundary.
-        if tool == "env-get" || tool == "config-get" {
+        // `env-get` reads only the environment injected for THIS
+        // plugin's sandbox (per-sandbox by construction, not shared) —
+        // no capability gate needed. Every other gated tool goes
+        // through TOOL_GRANTS below (audit R1 must-fix ②: `config-get`
+        // rode this exemption while the config map is instance-level
+        // and shared across plugins).
+        if tool == "env-get" {
             return None;
         }
 
@@ -124,8 +126,13 @@ impl GrantSet {
             return None;
         };
 
-        let param = match word {
-            CAP_HTTP_EGRESS => params["url"].as_str().and_then(host_of),
+        let http_host: Option<String> = if word == CAP_HTTP_EGRESS {
+            params["url"].as_str().and_then(host_of)
+        } else {
+            None
+        };
+        let param: Option<&str> = match word {
+            CAP_HTTP_EGRESS => http_host.as_deref(),
             CAP_MESH_SUBSCRIBE => params["topicPattern"]
                 .as_str()
                 .or_else(|| params["topic_pattern"].as_str()),
@@ -141,12 +148,16 @@ impl GrantSet {
     }
 }
 
-/// Extract the host from a URL string (`scheme://host[:port]/…`),
-/// dropping any userinfo component.
-fn host_of(url: &str) -> Option<&str> {
-    let rest = url.split_once("://")?.1;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    authority.rsplit('@').next().filter(|h| !h.is_empty())
+/// Extract the host from a URL string (audit R1 must-fix ①).
+///
+/// Parsed with the same WHATWG `url` crate the network guard uses — a
+/// hand-rolled split diverges on backslashes (WHATWG treats `\\` as a
+/// path separator for special schemes) and userinfo forms, and a
+/// parser mismatch here becomes a parameterized-egress bypass
+/// (`https://evil.com\\@api.github.com/` resolves to host `evil.com`).
+fn host_of(url: &str) -> Option<String> {
+    let host = url::Url::parse(url).ok()?.host_str()?.to_string();
+    Some(host).filter(|h| !h.is_empty())
 }
 
 #[cfg(test)]
@@ -177,9 +188,10 @@ mod tests {
         // Always-granted / plugin-scoped tools pass the empty set.
         assert!(g.check_dispatch("log", &json!({"message": "hi"})).is_none());
         assert!(g.check_dispatch("env-get", &json!({"key": "k"})).is_none());
+        // config-get is now gated with config.read (audit R1 must-fix ②).
         assert!(
             g.check_dispatch("config-get", &json!({"key": "k"}))
-                .is_none()
+                .is_some()
         );
     }
 
