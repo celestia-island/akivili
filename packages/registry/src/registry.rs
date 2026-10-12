@@ -2170,6 +2170,90 @@ path = "edge/module.wasm"
         );
     }
 
+    /// A bare declaration (attachment with NO payload) feeds with
+    /// resolved: None and loads into a handle without touching the
+    /// filesystem — the declaration itself is the content (R1/R2 LOW).
+    #[test]
+    fn bare_declaration_attachments_feed_and_load_without_payload() {
+        let store = TestStore::new();
+        let manifest = r#"
+id = "bare-attach"
+version = "1.0.0"
+provider = "acme"
+form = "web.resource"
+
+[[attachments]]
+surface = "edge"
+form = "wasm.component"
+kind = "edge.deploy"
+"#;
+        store.add_plugin("bare-attach", manifest, &[]);
+        let registry = store.open();
+
+        let feed = registry
+            .feed_attachments(&AttachmentAcceptance::new("edge-node", vec![Surface::Edge]))
+            .unwrap();
+        let item = feed.iter().next().unwrap();
+        assert!(
+            item.resolved.is_none(),
+            "a bare declaration resolves no payload"
+        );
+
+        let handle = registry
+            .load_attachment(&item.plugin_id, item.attachment_index)
+            .unwrap();
+        handle.unload().unwrap();
+    }
+
+    /// A declared digest that mismatches AT LOAD TIME (the file was
+    /// correct at scan, tampered before load) fails loud with a
+    /// `Failed` audit row — the load-side twin of the feed-time tamper
+    /// test (R1/R2 LOW).
+    #[test]
+    fn load_attachment_rejects_a_payload_tampered_after_the_scan() {
+        let store = TestStore::new();
+        let digest = sha256_hex(b"wasm!");
+        let manifest = format!(
+            r#"
+id = "late-tamper"
+version = "1.0.0"
+provider = "acme"
+form = "wasm.component"
+
+[[attachments]]
+surface = "edge"
+form = "wasm.component"
+kind = "edge.deploy"
+
+[attachments.payload.File]
+path = "edge/module.wasm"
+sha256 = "{digest}"
+"#
+        );
+        store.add_plugin("late-tamper", &manifest, &[("edge/module.wasm", "wasm!")]);
+        let registry = store.open();
+
+        // Feed while the file still matches (the scan already verified
+        // it; the feed re-reads and passes).
+        let feed = registry
+            .feed_attachments(&AttachmentAcceptance::new("edge-node", vec![Surface::Edge]))
+            .unwrap();
+        let item = feed.iter().next().unwrap();
+
+        // Tamper after the feed; the load re-verifies against the
+        // DECLARED digest and fails loud.
+        std::fs::write(
+            store.root.path().join("late-tamper/edge/module.wasm"),
+            "tampered",
+        )
+        .unwrap();
+        let err = registry.load_attachment(&item.plugin_id, item.attachment_index);
+        assert!(
+            matches!(err, Err(RegistryError::PayloadIntegrity { .. })),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn load_attachment_rejects_bad_indexes_and_tampered_payloads_fail_loud() {
         let store = TestStore::new();
