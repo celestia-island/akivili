@@ -146,6 +146,21 @@ fn dispatch_host_fn(
     tool_name: &str,
     params: serde_json::Value,
 ) -> serde_json::Value {
+    // Audit akivili-R1-1: per-plugin grant arbitration at the single
+    // dispatch entry — the manifest's capability list is the only
+    // source of authority for host tools. `log` is outside the gate
+    // (the vocabulary marks it always-granted); `env-get` reads only
+    // the plugin's own sandbox environment (scoped by construction);
+    // `config-get` reads the plugin's own configuration section.
+    if let Some(denial) = api.grants().check_dispatch(tool_name, &params) {
+        warn!(
+            plugin = plugin_name,
+            tool = tool_name,
+            reason = %denial,
+            "host tool dispatch denied by capability grant"
+        );
+        return PluginResult::err(format!("capability denied: {tool_name} ({denial})"));
+    }
     match tool_name {
         "http-request" => {
             let method = params["method"].as_str().unwrap_or("GET").to_string();
@@ -688,14 +703,18 @@ mod tests {
     use anyhow::{Error, Result};
 
     fn make_host_api() -> Arc<HostFunctions> {
-        Arc::new(HostFunctions::new())
+        make_host_api_with_grants(&[])
+    }
+
+    fn make_host_api_with_grants(words: &[&str]) -> Arc<HostFunctions> {
+        Arc::new(HostFunctions::new().with_grants(grants(words)))
     }
 
     #[test]
     fn load_and_handle_request() -> Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
-            let host_api = make_host_api();
+            let host_api = make_host_api_with_grants(&["tool.register"]);
             let data = TsPluginData::new(
                 "test-plugin",
                 r#"
@@ -778,11 +797,19 @@ var handleRequest = function(method, path, headers, body) {
         Ok(())
     }
 
+    /// Test helper: a grant set from raw words (audit akivili-R1-1 —
+    /// the fail-closed default requires tests to declare what they use).
+    fn grants(words: &[&str]) -> crate::grants::GrantSet {
+        crate::grants::GrantSet::from_raw_words(
+            words.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
+        )
+    }
+
     #[test]
     fn dispatch_kv_roundtrip() -> Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
-            let host_api = make_host_api();
+            let host_api = make_host_api_with_grants(&["kv.read", "kv.write"]);
             let data = TsPluginData::new(
                 "kv-plugin",
                 r#"
@@ -811,7 +838,7 @@ var handleRequest = function(method, path, headers, body) {
     fn register_mcp_tool() -> Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
-            let host_api = make_host_api();
+            let host_api = make_host_api_with_grants(&["mcp.register"]);
             let host_api_clone = host_api.clone();
             let data = TsPluginData::new(
                 "tool-plugin",
@@ -914,7 +941,7 @@ var handleRequest = function(method, path, headers, body) {
     fn handle_request_not_defined() -> Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
-            let host_api = make_host_api();
+            let host_api = make_host_api_with_grants(&["tool.register"]);
             let data = TsPluginData::new("empty", r#"var x = 42;"#, TsLanguage::JavaScript);
             let result = tokio::task::spawn_blocking(move || {
                 let mut plugin = TsPlugin::create_and_load(host_api, &data)?;
@@ -975,7 +1002,7 @@ var handleRequest = function(method, path, headers, body) {
     fn on_message_handler() -> Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
-            let host_api = make_host_api();
+            let host_api = make_host_api_with_grants(&["event.forward"]);
             let data = TsPluginData::new(
                 "bot-plugin",
                 r#"
@@ -1107,7 +1134,11 @@ var onMessage = function(platform, message) {
             let guard =
                 crate::guard::NetworkGuard::new(crate::guard::NetworkGuardPolicy::permissive())
                     .with_resolver(Arc::new(|_: &str| vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]));
-            let host_api = Arc::new(HostFunctions::new().with_network_guard(guard));
+            let host_api = Arc::new(
+                HostFunctions::new()
+                    .with_grants(crate::grants::GrantSet::from_raw_words(["http.egress"]))
+                    .with_network_guard(guard),
+            );
 
             let script = format!(
                 r#"
@@ -1168,7 +1199,11 @@ var handleRequest = function(m, p, h, b) {{
             let guard =
                 crate::guard::NetworkGuard::new(crate::guard::NetworkGuardPolicy::permissive())
                     .with_resolver(Arc::new(|_: &str| vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]));
-            let host_api = Arc::new(HostFunctions::new().with_network_guard(guard));
+            let host_api = Arc::new(
+                HostFunctions::new()
+                    .with_grants(crate::grants::GrantSet::from_raw_words(["http.egress"]))
+                    .with_network_guard(guard),
+            );
 
             let threads: Vec<_> = (0..CLIENTS)
                 .map(|i| {
@@ -1219,8 +1254,11 @@ var handleRequest = function(m, p, h, b) {{
             let bus = Arc::new(RecordingBus {
                 published: Mutex::new(Vec::new()),
             });
-            let host_api =
-                Arc::new(HostFunctions::new().with_pubsub_bus(bus.clone() as Arc<dyn PubSubBus>));
+            let host_api = Arc::new(
+                HostFunctions::new()
+                    .with_grants(crate::grants::GrantSet::from_raw_words(["event.forward"]))
+                    .with_pubsub_bus(bus.clone() as Arc<dyn PubSubBus>),
+            );
 
             let out = eval_on_bare_thread(
                 host_api,
@@ -1270,7 +1308,13 @@ var handleRequest = function(m, p, h, b) {
             let config = [("plugin.mode".to_string(), "fast".to_string())]
                 .into_iter()
                 .collect();
-            let host_api = Arc::new(HostFunctions::new().with_config(config));
+            let host_api = Arc::new(
+                HostFunctions::new()
+                    .with_grants(crate::grants::GrantSet::from_raw_words([
+                        "kv.read", "kv.write",
+                    ]))
+                    .with_config(config),
+            );
 
             let out = eval_on_bare_thread(
                 host_api,
@@ -1295,7 +1339,13 @@ var handleRequest = function(m, p, h, b) {
             let config = [("shared.key".to_string(), "yes".to_string())]
                 .into_iter()
                 .collect();
-            let host_api = Arc::new(HostFunctions::new().with_config(config));
+            let host_api = Arc::new(
+                HostFunctions::new()
+                    .with_grants(crate::grants::GrantSet::from_raw_words([
+                        "kv.read", "kv.write",
+                    ]))
+                    .with_config(config),
+            );
 
             let threads: Vec<_> = (0..4)
                 .map(|i| {
