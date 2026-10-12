@@ -39,11 +39,18 @@ resources at startup which they load one by one (`ResourceFeed` → `ResourceHan
 
 - **Manifests** — a plugin store is a plain root directory with one subdirectory
   per plugin, each described by an `akivili.plugin.toml` manifest: `id`
-  (`^[a-z0-9]+$`, unique), `version`, `provider`, and a list of resource entries
+  (`^[a-z0-9][a-z0-9-]*$`, unique), `version`, `provider`, and a list of resource entries
   (`kind`, optional `name`, `order`, and an `Inline` JSON or `File` payload with
   optional `sha256`). The enable/disable switch lives in a `registry-state.json`
   at the store root — never inside a plugin directory — so toggling a plugin never
   mutates plugin-owned files, and deleting the subdirectory fully uninstalls it.
+- **Multi-surface attachments (`[[attachments]]`)** — a plugin may serve
+  additional surfaces beyond its primary `form`: one entry per surface
+  (`engine` / `webui` / `edge`), each carrying its own `form`, resource
+  `kind` (e.g. `engine.agent`, `edge.deploy`), capabilities (a SUBSET of
+  the plugin-level grant — attachments narrow, never widen), contracts,
+  and an optional upgrade declaration validated against the attachment's
+  own form. `system.host` manifests and forms are refused in attachments.
 - **Feed semantics** — `Registry::feed(&HostAcceptance)` filters enabled plugins'
   entries down to the kinds the host accepts, ordered by `order` (ties broken by
   plugin id, then manifest position). A feed is a snapshot: file payloads are read

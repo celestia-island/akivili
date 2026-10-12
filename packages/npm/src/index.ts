@@ -59,6 +59,43 @@ const PARAMETERIZED = new Set([
   "mesh.subscribe",
 ]);
 
+/** The `[upgrade]` section (extracted so attachments can reuse it). */
+export interface UpgradeSection {
+  mode: "rolling" | "hot" | "cold";
+  strategy?: string;
+  rollback?: "auto" | "manual";
+  drainTimeout?: string;
+  minReady?: number;
+  idleRestart?: boolean;
+  forceWindow?: string;
+  generations?: number;
+}
+
+/** The surface an attachment serves (mirrors manifest.rs `Surface`). */
+export type Surface = "engine" | "webui" | "edge";
+
+/** The canonical surface spellings (closed vocabulary). */
+export const SURFACES: readonly Surface[] = ["engine", "webui", "edge"];
+
+/** One `[[attachments]]` entry: an additional surface this plugin
+ * serves beyond its primary `form`. Capabilities narrow the
+ * plugin-level grant (subset, never widen); `upgrade` validates
+ * against the attachment's own form. */
+export interface AttachmentEntry {
+  surface: Surface;
+  form: FormKind;
+  kind?: string;
+  name?: string;
+  capabilities?: string[];
+  /** Wire key: `requires-contract` in TOML. */
+  requiresContract?: string[];
+  upgrade?: UpgradeSection;
+  payload?: {
+    Inline?: unknown;
+    File?: { path: string; sha256?: string };
+  };
+}
+
 /** A parsed `akivili.plugin.toml` manifest (schema 1, the only generation). */
 export interface PluginManifest {
   schema: number;
@@ -78,16 +115,7 @@ export interface PluginManifest {
     signature?: string;
     minTrust?: "unsigned" | "signed" | "verified-publisher";
   };
-  upgrade?: {
-    mode: "rolling" | "hot" | "cold";
-    strategy?: string;
-    rollback?: "auto" | "manual";
-    drainTimeout?: string;
-    minReady?: number;
-    idleRestart?: boolean;
-    forceWindow?: string;
-    generations?: number;
-  };
+  upgrade?: UpgradeSection;
   migrations?: Array<{
     id: string;
     engine: "sql" | "sea-orm";
@@ -105,6 +133,10 @@ export interface PluginManifest {
     supervisor: string;
     artifact?: string;
   };
+  /** Additional surfaces beyond the primary form (at most one per
+   * surface). Not parsed by the minimal TOML reader — construct or
+   * validate structured objects. */
+  attachments?: AttachmentEntry[];
 }
 
 /** A validation failure with a human-actionable message. */
@@ -197,6 +229,33 @@ export function validateManifest(m: PluginManifest): ManifestIssue[] {
   if (isSystemClass !== isSystemHost) {
     push("class", `class '${m.class}' and form '${m.form}' disagree: class = "system" ⇔ form = system.host`);
   }
+  // Attachments: the primary form stays the upgrade anchor; each entry
+  // is a second surface with its own scoped declaration.
+  const attachments = m.attachments ?? [];
+  if (isSystemHost && attachments.length > 0) {
+    push("attachments", "system.host manifests may not declare [[attachments]]");
+  }
+  const seenSurfaces = new Set<string>();
+  attachments.forEach((a, i) => {
+    const field = `attachments[${i}]`;
+    if (!SURFACES.includes(a.surface)) {
+      push(`${field}.surface`, `'${a.surface}' is not a known surface spelling`);
+    }
+    if (a.form === "system.host") {
+      push(`${field}.form`, "attachments may not use form system.host");
+    }
+    if (seenSurfaces.has(a.surface)) {
+      push(`${field}.surface`, `duplicate surface '${a.surface}' (at most one per surface)`);
+    }
+    seenSurfaces.add(a.surface);
+    for (const word of a.capabilities ?? []) {
+      const issue = validateCapability(word);
+      if (issue) issues.push({ field: `${field}.capabilities`, message: issue.message });
+      else if (!(m.capabilities ?? []).includes(word)) {
+        push(`${field}.capabilities`, `'${word}' is not granted at plugin level (attachments narrow, never widen)`);
+      }
+    }
+  });
   return issues;
 }
 
@@ -247,12 +306,16 @@ export function parseManifest(text: string): { manifest: PluginManifest } | { is
   if (typeof root.version !== "string") issues.push({ field: "version", message: "missing version" });
   if (typeof root.provider !== "string") issues.push({ field: "provider", message: "missing provider" });
   if (issues.length > 0) return { issues };
-  const manifest: PluginManifest = {
+  // Built as a Partial and cast at the boundary: a manifest text without
+  // a `form` line must still parse — validateManifest is the gate that
+  // reports the missing form (master carried a pre-existing tsc red here;
+  // fixed in the same PR as the attachments mirror).
+  const manifest = {
     schema: root.schema,
     id: root.id as string,
     version: root.version as string,
     provider: root.provider as string,
-  };
+  } as Partial<PluginManifest>;
   if (typeof root.description === "string") manifest.description = root.description;
   if (typeof root.form === "string") manifest.form = root.form as FormKind;
   if (Array.isArray(root.capabilities)) manifest.capabilities = root.capabilities as string[];
@@ -269,7 +332,7 @@ export function parseManifest(text: string): { manifest: PluginManifest } | { is
         : NonNullable<PluginManifest["trust"]>["minTrust"];
     }
   }
-  return { manifest };
+  return { manifest: manifest as PluginManifest };
 }
 function stripQuotes(s: string): string {
   if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) return s.slice(1, -1);

@@ -100,6 +100,12 @@ pub struct PluginManifest {
     /// The resources this plugin contributes.
     #[serde(default)]
     pub resources: Vec<ResourceEntry>,
+    /// Additional surfaces this plugin attaches to beyond its primary
+    /// `form` (at most one entry per surface; see [`AttachmentEntry`]).
+    /// The primary `form` stays the upgrade-semantics anchor; attachments
+    /// carry their own scoped declaration instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentEntry>,
 }
 
 /// One resource contributed by a plugin.
@@ -145,6 +151,84 @@ pub enum Payload {
         /// content at scan and feed time.
         sha256: Option<String>,
     },
+}
+
+/// The surface an `[[attachments]]` entry serves — the additional host
+/// beyond the plugin's primary `form` (2026-10-12 ruling: one plugin may
+/// attach to several surfaces simultaneously — an engine agent plus a
+/// webui module plus an edge deployment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Surface {
+    /// The compute-engine host (scepter): backend agents and tools.
+    Engine,
+    /// The web-UI host (chest-webui): embedded pages and resources.
+    Webui,
+    /// Edge nodes, deployed over the evernight topology lane.
+    Edge,
+}
+
+impl Surface {
+    /// The wire spelling of the surface.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Engine => "engine",
+            Self::Webui => "webui",
+            Self::Edge => "edge",
+        }
+    }
+}
+
+impl std::fmt::Display for Surface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One `[[attachments]]` entry: an additional surface this plugin serves
+/// beyond its primary `form`.
+///
+/// The entry is attachment-scoped: `form` says how the TARGET surface's
+/// host loads and runs it, `kind` names the resource kind it registers
+/// as there (open vocabulary — `engine.agent`, `webui.page-type`,
+/// `edge.deploy`, …), and `capabilities` must be a SUBSET of the
+/// plugin-level grant — an attachment narrows, never widens.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AttachmentEntry {
+    /// Which surface this attachment serves (at most one per surface).
+    pub surface: Surface,
+    /// How the target surface's host loads and runs this attachment.
+    /// `system.host` is refused — the host binary itself never attaches.
+    pub form: FormKind,
+    /// The resource kind this attachment registers as on its surface
+    /// (open vocabulary, syntax-validated by [`ResourceKind`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ResourceKind>,
+    /// Optional name within the kind (mirrors [`ResourceEntry::name`],
+    /// e.g. the page-type class or the agent folder).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Attachment-scoped capabilities — every word must also appear in
+    /// the plugin-level `capabilities` (narrowing only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<Capability>,
+    /// Attachment-scoped contract requirements.
+    #[serde(
+        rename = "requires-contract",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub requires_contract: Vec<ContractRef>,
+    /// Attachment-scoped upgrade declaration, validated against THIS
+    /// attachment's own `form` (same form×mode matrix as the plugin
+    /// level). Absent = the plugin-level `[upgrade]` governs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<UpgradeSection>,
+    /// Attachment payload — an inline descriptor or a file inside the
+    /// plugin directory. The consuming surface defines the inner shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Payload>,
 }
 
 /// The `[trust]` section of a manifest: what the plugin expects
@@ -308,6 +392,7 @@ impl Default for PluginManifest {
             config: None,
             system: None,
             resources: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 }
@@ -359,6 +444,44 @@ impl PluginManifest {
         }
         if let Some(upgrade) = &self.upgrade {
             upgrade.validate(&form)?;
+        }
+        // Attachments: the primary form stays the upgrade anchor; each
+        // entry is a second surface with its own scoped declaration.
+        if !self.attachments.is_empty() {
+            // The host binary itself never attaches elsewhere.
+            if form == FormKind::SystemHost {
+                return Err(RegistryError::InvalidManifest(
+                    "system.host manifests may not declare [[attachments]]".to_string(),
+                ));
+            }
+            let mut seen: Vec<Surface> = Vec::new();
+            for attachment in &self.attachments {
+                if attachment.form == FormKind::SystemHost {
+                    return Err(RegistryError::InvalidManifest(format!(
+                        "attachment to surface '{}' may not use form system.host",
+                        attachment.surface
+                    )));
+                }
+                if seen.contains(&attachment.surface) {
+                    return Err(RegistryError::InvalidManifest(format!(
+                        "duplicate [[attachments]] surface '{}' (at most one per surface)",
+                        attachment.surface
+                    )));
+                }
+                seen.push(attachment.surface);
+                // Capabilities narrow the plugin-level grant, never widen.
+                for word in &attachment.capabilities {
+                    if !self.capabilities.contains(word) {
+                        return Err(RegistryError::InvalidManifest(format!(
+                            "attachment to surface '{}' declares capability '{}' not granted at plugin level",
+                            attachment.surface, word
+                        )));
+                    }
+                }
+                if let Some(upgrade) = &attachment.upgrade {
+                    upgrade.validate(&attachment.form)?;
+                }
+            }
         }
         for migration in &self.migrations {
             migration.validate()?;
@@ -724,6 +847,7 @@ mod tests {
             config: None,
             system: None,
             resources: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 
@@ -1010,6 +1134,7 @@ requires-contract = ["celestia:panel/host@0.1", "celestia:kv/host@0.2"]
             description: None,
             form: Some(FormKind::WebResource),
             resources: Vec::new(),
+            attachments: Vec::new(),
             ..PluginManifest::default()
         };
         assert_eq!(manifest.schema, SCHEMA);
@@ -1296,5 +1421,200 @@ idle-restart = true
         assert_eq!(system.bootstrap, vec!["db-migrate", "seed", "setup"]);
         assert_eq!(system.supervisor, "systemd");
         manifest.validate().expect("system host manifest validates");
+    }
+
+    // ── attachments (multi-surface declaration) ───────────────────────
+
+    /// A helper attachment: engine surface, process.rpc form, agent kind.
+    fn engine_attachment() -> AttachmentEntry {
+        AttachmentEntry {
+            surface: Surface::Engine,
+            form: FormKind::ProcessRpc,
+            kind: Some(ResourceKind::new("engine.agent").unwrap()),
+            name: Some("industrial_iot".into()),
+            capabilities: Vec::new(),
+            requires_contract: Vec::new(),
+            upgrade: None,
+            payload: Some(Payload::Inline(serde_json::json!({
+                "folder": "industrial_iot"
+            }))),
+        }
+    }
+
+    #[test]
+    fn attachments_parse_validate_and_round_trip() {
+        let raw = r#"
+schema = 1
+id = "acme-iot"
+version = "1.2.0"
+provider = "acme"
+description = "IoT agent with a panel page"
+form = "web.vue-module"
+capabilities = ["mesh.call:evernight", "state.read"]
+
+[[resources]]
+kind = "webui.page-type"
+name = "panel"
+[resources.payload.Inline]
+title = "IoT panel"
+
+[[attachments]]
+surface = "engine"
+form = "process.rpc"
+kind = "engine.agent"
+name = "industrial_iot"
+capabilities = ["mesh.call:evernight"]
+
+[attachments.payload.Inline]
+folder = "industrial_iot"
+
+[attachments.upgrade]
+mode = "cold"
+strategy = "cold-restart"
+idle-restart = true
+
+[[attachments]]
+surface = "edge"
+form = "wasm.component"
+kind = "edge.deploy"
+"#;
+        let manifest: PluginManifest = toml::from_str(raw).expect("attachments must parse");
+        assert_eq!(manifest.attachments.len(), 2, "{manifest:?}");
+        assert_eq!(manifest.attachments[0].surface, Surface::Engine);
+        assert_eq!(manifest.attachments[1].surface, Surface::Edge);
+        manifest
+            .validate()
+            .expect("multi-surface manifest validates");
+
+        // Round trip: the serialized form parses back to the same value.
+        let text = toml::to_string_pretty(&manifest).expect("serialize");
+        let back: PluginManifest = toml::from_str(&text).expect("re-parse");
+        assert_eq!(back, manifest, "round trip must be lossless");
+    }
+
+    #[test]
+    fn attachments_reject_duplicate_surface() {
+        let mut manifest = baseline();
+        manifest.attachments = vec![engine_attachment(), engine_attachment()];
+        let err = manifest.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate [[attachments]] surface 'engine'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn attachments_reject_system_host_form() {
+        let mut manifest = baseline();
+        let mut attachment = engine_attachment();
+        attachment.form = FormKind::SystemHost;
+        manifest.attachments = vec![attachment];
+        let err = manifest.validate().unwrap_err().to_string();
+        assert!(err.contains("may not use form system.host"), "{err}");
+    }
+
+    #[test]
+    fn system_class_manifest_rejects_attachments() {
+        let mut manifest = baseline();
+        manifest.form = Some(FormKind::SystemHost);
+        manifest.class = Some("system".into());
+        manifest.attachments = vec![engine_attachment()];
+        let err = manifest.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("system.host manifests may not declare [[attachments]]"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn attachments_capabilities_must_narrow_plugin_grant() {
+        let mut manifest = baseline();
+        manifest.capabilities = vec![Capability::new("kv.read").unwrap()];
+        let mut attachment = engine_attachment();
+        attachment.capabilities = vec![Capability::new("mesh.call:evernight").unwrap()];
+        manifest.attachments = vec![attachment];
+        let err = manifest.validate().unwrap_err().to_string();
+        assert!(err.contains("not granted at plugin level"), "{err}");
+
+        // Narrowing to a granted word passes.
+        manifest.attachments[0].capabilities = vec![Capability::new("kv.read").unwrap()];
+        manifest.validate().expect("subset capability validates");
+    }
+
+    #[test]
+    fn attachment_upgrade_validates_against_its_own_form() {
+        let mut manifest = baseline();
+        // Plugin level: hot on the webui primary form.
+        manifest.upgrade = Some(UpgradeSection {
+            mode: UpgradeMode::Hot,
+            strategy: UpgradeStrategy::BlueGreen,
+            rollback: RollbackPolicy::Auto,
+            drain_timeout: None,
+            min_ready: None,
+            idle_restart: None,
+            force_window: None,
+            generations: None,
+        });
+        // Attachment level: cold without a restart path must fail against
+        // the attachment's own form, independent of the plugin's hot.
+        let mut attachment = engine_attachment();
+        attachment.upgrade = Some(UpgradeSection {
+            mode: UpgradeMode::Cold,
+            strategy: UpgradeStrategy::ColdRestart,
+            rollback: RollbackPolicy::Auto,
+            drain_timeout: None,
+            min_ready: None,
+            idle_restart: None,
+            force_window: None,
+            generations: None,
+        });
+        manifest.attachments = vec![attachment];
+        let err = manifest.validate().unwrap_err().to_string();
+        assert!(err.contains("cold upgrades must declare"), "{err}");
+
+        manifest.attachments[0]
+            .upgrade
+            .as_mut()
+            .unwrap()
+            .idle_restart = Some(true);
+        manifest
+            .validate()
+            .expect("attachment cold with idle-restart validates");
+    }
+
+    #[test]
+    fn attachments_reject_unknown_surface_spellings_and_keys() {
+        let bad_surface = r#"
+schema = 1
+id = "acme"
+version = "1.0.0"
+provider = "acme"
+form = "web.resource"
+
+[[attachments]]
+surface = "server"
+form = "process.rpc"
+"#;
+        assert!(
+            toml::from_str::<PluginManifest>(bad_surface).is_err(),
+            "unknown surface spelling must fail to parse"
+        );
+
+        let typo_key = r#"
+schema = 1
+id = "acme"
+version = "1.0.0"
+provider = "acme"
+form = "web.resource"
+
+[[attachments]]
+surface = "engine"
+form = "process.rpc"
+capabilitis = []
+"#;
+        assert!(
+            toml::from_str::<PluginManifest>(typo_key).is_err(),
+            "attachment entries deny unknown fields"
+        );
     }
 }

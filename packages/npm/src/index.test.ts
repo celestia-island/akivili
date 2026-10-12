@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   FORM_KINDS,
+  SURFACES,
   parseManifest,
   validateCapability,
   validateManifest,
@@ -113,5 +114,78 @@ describe("parseManifest", () => {
       "web.resource",
       "system.host",
     ]);
+  });
+});
+
+describe("attachments", () => {
+  it("accepts a multi-surface manifest and pins the surface vocabulary", () => {
+    expect(SURFACES).toEqual(["engine", "webui", "edge"]);
+    const m = base({
+      capabilities: ["kv.read", "mesh.call:evernight"],
+      attachments: [
+        {
+          surface: "engine",
+          form: "process.rpc",
+          kind: "engine.agent",
+          name: "industrial_iot",
+          capabilities: ["mesh.call:evernight"],
+          payload: { Inline: { folder: "industrial_iot" } },
+        },
+        { surface: "edge", form: "wasm.component", kind: "edge.deploy" },
+      ],
+    });
+    expect(validateManifest(m)).toEqual([]);
+  });
+
+  it("rejects duplicate surfaces and the system.host attachment form", () => {
+    const dup = base({
+      attachments: [
+        { surface: "engine", form: "process.rpc" },
+        { surface: "engine", form: "script.ts" },
+      ],
+    });
+    expect(
+      validateManifest(dup).some((i) => i.field === "attachments[1].surface"),
+    ).toBe(true);
+
+    const hostForm = base({
+      attachments: [{ surface: "engine", form: "system.host" }],
+    });
+    expect(
+      validateManifest(hostForm).some((i) => i.field === "attachments[0].form"),
+    ).toBe(true);
+  });
+
+  it("rejects attachments on system.host manifests", () => {
+    const m = base({
+      form: "system.host",
+      class: "system",
+      attachments: [{ surface: "engine", form: "process.rpc" }],
+    });
+    expect(validateManifest(m).some((i) => i.field === "attachments")).toBe(true);
+  });
+
+  it("requires attachment capabilities to narrow the plugin-level grant", () => {
+    const widening = base({
+      capabilities: ["kv.read"],
+      attachments: [
+        { surface: "engine", form: "process.rpc", capabilities: ["mesh.call:evernight"] },
+      ],
+    });
+    expect(
+      validateManifest(widening).some(
+        (i) =>
+          i.field === "attachments[0].capabilities" &&
+          i.message.includes("not granted at plugin level"),
+      ),
+    ).toBe(true);
+
+    const narrowing = base({
+      capabilities: ["kv.read"],
+      attachments: [
+        { surface: "engine", form: "process.rpc", capabilities: ["kv.read"] },
+      ],
+    });
+    expect(validateManifest(narrowing)).toEqual([]);
   });
 });

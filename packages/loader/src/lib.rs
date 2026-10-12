@@ -197,6 +197,7 @@ impl ConfigManifest {
             form: Some(form),
             capabilities,
             resources: Vec::new(),
+            attachments: Vec::new(),
             ..PluginManifest::default()
         };
         manifest
@@ -1141,6 +1142,7 @@ mod process_slot_tests {
                 requires_contract: Vec::new(),
                 trust: None,
                 resources: Vec::new(),
+                attachments: Vec::new(),
                 ..akivili_registry::PluginManifest::default()
             },
             slot,
@@ -1333,6 +1335,7 @@ mod topology_source_tests {
             requires_contract: Vec::new(),
             trust: None,
             resources: Vec::new(),
+            attachments: Vec::new(),
             ..PluginManifest::default()
         }
     }
@@ -1493,6 +1496,7 @@ var handleRequest = function (method, path, headers, body) {
             requires_contract: Vec::new(),
             trust: None,
             resources: Vec::new(),
+            attachments: Vec::new(),
             ..PluginManifest::default()
         }
     }
@@ -1576,6 +1580,7 @@ mod wasm_tests {
             requires_contract: Vec::new(),
             trust: None,
             resources: Vec::new(),
+            attachments: Vec::new(),
             ..PluginManifest::default()
         }
     }
