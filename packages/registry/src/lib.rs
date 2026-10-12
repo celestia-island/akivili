@@ -119,9 +119,9 @@ pub use forms::FormKind;
 pub use handle::{LocalRegistration, ResourceHandle};
 pub use kinds::ResourceKind;
 pub use manifest::{
-    ConfigSection, ContractRef, MigrationEngine, MigrationEntry, MinTrust, Payload, PluginManifest,
-    ResourceEntry, RollbackPolicy, SCHEMA, SystemSection, TrustSection, UnknownVersionPolicy,
-    UpgradeMode, UpgradeSection, UpgradeStrategy,
+    AttachmentEntry, ConfigSection, ContractRef, MigrationEngine, MigrationEntry, MinTrust,
+    Payload, PluginManifest, ResourceEntry, RollbackPolicy, SCHEMA, Surface, SystemSection,
+    TrustSection, UnknownVersionPolicy, UpgradeMode, UpgradeSection, UpgradeStrategy,
 };
 pub use registry::{DEFAULT_MAX_PAYLOAD_BYTES, Registry, RegistryOptions};
 pub use store::{PluginRecord, Rejection, ScanResult};

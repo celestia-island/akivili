@@ -2,11 +2,12 @@
 //!
 //! The `[trust]` section's `signature` names a signature file inside
 //! the plugin directory; the signature is Ed25519 over the plugin's
-//! PAYLOAD — every resource file's bytes in manifest order (the
-//! content-addressed digest chain the store already computes per
-//! file). A plugin demanding trust (`min-trust` above unsigned, or an
-//! explicit signature path) fails closed: missing file, malformed
-//! bytes, or a key mismatch all refuse the load.
+//! PAYLOAD — every resource file's bytes in manifest order, then every
+//! attachment file's bytes in manifest order (the content-addressed
+//! digest chain the store already computes per file). A plugin
+//! demanding trust (`min-trust` above unsigned, or an explicit
+//! signature path) fails closed: missing file, malformed bytes, or a
+//! key mismatch all refuse the load.
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
@@ -25,9 +26,9 @@ pub struct PublisherKey {
 /// Verify a plugin's declared signature over its payload bytes.
 ///
 /// `signature_file` is the signature file's content; `payload` is the
-/// concatenation the distribution format defines (v0: the resource
-/// files' bytes in manifest order — the store hands it in already
-/// assembled).
+/// concatenation the distribution format defines (v0: resource files'
+/// bytes in manifest order, then attachment files' bytes in manifest
+/// order — the store hands it in already assembled).
 pub fn verify_plugin_signature(
     trust: &TrustSection,
     signature_file: Option<&[u8]>,
