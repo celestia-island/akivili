@@ -110,11 +110,11 @@ pub mod registry;
 pub mod store;
 pub mod trust;
 
-pub use acceptance::{HostAcceptance, KindFilter};
+pub use acceptance::{AttachmentAcceptance, HostAcceptance, KindFilter};
 pub use audit::{AuditEvent, AuditLog};
 pub use capabilities::{Capability, VOCABULARY};
 pub use error::{RegistryError, RegistryResult};
-pub use feed::{FeedItem, ResolvedPayload, ResourceFeed};
+pub use feed::{AttachmentFeed, AttachmentFeedItem, FeedItem, ResolvedPayload, ResourceFeed};
 pub use forms::FormKind;
 pub use handle::{LocalRegistration, ResourceHandle};
 pub use kinds::ResourceKind;

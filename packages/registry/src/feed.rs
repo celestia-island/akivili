@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::ResourceEntry;
+use crate::manifest::{AttachmentEntry, ResourceEntry};
 
 /// The result of feeding a [`HostAcceptance`](crate::HostAcceptance) to the
 /// registry: the ordered series of resources the declaring host should
@@ -82,6 +82,74 @@ impl<'a> IntoIterator for &'a ResourceFeed {
 impl IntoIterator for ResourceFeed {
     type Item = FeedItem;
     type IntoIter = std::vec::IntoIter<FeedItem>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter()
+    }
+}
+
+/// The result of feeding an
+/// [`AttachmentAcceptance`](crate::AttachmentAcceptance) to the registry:
+/// the ordered series of manifest attachments the declaring host should
+/// serve.
+///
+/// Attachments carry no `order` field; feed order is (plugin id, manifest
+/// position) — stable across re-feeds of an unchanged store.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttachmentFeed {
+    pub items: Vec<AttachmentFeedItem>,
+}
+
+/// One fed attachment: which plugin it came from, the manifest entry, the
+/// entry's index inside that manifest's `attachments` vector (for
+/// [`Registry::load_attachment`](crate::Registry::load_attachment)), and
+/// the resolved content (when the attachment declares a payload).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttachmentFeedItem {
+    pub plugin_id: String,
+    pub plugin_version: String,
+    /// Index of this entry in the plugin manifest's `attachments` vector.
+    pub attachment_index: usize,
+    pub attachment: AttachmentEntry,
+    /// Feed-time-resolved payload; `None` when the attachment is a bare
+    /// declaration (no `payload` in the manifest).
+    pub resolved: Option<ResolvedPayload>,
+}
+
+impl AttachmentFeed {
+    /// Iterates the fed items in feed order.
+    pub fn iter(&self) -> std::slice::Iter<'_, AttachmentFeedItem> {
+        self.items.iter()
+    }
+
+    /// Number of fed items.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether nothing was fed.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Consumes the feed into its items.
+    pub fn into_items(self) -> Vec<AttachmentFeedItem> {
+        self.items
+    }
+}
+
+impl<'a> IntoIterator for &'a AttachmentFeed {
+    type Item = &'a AttachmentFeedItem;
+    type IntoIter = std::slice::Iter<'a, AttachmentFeedItem>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.iter()
+    }
+}
+
+impl IntoIterator for AttachmentFeed {
+    type Item = AttachmentFeedItem;
+    type IntoIter = std::vec::IntoIter<AttachmentFeedItem>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.items.into_iter()

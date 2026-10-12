@@ -1,12 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::acceptance::HostAcceptance;
+use crate::acceptance::{AttachmentAcceptance, HostAcceptance};
 use crate::audit::{AuditEvent, AuditLog, unix_secs};
 use crate::error::{RegistryError, RegistryResult};
-use crate::feed::{FeedItem, ResolvedPayload, ResourceFeed};
+use crate::feed::{AttachmentFeed, AttachmentFeedItem, FeedItem, ResolvedPayload, ResourceFeed};
 use crate::handle::{HandleInfo, LocalRegistration, RegistryInner, ResourceHandle};
-use crate::manifest::{Payload, ResourceEntry};
+use crate::kinds::ResourceKind;
+use crate::manifest::{AttachmentEntry, Payload, ResourceEntry};
 use crate::store::{
     self, EnabledState, PluginRecord, ReadPayloadError, Rejection, STATE_FILE, ScanResult,
     sha256_hex,
@@ -428,6 +429,187 @@ impl Registry {
         Ok(ResourceFeed { items })
     }
 
+    /// Feeds manifest attachments to a declaring host (the
+    /// `[[attachments]]` analogue of [`Registry::feed`]).
+    ///
+    /// Enabled plugins' attachments are filtered against the acceptance's
+    /// surfaces (and optional kind narrowing), payloads resolved at feed
+    /// time (same confinement / size-cap / digest discipline as resource
+    /// feeding), ordered by (plugin id, manifest position), and one `fed`
+    /// audit event is appended per item. Attachments without a payload
+    /// feed with `resolved: None` — the declaration itself is the content.
+    pub fn feed_attachments(
+        &self,
+        acceptance: &AttachmentAcceptance,
+    ) -> RegistryResult<AttachmentFeed> {
+        let mut items = Vec::new();
+        for record in &self.records {
+            if !record.enabled {
+                continue;
+            }
+            for (attachment_index, attachment) in record.manifest.attachments.iter().enumerate() {
+                if !acceptance.accepts(&attachment.surface, attachment.kind.as_ref()) {
+                    continue;
+                }
+                let resolved = match &attachment.payload {
+                    Some(payload) => Some(self.resolve_payload_of(record, payload)?),
+                    None => None,
+                };
+                items.push(AttachmentFeedItem {
+                    plugin_id: record.manifest.id.clone(),
+                    plugin_version: record.manifest.version.clone(),
+                    attachment_index,
+                    attachment: attachment.clone(),
+                    resolved,
+                });
+            }
+        }
+
+        items.sort_by(|a, b| {
+            (&a.plugin_id, a.attachment_index).cmp(&(&b.plugin_id, b.attachment_index))
+        });
+
+        for item in &items {
+            self.inner.append_audit(AuditEvent::Fed {
+                ts: unix_secs(),
+                plugin_id: item.plugin_id.clone(),
+                kind: attachment_audit_kind(&item.attachment).to_string(),
+                host_id: acceptance.host_id.clone(),
+                order: item.attachment_index as i32,
+                name: item.attachment.name.clone(),
+                sha256: item
+                    .resolved
+                    .as_ref()
+                    .and_then(|resolved| resolved.sha256().map(str::to_string)),
+            })?;
+        }
+
+        Ok(AttachmentFeed { items })
+    }
+
+    /// Declares an attachment loaded: the attachment analogue of
+    /// [`Registry::load`]. Re-verifies file payloads (path confinement,
+    /// size cap, declared digest), audits `loaded`, and returns a handle.
+    /// Loading from a disabled plugin is an error, same as resources.
+    pub fn load_attachment(
+        &self,
+        plugin_id: &str,
+        attachment_index: usize,
+    ) -> RegistryResult<ResourceHandle> {
+        let fail = |reason: String| {
+            self.inner.append_audit(AuditEvent::Failed {
+                ts: unix_secs(),
+                stage: "load".into(),
+                plugin_id: Some(plugin_id.to_string()),
+                reason: reason.clone(),
+            })
+        };
+
+        let record = self
+            .records
+            .iter()
+            .find(|record| record.manifest.id == plugin_id)
+            .ok_or_else(|| RegistryError::UnknownPlugin(plugin_id.to_string()));
+        let record = match record {
+            Ok(record) => record,
+            Err(e) => {
+                fail(e.to_string())?;
+                return Err(e);
+            }
+        };
+
+        if !record.enabled {
+            let e = RegistryError::PluginDisabled(plugin_id.to_string());
+            fail(e.to_string())?;
+            return Err(e);
+        }
+
+        let attachment = record.manifest.attachments.get(attachment_index);
+        let attachment = match attachment {
+            Some(attachment) => attachment,
+            None => {
+                let e = RegistryError::EntryIndexOutOfBounds {
+                    plugin_id: plugin_id.to_string(),
+                    index: attachment_index,
+                };
+                fail(e.to_string())?;
+                return Err(e);
+            }
+        };
+
+        let sha256 = match &attachment.payload {
+            None => None,
+            Some(Payload::Inline(_)) => None,
+            Some(Payload::File { path, sha256 }) => {
+                let full = match store::confined_payload_path(&record.dir, path) {
+                    Ok(full) => full,
+                    Err(reason) => {
+                        let err = RegistryError::PayloadIntegrity {
+                            plugin_id: plugin_id.to_string(),
+                            reason,
+                        };
+                        fail(err.to_string())?;
+                        return Err(err);
+                    }
+                };
+                let bytes = match store::read_capped(&full, self.max_payload_bytes) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        let reason = e.reason(&full);
+                        let err = match e {
+                            ReadPayloadError::TooLarge { size, cap } => {
+                                RegistryError::PayloadTooLarge {
+                                    plugin_id: plugin_id.to_string(),
+                                    path: path.display().to_string(),
+                                    size,
+                                    cap,
+                                }
+                            }
+                            ReadPayloadError::Io(_) => RegistryError::PayloadIntegrity {
+                                plugin_id: plugin_id.to_string(),
+                                reason,
+                            },
+                        };
+                        fail(err.to_string())?;
+                        return Err(err);
+                    }
+                };
+                let actual = sha256_hex(&bytes);
+                if let Some(expected) = sha256
+                    && expected != &actual
+                {
+                    let err = RegistryError::PayloadIntegrity {
+                        plugin_id: plugin_id.to_string(),
+                        reason: format!(
+                            "sha256 mismatch for payload '{}': declared {expected}, actual {actual}",
+                            path.display()
+                        ),
+                    };
+                    fail(err.to_string())?;
+                    return Err(err);
+                }
+                Some(actual)
+            }
+        };
+
+        let id = self.inner.allocate_handle_id();
+        self.inner.append_audit(AuditEvent::Loaded {
+            ts: unix_secs(),
+            plugin_id: plugin_id.to_string(),
+            kind: attachment_audit_kind(attachment).to_string(),
+            handle: id,
+            sha256,
+        })?;
+        Ok(ResourceHandle::new(
+            self.inner.clone(),
+            HandleInfo {
+                id,
+                plugin_id: plugin_id.to_string(),
+                kind: attachment_audit_kind(attachment),
+            },
+        ))
+    }
+
     /// Declares a resource loaded: the host's "I loaded this" statement.
     ///
     /// Looks the entry up in the plugin's manifest, re-verifies file
@@ -560,7 +742,18 @@ impl Registry {
         record: &PluginRecord,
         entry: &ResourceEntry,
     ) -> RegistryResult<ResolvedPayload> {
-        match &entry.payload {
+        self.resolve_payload_of(record, &entry.payload)
+    }
+
+    /// Resolves one payload value at feed time — the shared body behind
+    /// resource and attachment feeding (same confinement, cap, and digest
+    /// discipline for both).
+    fn resolve_payload_of(
+        &self,
+        record: &PluginRecord,
+        payload: &Payload,
+    ) -> RegistryResult<ResolvedPayload> {
+        match payload {
             Payload::Inline(value) => Ok(ResolvedPayload::Inline(value.clone())),
             Payload::File { path, sha256 } => {
                 let full = match store::confined_payload_path(&record.dir, path) {
@@ -628,11 +821,22 @@ impl Registry {
     }
 }
 
+/// The audit-trail kind for one attachment: its declared kind when
+/// present, else a surface-derived label (a kind-less attachment still
+/// needs a meaningful, parseable audit row and handle identity).
+fn attachment_audit_kind(attachment: &AttachmentEntry) -> ResourceKind {
+    attachment.kind.clone().unwrap_or_else(|| {
+        ResourceKind::new(&format!("attachment.{}", attachment.surface))
+            .expect("surface-derived kind is valid dotted syntax")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::kinds::ResourceKind;
     use crate::manifest::MANIFEST_FILE;
+    use crate::manifest::Surface;
 
     struct TestStore {
         root: tempfile::TempDir,
@@ -1768,6 +1972,257 @@ min-trust = "signed"
             "the demanding plugin must fail closed without keys"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── attachment feeding (multi-surface) ────────────────────────────
+
+    /// One plugin with two attachments (engine inline + edge file) plus
+    /// a webui page-type resource, to exercise surface/kind filtering.
+    const ATTACH_PLUGIN: &str = r#"
+id = "acme-iot"
+version = "1.2.0"
+provider = "acme"
+form = "web.vue-module"
+
+[[resources]]
+kind = "webui.page-type"
+name = "panel"
+[resources.payload.Inline]
+title = "IoT panel"
+
+[[attachments]]
+surface = "engine"
+form = "process.rpc"
+kind = "engine.agent"
+name = "industrial_iot"
+
+[attachments.payload.Inline]
+folder = "industrial_iot"
+
+[[attachments]]
+surface = "edge"
+form = "wasm.component"
+kind = "edge.deploy"
+
+[attachments.payload.File]
+path = "edge/module.wasm"
+"#;
+
+    #[test]
+    fn feed_attachments_filters_by_surface_and_kind() {
+        let store = TestStore::new();
+        store.add_plugin("acme-iot", ATTACH_PLUGIN, &[("edge/module.wasm", "wasm!")]);
+
+        let registry = store.open();
+
+        // The engine host: only the engine.agent attachment feeds.
+        let feed = registry
+            .feed_attachments(&AttachmentAcceptance::new(
+                "scepter-engine",
+                vec![Surface::Engine],
+            ))
+            .unwrap();
+        assert_eq!(feed.len(), 1, "{feed:?}");
+        let item = feed.iter().next().unwrap();
+        assert_eq!(item.plugin_id, "acme-iot");
+        assert_eq!(item.attachment_index, 0);
+        assert_eq!(item.attachment.surface, Surface::Engine);
+        assert_eq!(
+            item.attachment.kind.as_ref().unwrap().as_str(),
+            "engine.agent"
+        );
+        match &item.resolved {
+            Some(ResolvedPayload::Inline(value)) => {
+                assert_eq!(value["folder"], "industrial_iot");
+            }
+            other => panic!("expected inline payload, got {other:?}"),
+        }
+
+        // The edge host with kind narrowing feeds the file payload.
+        let feed = registry
+            .feed_attachments(&AttachmentAcceptance::new("edge-node", vec![Surface::Edge]))
+            .unwrap();
+        assert_eq!(feed.len(), 1);
+        let item = feed.iter().next().unwrap();
+        assert_eq!(item.attachment_index, 1);
+        match &item.resolved {
+            Some(ResolvedPayload::File { bytes, sha256 }) => {
+                assert_eq!(bytes, b"wasm!");
+                assert_eq!(sha256, &sha256_hex(b"wasm!"));
+            }
+            other => panic!("expected file payload, got {other:?}"),
+        }
+
+        // A webui-only host feeds no attachments (the page-type RESOURCE
+        // is the webui host's business, via `feed`, not `feed_attachments`).
+        let feed = registry
+            .feed_attachments(&AttachmentAcceptance::new(
+                "chest-webui",
+                vec![Surface::Webui],
+            ))
+            .unwrap();
+        assert!(feed.is_empty());
+    }
+
+    #[test]
+    fn feed_attachments_narrows_by_declared_kind() {
+        let store = TestStore::new();
+        store.add_plugin("acme-iot", ATTACH_PLUGIN, &[("edge/module.wasm", "wasm!")]);
+
+        let registry = store.open();
+        // Engine surface narrowed to edge.deploy: nothing feeds.
+        let feed = registry
+            .feed_attachments(
+                &AttachmentAcceptance::new("picky", vec![Surface::Engine, Surface::Edge])
+                    .with_kinds(vec![ResourceKind::new("edge.deploy").unwrap()]),
+            )
+            .unwrap();
+        assert_eq!(feed.len(), 1);
+        assert_eq!(
+            feed.iter().next().unwrap().attachment.surface,
+            Surface::Edge
+        );
+    }
+
+    #[test]
+    fn feed_attachments_skips_disabled_plugins_and_audits_fed() {
+        let store = TestStore::new();
+        store.add_plugin("acme-iot", ATTACH_PLUGIN, &[("edge/module.wasm", "wasm!")]);
+        let mut registry = store.open();
+        registry.set_enabled("acme-iot", false).unwrap();
+
+        let feed = registry
+            .feed_attachments(&AttachmentAcceptance::new(
+                "scepter-engine",
+                vec![Surface::Engine],
+            ))
+            .unwrap();
+        assert!(feed.is_empty());
+
+        registry.set_enabled("acme-iot", true).unwrap();
+        let feed = registry
+            .feed_attachments(&AttachmentAcceptance::new(
+                "scepter-engine",
+                vec![Surface::Engine],
+            ))
+            .unwrap();
+        assert_eq!(feed.len(), 1);
+
+        // The fed row lands in the audit trail with the declared kind.
+        let events_fed = store.audit_events();
+        let fed: Vec<&AuditEvent> = events_fed
+            .iter()
+            .filter(|event| matches!(event, AuditEvent::Fed { .. }))
+            .collect();
+        let last_fed = fed.last().unwrap();
+        match last_fed {
+            AuditEvent::Fed {
+                kind,
+                host_id,
+                name,
+                ..
+            } => {
+                assert_eq!(kind, "engine.agent");
+                assert_eq!(host_id, "scepter-engine");
+                assert_eq!(name.as_deref(), Some("industrial_iot"));
+            }
+            other => panic!("expected a Fed event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_attachment_returns_a_handle_and_audits_loaded() {
+        let store = TestStore::new();
+        store.add_plugin("acme-iot", ATTACH_PLUGIN, &[("edge/module.wasm", "wasm!")]);
+        let mut registry = store.open();
+
+        let feed = registry
+            .feed_attachments(&AttachmentAcceptance::new(
+                "scepter-engine",
+                vec![Surface::Engine],
+            ))
+            .unwrap();
+        let item = feed.iter().next().unwrap();
+
+        let handle = registry
+            .load_attachment(&item.plugin_id, item.attachment_index)
+            .unwrap();
+        handle.unload().unwrap();
+
+        let events_loaded = store.audit_events();
+        let loaded: Vec<&AuditEvent> = events_loaded
+            .iter()
+            .filter(|event| matches!(event, AuditEvent::Loaded { .. }))
+            .collect();
+        assert!(
+            loaded.iter().any(
+                |event| matches!(event, AuditEvent::Loaded { kind, .. } if kind == "engine.agent")
+            ),
+            "a Loaded audit row for engine.agent must exist"
+        );
+
+        // Disabled plugins refuse attachment loads, same as resources.
+        registry.set_enabled("acme-iot", false).unwrap();
+        let err = registry.load_attachment("acme-iot", 0);
+        assert!(
+            matches!(err, Err(RegistryError::PluginDisabled(_))),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn load_attachment_rejects_bad_indexes_and_tampered_payloads_fail_loud() {
+        let store = TestStore::new();
+        store.add_plugin("acme-iot", ATTACH_PLUGIN, &[("edge/module.wasm", "wasm!")]);
+        let registry = store.open();
+
+        let err = registry.load_attachment("acme-iot", 9);
+        assert!(
+            matches!(err, Err(RegistryError::EntryIndexOutOfBounds { .. })),
+            "{err:?}"
+        );
+
+        // Declared digest + tampered file: the FEED itself fails loud (the
+        // digest is verified at feed time, same as resource payloads), and
+        // the failure lands in the audit trail.
+        let digest = sha256_hex(b"wasm!");
+        let manifest = format!(
+            r#"
+id = "digest-iot"
+version = "1.0.0"
+provider = "acme"
+form = "wasm.component"
+
+[[attachments]]
+surface = "edge"
+form = "wasm.component"
+kind = "edge.deploy"
+
+[attachments.payload.File]
+path = "edge/module.wasm"
+sha256 = "{digest}"
+"#
+        );
+        store.add_plugin("digest-iot", &manifest, &[("edge/module.wasm", "wasm!")]);
+        let registry = store.open();
+        std::fs::write(
+            store.root.path().join("digest-iot/edge/module.wasm"),
+            "tampered",
+        )
+        .unwrap();
+        let err =
+            registry.feed_attachments(&AttachmentAcceptance::new("edge-node", vec![Surface::Edge]));
+        assert!(
+            err.is_err(),
+            "a tampered declared-digest payload must fail the feed"
+        );
+        assert!(
+            store
+                .audit_events()
+                .iter()
+                .any(|event| matches!(event, AuditEvent::Failed { .. })),
+            "the failure must be audited"
+        );
     }
 
     /// The C4 concatenation order is load-bearing: resource file bytes
