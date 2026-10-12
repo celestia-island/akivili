@@ -152,6 +152,7 @@ const CONTRACT_REF = /^celestia:[a-z0-9-]+(\.[a-z0-9-]+)*\/[a-z0-9-]+@(0|[1-9]\d
 const HOST = /^[a-z0-9.-]+$/;
 const KEBAB = /^[a-z0-9-]+$/;
 const TARGET = /^[a-z0-9][a-z0-9-]*$/;
+const KIND = /^[a-z0-9-]+(\.[a-z0-9-]+)+$/;
 
 /** Validate a capability word against the closed v1 vocabulary. */
 export function validateCapability(word: string): ManifestIssue | null {
@@ -248,6 +249,14 @@ export function validateManifest(m: PluginManifest): ManifestIssue[] {
       push(`${field}.surface`, `duplicate surface '${a.surface}' (at most one per surface)`);
     }
     seenSurfaces.add(a.surface);
+    if (a.kind !== undefined && !KIND.test(a.kind)) {
+      push(`${field}.kind`, `'${a.kind}' must match the dotted kind syntax (e.g. engine.agent)`);
+    }
+    for (const ref of a.requiresContract ?? []) {
+      if (!CONTRACT_REF.test(ref)) {
+        push(`${field}.requires-contract`, `'${ref}' must be celestia:<domain>/<world>@<major>.<minor>`);
+      }
+    }
     for (const word of a.capabilities ?? []) {
       const issue = validateCapability(word);
       if (issue) issues.push({ field: `${field}.capabilities`, message: issue.message });

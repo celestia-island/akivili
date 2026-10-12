@@ -469,6 +469,18 @@ impl PluginManifest {
                     )));
                 }
                 seen.push(attachment.surface);
+                // A kind rides exactly one channel (R1 finding): the
+                // same kind declared both as a resource and as an
+                // attachment would double-register on any host that
+                // consumes both feeds.
+                if let Some(kind) = &attachment.kind {
+                    if self.resources.iter().any(|entry| &entry.kind == kind) {
+                        return Err(RegistryError::InvalidManifest(format!(
+                            "kind '{}' is declared both as a resource and as an attachment",
+                            kind
+                        )));
+                    }
+                }
                 // Capabilities narrow the plugin-level grant, never widen.
                 for word in &attachment.capabilities {
                     if !self.capabilities.contains(word) {
@@ -478,8 +490,18 @@ impl PluginManifest {
                         )));
                     }
                 }
-                if let Some(upgrade) = &attachment.upgrade {
-                    upgrade.validate(&attachment.form)?;
+                // The upgrade declaration is validated against THIS
+                // attachment's form — explicitly declared, or inherited
+                // from the plugin level (the inheritance re-check is
+                // behavior-neutral under today's matrix and closes the
+                // gap the moment the matrix grows form-specific rules).
+                match &attachment.upgrade {
+                    Some(upgrade) => upgrade.validate(&attachment.form)?,
+                    None => {
+                        if let Some(upgrade) = &self.upgrade {
+                            upgrade.validate(&attachment.form)?;
+                        }
+                    }
                 }
             }
         }
@@ -1616,5 +1638,102 @@ capabilitis = []
             toml::from_str::<PluginManifest>(typo_key).is_err(),
             "attachment entries deny unknown fields"
         );
+    }
+
+    #[test]
+    fn attachments_reject_kind_declared_as_resource() {
+        let mut manifest = baseline();
+        manifest.resources = vec![ResourceEntry {
+            kind: ResourceKind::new("engine.agent").unwrap(),
+            name: None,
+            order: 0,
+            payload: Payload::Inline(serde_json::json!({})),
+        }];
+        let mut attachment = engine_attachment();
+        attachment.kind = Some(ResourceKind::new("engine.agent").unwrap());
+        manifest.attachments = vec![attachment];
+        let err = manifest.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("declared both as a resource and as an attachment"),
+            "{err}"
+        );
+
+        // A different kind on the attachment channel is fine.
+        manifest.attachments[0].kind = Some(ResourceKind::new("engine.tool").unwrap());
+        manifest.validate().expect("disjoint kinds validate");
+    }
+
+    #[test]
+    fn attachment_upgrade_inherits_plugin_level_and_revalidates() {
+        let mut manifest = baseline();
+        // Plugin level: hot on the webui primary form — valid today.
+        manifest.upgrade = Some(UpgradeSection {
+            mode: UpgradeMode::Hot,
+            strategy: UpgradeStrategy::BlueGreen,
+            rollback: RollbackPolicy::Auto,
+            drain_timeout: None,
+            min_ready: None,
+            idle_restart: None,
+            force_window: None,
+            generations: None,
+        });
+        // Attachment with NO upgrade of its own: the plugin-level section
+        // is inherited and re-validated against the attachment's form.
+        // Today's matrix constrains only system.host (forbidden in
+        // attachments), so this pins the lenient present AND the
+        // inheritance path — the moment the matrix grows form-specific
+        // rules, this guard is what catches an incompatible inheritance.
+        manifest.attachments = vec![engine_attachment()];
+        manifest
+            .validate()
+            .expect("inherited hot validates for a process.rpc attachment today");
+
+        // An explicit attachment upgrade still wins over inheritance and
+        // validates against the attachment's own form.
+        let mut attachment = engine_attachment();
+        attachment.upgrade = Some(UpgradeSection {
+            mode: UpgradeMode::Cold,
+            strategy: UpgradeStrategy::ColdRestart,
+            rollback: RollbackPolicy::Auto,
+            drain_timeout: None,
+            min_ready: None,
+            idle_restart: Some(true),
+            force_window: None,
+            generations: None,
+        });
+        manifest.attachments = vec![attachment];
+        manifest
+            .validate()
+            .expect("explicit attachment upgrade validates");
+    }
+
+    #[test]
+    fn attachments_round_trip_a_file_payload_with_upgrade() {
+        let raw = r#"
+schema = 1
+id = "acme-edge"
+version = "1.0.0"
+provider = "acme"
+form = "web.resource"
+
+[[attachments]]
+surface = "edge"
+form = "wasm.component"
+kind = "edge.deploy"
+
+[attachments.payload.File]
+path = "edge/module.wasm"
+
+[attachments.upgrade]
+mode = "rolling"
+strategy = "blue-green"
+drain-timeout = "30s"
+min-ready = 1
+"#;
+        let manifest: PluginManifest = toml::from_str(raw).expect("file+upgrade must parse");
+        manifest.validate().expect("file+upgrade validates");
+        let text = toml::to_string_pretty(&manifest).expect("serialize");
+        let back: PluginManifest = toml::from_str(&text).expect("re-parse");
+        assert_eq!(back, manifest, "round trip must be lossless");
     }
 }

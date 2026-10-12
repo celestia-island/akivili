@@ -1769,4 +1769,95 @@ min-trust = "signed"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// The C4 concatenation order is load-bearing: resource file bytes
+    /// first, then attachment file bytes (R1 P0 fix). A signature over
+    /// any other order must fail closed.
+    #[test]
+    fn attachment_payload_bytes_join_the_signing_concat_after_resources() {
+        use crate::trust::PublisherKey;
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::rngs::OsRng;
+
+        let root = std::env::temp_dir().join(format!(
+            "akivili-reg-attach-sign-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let manifest = r#"schema = 1
+id = "concat-plugin"
+version = "1.0.0"
+provider = "official"
+form = "web.vue-module"
+
+[trust]
+signature = "agent.sig"
+min-trust = "signed"
+
+[[resources]]
+kind = "webui.style"
+[resources.payload.File]
+path = "style.css"
+
+[[attachments]]
+surface = "engine"
+form = "process.rpc"
+kind = "engine.agent"
+
+[attachments.payload.File]
+path = "agent.bin"
+"#;
+        let signing = SigningKey::generate(&mut OsRng);
+        let audit = root.join("audit.jsonl");
+        let plugin = root.join("plugins/concat-plugin");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(plugin.join("akivili.plugin.toml"), manifest).unwrap();
+        std::fs::write(plugin.join("style.css"), b"RESOURCE").unwrap();
+        std::fs::write(plugin.join("agent.bin"), b"ATTACHMENT").unwrap();
+
+        // Correct order: resource bytes ‖ attachment bytes.
+        std::fs::write(
+            plugin.join("agent.sig"),
+            signing.sign(b"RESOURCEATTACHMENT").to_bytes(),
+        )
+        .unwrap();
+        let registry = Registry::options()
+            .publisher_keys(vec![PublisherKey {
+                key_id: "concat-key".into(),
+                bytes: signing.verifying_key().to_bytes(),
+            }])
+            .open(&root.join("plugins"), &audit)
+            .expect("the keyed lane opens");
+        assert!(
+            registry
+                .plugins()
+                .iter()
+                .any(|r| r.manifest.id == "concat-plugin"),
+            "the resources‖attachments signature must verify"
+        );
+
+        // Wrong order (attachments‖resources): the plugin fails closed.
+        std::fs::write(
+            plugin.join("agent.sig"),
+            signing.sign(b"ATTACHMENTRESOURCE").to_bytes(),
+        )
+        .unwrap();
+        let wrong = Registry::options()
+            .publisher_keys(vec![PublisherKey {
+                key_id: "concat-key".into(),
+                bytes: signing.verifying_key().to_bytes(),
+            }])
+            .open(&root.join("plugins"), &audit)
+            .expect("the keyed lane still opens");
+        assert!(
+            wrong
+                .plugins()
+                .iter()
+                .all(|r| r.manifest.id != "concat-plugin"),
+            "the wrong-order signature must fail closed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

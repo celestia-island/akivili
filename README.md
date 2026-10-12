@@ -51,6 +51,16 @@ resources at startup which they load one by one (`ResourceFeed` → `ResourceHan
   the plugin-level grant — attachments narrow, never widen), contracts,
   and an optional upgrade declaration validated against the attachment's
   own form. `system.host` manifests and forms are refused in attachments.
+  A kind may ride exactly one channel — declaring the same kind both as a
+  `[[resources]]` entry and as an attachment is a validation error.
+  Attachment file payloads share the resource scan gate (confinement,
+  size cap, declared digests) and their bytes join the trust-signature
+  concatenation AFTER the resource bytes, in manifest order.
+  **Compatibility note**: the field is additive under schema 1 — hosts
+  built before attachments silently ignore the section (the schema
+  tripwire only fires on a future `schema = 2`); `platforms` (a free-form
+  target-platform hint) and `surface` (the closed attachment-host
+  vocabulary) are separate axes and are not cross-checked.
 - **Feed semantics** — `Registry::feed(&HostAcceptance)` filters enabled plugins'
   entries down to the kinds the host accepts, ordered by `order` (ties broken by
   plugin id, then manifest position). A feed is a snapshot: file payloads are read

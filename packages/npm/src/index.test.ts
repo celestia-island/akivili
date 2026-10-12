@@ -188,4 +188,40 @@ describe("attachments", () => {
     });
     expect(validateManifest(narrowing)).toEqual([]);
   });
+
+  it("validates attachment kind syntax and contract refs", () => {
+    const badKind = base({
+      attachments: [{ surface: "engine", form: "process.rpc", kind: "engine" }],
+    });
+    expect(
+      validateManifest(badKind).some(
+        (i) => i.field === "attachments[0].kind" && i.message.includes("dotted kind"),
+      ),
+    ).toBe(true);
+
+    const badRef = base({
+      attachments: [
+        {
+          surface: "engine",
+          form: "process.rpc",
+          requiresContract: ["celestia:host/guest"],
+        },
+      ],
+    });
+    expect(
+      validateManifest(badRef).some((i) => i.field === "attachments[0].requires-contract"),
+    ).toBe(true);
+
+    const good = base({
+      attachments: [
+        {
+          surface: "engine",
+          form: "process.rpc",
+          kind: "engine.agent",
+          requiresContract: ["celestia:host/guest@0.1"],
+        },
+      ],
+    });
+    expect(validateManifest(good)).toEqual([]);
+  });
 });

@@ -381,6 +381,52 @@ fn validate_dir(
             payload_bytes.extend_from_slice(&bytes);
         }
     }
+    // Attachment file payloads ride the same gate (R1 P0 fix): every
+    // `[[attachments]]` File payload is confined, capped, and
+    // digest-checked exactly like resource payloads, and its bytes join
+    // the C4 concatenation AFTER the resource bytes (resources first,
+    // then attachments in manifest order — the load-bearing order the
+    // signature tests pin).
+    for attachment in &manifest.attachments {
+        if let Some(Payload::File { path, sha256 }) = &attachment.payload {
+            let label = attachment
+                .kind
+                .as_ref()
+                .map(|kind| kind.to_string())
+                .unwrap_or_else(|| format!("attachment.{}", attachment.surface));
+            let full = match confined_payload_path(dir, path) {
+                Ok(full) => full,
+                Err(reason) => {
+                    return Err(reject(
+                        Some(manifest.id.clone()),
+                        format!("payload rejected for kind '{label}': {reason}"),
+                    ));
+                }
+            };
+            let bytes = match read_capped(&full, max_payload_bytes) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Err(reject(
+                        Some(manifest.id.clone()),
+                        format!("payload rejected for kind '{label}': {}", e.reason(&full)),
+                    ));
+                }
+            };
+            if let Some(expected) = sha256 {
+                let actual = sha256_hex(&bytes);
+                if expected != &actual {
+                    return Err(reject(
+                        Some(manifest.id.clone()),
+                        format!(
+                            "sha256 mismatch for payload '{}' (kind '{label}'): declared {expected}, actual {actual}",
+                            path.display(),
+                        ),
+                    ));
+                }
+            }
+            payload_bytes.extend_from_slice(&bytes);
+        }
+    }
 
     // The trust gate (C4-2): plugins demanding a signature must verify
     // under a listed publisher key — fail-closed on every failure shape.
@@ -1072,6 +1118,110 @@ provider = "acme"
             ScanResult::Rejected(rejection) => {
                 assert!(
                     rejection.reason.contains("form"),
+                    "got: {}",
+                    rejection.reason
+                );
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    // ── attachment payloads share the scan gate (R1 P0) ──────────────
+
+    fn attachment_manifest(id: &str, path: &str, sha256: Option<&str>) -> String {
+        let digest = sha256
+            .map(|d| format!("sha256 = \"{d}\"\n"))
+            .unwrap_or_default();
+        format!(
+            r#"
+id = "{id}"
+version = "1.0.0"
+provider = "test"
+form = "web.resource"
+
+[[attachments]]
+surface = "engine"
+form = "process.rpc"
+kind = "engine.agent"
+
+[attachments.payload.File]
+path = "{path}"
+{digest}"#
+        )
+    }
+
+    #[test]
+    fn attachment_file_payloads_are_digest_checked_at_scan() {
+        // Declared digest vs actual bytes: mismatch rejects the plugin.
+        let results = scan_with(&[(
+            "digest-attach",
+            &attachment_manifest("digest-attach", "agent.bin", Some(&sha_of("other"))),
+            &[("agent.bin", "payload-bytes")],
+        )])
+        .unwrap();
+        match &results[0] {
+            ScanResult::Rejected(rejection) => {
+                assert!(
+                    rejection.reason.contains("sha256 mismatch"),
+                    "got: {}",
+                    rejection.reason
+                );
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+
+        // A missing file rejects too (the read is part of the gate).
+        let results = scan_with(&[(
+            "gone-attach",
+            &attachment_manifest("gone-attach", "gone.bin", None),
+            &[],
+        )])
+        .unwrap();
+        match &results[0] {
+            ScanResult::Rejected(rejection) => {
+                assert!(
+                    rejection.reason.contains("payload rejected"),
+                    "got: {}",
+                    rejection.reason
+                );
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+
+        // And the happy path scans in.
+        let results = scan_with(&[(
+            "ok-attach",
+            &attachment_manifest("ok-attach", "agent.bin", Some(&sha_of("payload-bytes"))),
+            &[("agent.bin", "payload-bytes")],
+        )])
+        .unwrap();
+        assert!(matches!(results[0], ScanResult::Accepted(_)), "{results:?}");
+    }
+
+    #[test]
+    fn attachment_escape_paths_are_rejected_at_scan() {
+        // `../escape.bin` points at a real file outside the plugin
+        // directory — the attachment channel must be confined exactly
+        // like the resource channel.
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("escape.bin"), b"secret").unwrap();
+        let dir = root.path().join("escaper");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(MANIFEST_FILE),
+            attachment_manifest("escaper", "../escape.bin", None),
+        )
+        .unwrap();
+        let results = scan(
+            root.path(),
+            &EnabledState::default(),
+            crate::registry::DEFAULT_MAX_PAYLOAD_BYTES,
+        )
+        .unwrap();
+        match &results[0] {
+            ScanResult::Rejected(rejection) => {
+                assert!(
+                    rejection.reason.contains("escapes"),
                     "got: {}",
                     rejection.reason
                 );
