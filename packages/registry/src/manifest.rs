@@ -106,6 +106,37 @@ pub struct PluginManifest {
     /// carry their own scoped declaration instead.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AttachmentEntry>,
+    /// Domain agents this plugin carries — the 10-12 binding: built-in
+    /// L2 agents move from the plana static registry into plugin
+    /// manifests, so a plugin IS the authority for its agent's identity.
+    /// Absent/empty = no agents (fully backward compatible).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<AgentEntry>,
+}
+
+/// One domain agent declared by a plugin (manifest `[[agents]]`).
+///
+/// `folder` follows plana's folder-name conventions so scepter's
+/// prompt/tool paths resolve unchanged; the host merges declared agents
+/// into the L2 roster beside the static registry (registry = fallback).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentEntry {
+    /// Agent folder name, `^[a-z][a-z0-9_]*$` (matches plana
+    /// `AgentKind::folder_name` vocabulary — devops / office / …).
+    pub folder: String,
+    /// Un-localized friendly name (the roster's fallback label).
+    pub name: String,
+    /// Localized roster descriptions keyed by locale tag; `en` is
+    /// required (the family's manifest i18n convention).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub description_i18n: BTreeMap<String, String>,
+    /// Tool doc stems the agent exposes (resolved by the host from the
+    /// plugin's res tree — the registry only carries the names).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// Skill (recipe) doc stems the agent ships.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
 }
 
 /// One resource contributed by a plugin.
@@ -377,6 +408,7 @@ impl Default for PluginManifest {
             schema: SCHEMA,
             id: String::new(),
             version: String::new(),
+            agents: Vec::new(),
             provider: String::new(),
             description: None,
             form: None,
@@ -507,6 +539,50 @@ impl PluginManifest {
         }
         for migration in &self.migrations {
             migration.validate()?;
+        }
+        // [[agents]] — the 10-12 binding section. Folder names must
+        // match plana's vocabulary shape and be unique within the
+        // manifest; `en` description is required (the roster's
+        // fallback label convention).
+        {
+            let mut seen_folders = std::collections::BTreeSet::new();
+            for agent in &self.agents {
+                let ok_folder = !agent.folder.is_empty()
+                    && agent.folder.len() <= 48
+                    && agent
+                        .folder
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_lowercase())
+                    && agent
+                        .folder
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                if !ok_folder {
+                    return Err(RegistryError::InvalidManifest(format!(
+                        "agent folder '{}' must match ^[a-z][a-z0-9_]*$ (<= 48 chars)",
+                        agent.folder
+                    )));
+                }
+                if agent.name.trim().is_empty() {
+                    return Err(RegistryError::InvalidManifest(format!(
+                        "agent '{}' carries an empty name",
+                        agent.folder
+                    )));
+                }
+                if !agent.description_i18n.contains_key("en") {
+                    return Err(RegistryError::InvalidManifest(format!(
+                        "agent '{}' requires an \"en\" description_i18n entry",
+                        agent.folder
+                    )));
+                }
+                if !seen_folders.insert(agent.folder.clone()) {
+                    return Err(RegistryError::InvalidManifest(format!(
+                        "duplicate [[agents]] folder '{}'",
+                        agent.folder
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -870,6 +946,7 @@ mod tests {
             system: None,
             resources: Vec::new(),
             attachments: Vec::new(),
+            agents: Vec::new(),
         }
     }
 
@@ -1735,5 +1812,136 @@ min-ready = 1
         let text = toml::to_string_pretty(&manifest).expect("serialize");
         let back: PluginManifest = toml::from_str(&text).expect("re-parse");
         assert_eq!(back, manifest, "round trip must be lossless");
+    }
+
+    // ── agents (the 10-12 binding section) ───────────────────────────
+
+    fn agent_section_raw() -> &'static str {
+        r#"
+schema = 1
+id = "acme-devops"
+version = "0.1.0"
+provider = "acme"
+form = "web.vue-module"
+
+[[resources]]
+kind = "webui.page-type"
+name = "panel"
+[resources.payload.Inline]
+title = "DevOps"
+
+[[agents]]
+folder = "devops"
+name = "DevOps"
+tools = ["list_prs", "merge_pr"]
+skills = ["release_flow"]
+
+[agents.description_i18n]
+en = "Source control, CI and CD operations"
+zh-Hans = "源码管理、CI 与 CD 操作"
+"#
+    }
+
+    #[test]
+    fn agents_parse_validate_and_round_trip() {
+        let manifest: PluginManifest =
+            toml::from_str(agent_section_raw()).expect("agents section must parse");
+        assert_eq!(manifest.agents.len(), 1);
+        let agent = &manifest.agents[0];
+        assert_eq!(agent.folder, "devops");
+        assert_eq!(agent.name, "DevOps");
+        assert_eq!(
+            agent.description_i18n.get("en").map(String::as_str),
+            Some("Source control, CI and CD operations")
+        );
+        assert_eq!(agent.tools, vec!["list_prs", "merge_pr"]);
+        manifest.validate().expect("manifest with agents validates");
+        // Round trip: serialize + reparse keeps the section intact.
+        let again: PluginManifest =
+            toml::from_str(&toml::to_string(&manifest).unwrap()).expect("round trip parses");
+        assert_eq!(again.agents, manifest.agents);
+    }
+
+    #[test]
+    fn agents_absent_is_backward_compatible() {
+        let raw = r#"
+schema = 1
+id = "plain"
+version = "1.0.0"
+provider = "acme"
+form = "web.vue-module"
+"#;
+        let manifest: PluginManifest = toml::from_str(raw).expect("no-agents manifest parses");
+        assert!(manifest.agents.is_empty());
+        manifest.validate().expect("validates without agents");
+    }
+
+    #[test]
+    fn agents_reject_bad_folder_shape() {
+        for bad in ["Devops", "dev-ops", "1devops", "", &"x".repeat(49)] {
+            let raw = format!(
+                r#"
+schema = 1
+id = "acme"
+version = "1.0.0"
+provider = "acme"
+form = "web.vue-module"
+
+[[agents]]
+folder = "{bad}"
+name = "X"
+
+[agents.description_i18n]
+en = "desc"
+"#
+            );
+            let manifest: PluginManifest = toml::from_str(&raw).expect("parses");
+            assert!(
+                manifest.validate().is_err(),
+                "folder {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn agents_reject_missing_en_description_and_dup_folders() {
+        let no_en = r#"
+schema = 1
+id = "acme"
+version = "1.0.0"
+provider = "acme"
+form = "web.vue-module"
+
+[[agents]]
+folder = "devops"
+name = "X"
+
+[agents.description_i18n]
+zh-Hans = "仅中文"
+"#;
+        let manifest: PluginManifest = toml::from_str(no_en).unwrap();
+        assert!(manifest.validate().is_err(), "en description required");
+
+        let dup = r#"
+schema = 1
+id = "acme"
+version = "1.0.0"
+provider = "acme"
+form = "web.vue-module"
+
+[[agents]]
+folder = "devops"
+name = "X"
+[agents.description_i18n]
+en = "a"
+
+[[agents]]
+folder = "devops"
+name = "Y"
+[agents.description_i18n]
+en = "b"
+"#;
+        let manifest: PluginManifest = toml::from_str(dup).unwrap();
+        assert!(manifest.validate().is_err(), "duplicate folders rejected");
     }
 }
