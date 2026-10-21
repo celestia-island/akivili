@@ -61,6 +61,20 @@ resources at startup which they load one by one (`ResourceFeed` → `ResourceHan
   tripwire only fires on a future `schema = 2`); `platforms` (a free-form
   target-platform hint) and `surface` (the closed attachment-host
   vocabulary) are separate axes and are not cross-checked.
+- **L2 execution contract (`[[agent_tools]]` / `[[installs]]` /
+  `[[mcp_servers]]`)** — the on-demand L2 plugin runtime: structured tool
+  declarations carry name/description/JSON-schema plus an execution
+  `origin` (`host`, `js`, or `mcp:<server-id>`) so the host can expose a
+  tool before anything is installed; `[[mcp_servers]]` declares the
+  servers a plugin installs on evernight nodes (stdio command or http/sse
+  url, bound to one declared agent folder); `[[installs]]` declares
+  plugin-owned TypeScript install scripts executed in the PTC sandbox on
+  first tool use (the script path must be covered by a signed
+  `[[resources]]` file payload, tool names must resolve to declared
+  tools, and the caller wait window is clamped to 1 s ..= 1 h, default
+  120 s). Every cross-reference must resolve inside the same manifest —
+  unknown agent folders, undeclared server origins, unsigned scripts and
+  dangling tool names are validation errors.
 - **Feed semantics** — `Registry::feed(&HostAcceptance)` filters enabled plugins'
   entries down to the kinds the host accepts, ordered by `order` (ties broken by
   plugin id, then manifest position). A feed is a snapshot: file payloads are read
