@@ -741,6 +741,21 @@ impl PluginManifest {
                                 server.id
                             )));
                         }
+                        // The command is resolved inside the installed
+                        // plugin directory, so its path shape must stay
+                        // relative and inside it (same rule as install
+                        // scripts — no absolute paths, no `..` walks).
+                        {
+                            let command_path = PathBuf::from(&server.command);
+                            if command_path.is_absolute()
+                                || server.command.split(['/', '\\']).any(|seg| seg == "..")
+                            {
+                                return Err(RegistryError::InvalidManifest(format!(
+                                    "mcp server '{}' (stdio) command '{}' must be a relative path inside the installed plugin directory",
+                                    server.id, server.command
+                                )));
+                            }
+                        }
                         // The url field is remote-transport-only; a stdio
                         // entry carrying one is a contradictory declaration.
                         if !server.url.is_empty() {
@@ -890,9 +905,9 @@ impl PluginManifest {
                 }
                 let mut seen_ids = std::collections::BTreeSet::new();
                 for install in &self.installs {
-                    if !is_valid_id(&install.id) {
+                    if !is_valid_id(&install.id) || install.id.len() > 64 {
                         return Err(RegistryError::InvalidManifest(format!(
-                            "install id '{}' must match ^[a-z0-9][a-z0-9-]*$",
+                            "install id '{}' must match ^[a-z0-9][a-z0-9-]*$ (<= 64 chars)",
                             install.id
                         )));
                     }
@@ -2871,6 +2886,42 @@ id = "default"
 script = "install/default.ts"
 "#
                 .to_string(),
+            ),
+            (
+                "stdio command must stay inside the plugin directory",
+                r#"
+
+[[mcp_servers]]
+id = "office-engine-2"
+transport = "stdio"
+command = "/bin/bash"
+agent = "office"
+"#
+                .to_string(),
+            ),
+            (
+                "stdio command must not walk out with ..",
+                r#"
+
+[[mcp_servers]]
+id = "office-engine-2"
+transport = "stdio"
+command = "../evil"
+agent = "office"
+"#
+                .to_string(),
+            ),
+            (
+                "install ids carry the same length cap as server ids",
+                format!(
+                    r#"
+
+[[installs]]
+id = "{}"
+script = "install/default.ts"
+"#,
+                    "a".repeat(65)
+                ),
             ),
         ];
 
