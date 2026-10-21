@@ -112,6 +112,23 @@ pub struct PluginManifest {
     /// Absent/empty = no agents (fully backward compatible).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<AgentEntry>,
+    /// Structured tool declarations (manifest `[[agent_tools]]`) — the
+    /// lazy-visibility contract: the host can expose a tool's name,
+    /// description and parameter schema from the manifest alone, before
+    /// any MCP server is installed on a node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_tools: Vec<AgentToolEntry>,
+    /// Install scripts (manifest `[[installs]]`) — the on-demand
+    /// provisioning contract: plugin-owned TypeScript executed in the
+    /// PTC sandbox when a bound tool is first invoked on a node that
+    /// does not have its MCP entry yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub installs: Vec<InstallEntry>,
+    /// MCP server entries (manifest `[[mcp_servers]]`) — servers this
+    /// plugin installs on evernight nodes (never inside scepter or
+    /// cosmos containers), each bound to one declared agent folder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<McpServerEntry>,
 }
 
 /// One domain agent declared by a plugin (manifest `[[agents]]`).
@@ -137,6 +154,112 @@ pub struct AgentEntry {
     /// Skill (recipe) doc stems the agent ships.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
+}
+
+/// One structured tool declaration (manifest `[[agent_tools]]`).
+///
+/// The lazy-visibility half of the L2 plugin execution contract: the
+/// host exposes name/description/schema from the manifest alone (before
+/// any install has run), and `origin` tells the runtime where execution
+/// lives once the install has provided it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentToolEntry {
+    /// The `[[agents]]` folder this tool belongs to.
+    pub agent: String,
+    /// Tool name — the module export and the dispatch local part,
+    /// `^[a-z0-9_]+$` (<= 64 chars), unique per agent.
+    pub name: String,
+    /// One-line description the prompt surface shows.
+    pub description: String,
+    /// Where the tool executes once provisioned:
+    /// `"host"` — a built-in host capability the plugin binds;
+    /// `"js"` — the plugin's in-PTC sandbox script;
+    /// `"mcp:<server-id>"` — an `[[mcp_servers]]` entry of this plugin.
+    pub origin: String,
+    /// JSON Schema (object) for the tool's parameters; an empty object
+    /// means "no schema enforced at the manifest layer".
+    #[serde(default = "default_tool_schema")]
+    pub schema: serde_json::Value,
+}
+
+fn default_tool_schema() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+/// One install script (manifest `[[installs]]`).
+///
+/// The on-demand provisioning contract: a plugin-owned TypeScript file
+/// executed in the PTC sandbox when a bound tool is first invoked on a
+/// node that does not have the MCP entry yet. The script drives Polemos
+/// host tools (resource push / node exec / mcp registry upsert) to
+/// install. All waiters — the initiating call included — wait at most
+/// `timeout_ms` before receiving a retryable "installing" answer, and a
+/// cancel is only honoured after at least one such timeout has elapsed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstallEntry {
+    /// Install id, `^[a-z0-9][a-z0-9-]*$`, unique within the manifest.
+    pub id: String,
+    /// Path of the TypeScript install script inside the plugin
+    /// directory. Must be covered by a `[[resources]]` file payload so
+    /// the bytes are hashed and signature-verified — an unsigned script
+    /// is rejected at validation time.
+    pub script: String,
+    /// Tool names this install provides; `["*"]` (the default) means
+    /// every declared tool. Each name must resolve to an
+    /// `[[agent_tools]]` entry or an `[[agents]]` doc stem.
+    #[serde(default = "default_install_tools")]
+    pub tools: Vec<String>,
+    /// How long callers wait for this install before receiving the
+    /// retryable answer. Default 120 000 ms; clamped to 1 s ..= 1 h.
+    #[serde(default = "default_install_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Optional node affinity label (e.g. `"capability:office"`);
+    /// resolved by the host against evernight node capabilities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_selector: Option<String>,
+}
+
+fn default_install_tools() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+const DEFAULT_INSTALL_TIMEOUT_MS: u64 = 120_000;
+
+fn default_install_timeout_ms() -> u64 {
+    DEFAULT_INSTALL_TIMEOUT_MS
+}
+
+/// One MCP server entry (manifest `[[mcp_servers]]`).
+///
+/// A server this plugin installs on evernight nodes — never inside
+/// scepter or cosmos containers (the lateral-movement guard). Bound to
+/// one L2 agent folder; after the install script has run, this is the
+/// entry the node-side `mcpTools` registry carries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpServerEntry {
+    /// Server id, `^[a-z0-9][a-z0-9-]*$` (<= 64 chars), unique within
+    /// the manifest; `[[agent_tools]]` origins reference it as
+    /// `mcp:<id>`.
+    pub id: String,
+    /// Transport: `"stdio"` (the node spawns `command`) or `"http"` /
+    /// `"sse"` (the node dials `url`).
+    pub transport: String,
+    /// The command to run for `stdio`, resolved inside the installed
+    /// plugin directory. Empty for remote transports.
+    #[serde(default)]
+    pub command: String,
+    /// argv for the stdio command.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// The endpoint URL for `http`/`sse`. Empty for stdio.
+    #[serde(default)]
+    pub url: String,
+    /// The `[[agents]]` folder this server's tools belong to.
+    pub agent: String,
+    /// Platform/arch matrix the artifact set covers (e.g.
+    /// `["linux-x64"]`); empty means platform-independent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platforms: Vec<String>,
 }
 
 /// One resource contributed by a plugin.
@@ -425,6 +548,9 @@ impl Default for PluginManifest {
             system: None,
             resources: Vec::new(),
             attachments: Vec::new(),
+            agent_tools: Vec::new(),
+            installs: Vec::new(),
+            mcp_servers: Vec::new(),
         }
     }
 }
@@ -581,6 +707,202 @@ impl PluginManifest {
                         "duplicate [[agents]] folder '{}'",
                         agent.folder
                     )));
+                }
+            }
+        }
+
+        // [[agent_tools]] / [[mcp_servers]] / [[installs]] — the L2
+        // plugin execution contract. Every cross-reference must resolve
+        // within THIS manifest: agent bindings name a declared
+        // [[agents]] folder, mcp origins name a declared server, every
+        // install script is covered by a signed file resource, and
+        // every install tool name resolves to a declared tool.
+        {
+            let agent_folders: std::collections::BTreeSet<&str> =
+                self.agents.iter().map(|a| a.folder.as_str()).collect();
+            let server_ids: std::collections::BTreeSet<&str> =
+                self.mcp_servers.iter().map(|s| s.id.as_str()).collect();
+
+            for server in &self.mcp_servers {
+                if !is_valid_id(&server.id) || server.id.len() > 64 {
+                    return Err(RegistryError::InvalidManifest(format!(
+                        "mcp server id '{}' must match ^[a-z0-9][a-z0-9-]*$ (<= 64 chars)",
+                        server.id
+                    )));
+                }
+                match server.transport.as_str() {
+                    "stdio" => {
+                        if server.command.trim().is_empty() {
+                            return Err(RegistryError::InvalidManifest(format!(
+                                "mcp server '{}' (stdio) requires a command",
+                                server.id
+                            )));
+                        }
+                    }
+                    "http" | "sse" => {
+                        if !server.url.starts_with("http://") && !server.url.starts_with("https://")
+                        {
+                            return Err(RegistryError::InvalidManifest(format!(
+                                "mcp server '{}' ({}) requires an http(s) url",
+                                server.id, server.transport
+                            )));
+                        }
+                    }
+                    other => {
+                        return Err(RegistryError::InvalidManifest(format!(
+                            "mcp server '{}' transport must be stdio|http|sse (got '{other}')",
+                            server.id
+                        )));
+                    }
+                }
+                if !agent_folders.contains(server.agent.as_str()) {
+                    return Err(RegistryError::InvalidManifest(format!(
+                        "mcp server '{}' binds unknown agent folder '{}'",
+                        server.id, server.agent
+                    )));
+                }
+            }
+            {
+                let mut seen_ids = std::collections::BTreeSet::new();
+                for server in &self.mcp_servers {
+                    if !seen_ids.insert(server.id.clone()) {
+                        return Err(RegistryError::InvalidManifest(format!(
+                            "duplicate [[mcp_servers]] id '{}'",
+                            server.id
+                        )));
+                    }
+                }
+            }
+
+            {
+                let mut seen: std::collections::BTreeSet<(String, String)> =
+                    std::collections::BTreeSet::new();
+                for tool in &self.agent_tools {
+                    if !agent_folders.contains(tool.agent.as_str()) {
+                        return Err(RegistryError::InvalidManifest(format!(
+                            "agent tool '{}' binds unknown agent folder '{}'",
+                            tool.name, tool.agent
+                        )));
+                    }
+                    let ok_name = !tool.name.is_empty()
+                        && tool.name.len() <= 64
+                        && tool
+                            .name
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                    if !ok_name {
+                        return Err(RegistryError::InvalidManifest(format!(
+                            "agent tool name '{}' must match ^[a-z0-9_]+$ (<= 64 chars)",
+                            tool.name
+                        )));
+                    }
+                    if tool.description.trim().is_empty() {
+                        return Err(RegistryError::InvalidManifest(format!(
+                            "agent tool '{}' carries an empty description",
+                            tool.name
+                        )));
+                    }
+                    match tool.origin.as_str() {
+                        "host" | "js" => {}
+                        origin if origin.starts_with("mcp:") => {
+                            let server_id = &origin[4..];
+                            if server_id.is_empty() || !server_ids.contains(server_id) {
+                                return Err(RegistryError::InvalidManifest(format!(
+                                    "agent tool '{}' origin '{origin}' does not name a declared [[mcp_servers]] id",
+                                    tool.name
+                                )));
+                            }
+                        }
+                        other => {
+                            return Err(RegistryError::InvalidManifest(format!(
+                                "agent tool '{}' origin must be host|js|mcp:<server-id> (got '{other}')",
+                                tool.name
+                            )));
+                        }
+                    }
+                    if !tool.schema.is_object() {
+                        return Err(RegistryError::InvalidManifest(format!(
+                            "agent tool '{}' schema must be a JSON object",
+                            tool.name
+                        )));
+                    }
+                    if !seen.insert((tool.agent.clone(), tool.name.clone())) {
+                        return Err(RegistryError::InvalidManifest(format!(
+                            "duplicate [[agent_tools]] name '{}' for agent '{}'",
+                            tool.name, tool.agent
+                        )));
+                    }
+                }
+            }
+
+            {
+                let declared_tools: std::collections::BTreeSet<&str> = self
+                    .agent_tools
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .chain(
+                        self.agents
+                            .iter()
+                            .flat_map(|a| a.tools.iter().map(String::as_str)),
+                    )
+                    .collect();
+                let mut seen_ids = std::collections::BTreeSet::new();
+                for install in &self.installs {
+                    if !is_valid_id(&install.id) {
+                        return Err(RegistryError::InvalidManifest(format!(
+                            "install id '{}' must match ^[a-z0-9][a-z0-9-]*$",
+                            install.id
+                        )));
+                    }
+                    if !seen_ids.insert(install.id.clone()) {
+                        return Err(RegistryError::InvalidManifest(format!(
+                            "duplicate [[installs]] id '{}'",
+                            install.id
+                        )));
+                    }
+                    if !(1_000..=3_600_000).contains(&install.timeout_ms) {
+                        return Err(RegistryError::InvalidManifest(format!(
+                            "install '{}' timeout_ms {} outside 1_000..=3_600_000",
+                            install.id, install.timeout_ms
+                        )));
+                    }
+                    let script_path = PathBuf::from(&install.script);
+                    if install.script.trim().is_empty()
+                        || script_path.is_absolute()
+                        || install.script.split(['/', '\\']).any(|seg| seg == "..")
+                    {
+                        return Err(RegistryError::InvalidManifest(format!(
+                            "install '{}' script '{}' must be a relative path inside the plugin directory",
+                            install.id, install.script
+                        )));
+                    }
+                    let covered = self.resources.iter().any(|r| match &r.payload {
+                        Payload::File { path, .. } => *path == script_path,
+                        Payload::Inline(_) => false,
+                    });
+                    if !covered {
+                        return Err(RegistryError::InvalidManifest(format!(
+                            "install '{}' script '{}' is not covered by a [[resources]] file payload (unsigned bytes)",
+                            install.id, install.script
+                        )));
+                    }
+                    if install.tools.is_empty() {
+                        return Err(RegistryError::InvalidManifest(format!(
+                            "install '{}' declares no tools",
+                            install.id
+                        )));
+                    }
+                    for tool in &install.tools {
+                        if tool == "*" {
+                            continue;
+                        }
+                        if !declared_tools.contains(tool.as_str()) {
+                            return Err(RegistryError::InvalidManifest(format!(
+                                "install '{}' names tool '{tool}' which no [[agent_tools]] entry or [[agents]] doc stem declares",
+                                install.id
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -947,6 +1269,9 @@ mod tests {
             resources: Vec::new(),
             attachments: Vec::new(),
             agents: Vec::new(),
+            agent_tools: Vec::new(),
+            installs: Vec::new(),
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -1943,5 +2268,376 @@ en = "b"
 "#;
         let manifest: PluginManifest = toml::from_str(dup).unwrap();
         assert!(manifest.validate().is_err(), "duplicate folders rejected");
+    }
+
+    // ── agent_tools / mcp_servers / installs (the L2 execution contract) ──
+
+    fn l2_contract_raw() -> String {
+        r#"
+schema = 1
+id = "acme-office"
+version = "0.1.0"
+provider = "acme"
+form = "web.vue-module"
+
+[[resources]]
+kind = "webui.page-type"
+name = "panel"
+[resources.payload.Inline]
+title = "Office"
+
+[[resources]]
+kind = "install.script"
+[resources.payload.File]
+path = "install/default.ts"
+
+[[agents]]
+folder = "office"
+name = "Office"
+[agents.description_i18n]
+en = "Office documents"
+
+[[agent_tools]]
+agent = "office"
+name = "deck_build"
+description = "Compose a deck from a plan and template"
+origin = "mcp:office-engine"
+[agent_tools.schema]
+type = "object"
+
+[[agent_tools]]
+agent = "office"
+name = "deck_plan_validate"
+description = "Validate a deck plan (pure logic)"
+origin = "js"
+
+[[mcp_servers]]
+id = "office-engine"
+transport = "stdio"
+command = "office-mcp"
+agent = "office"
+platforms = ["linux-x64"]
+
+[[installs]]
+id = "default"
+script = "install/default.ts"
+tools = ["*"]
+timeout_ms = 120000
+node_selector = "capability:office"
+"#
+        .to_string()
+    }
+
+    fn parse_validated(raw: &str) -> PluginManifest {
+        let manifest: PluginManifest = toml::from_str(raw).expect("must parse");
+        manifest.validate().expect("must validate");
+        manifest
+    }
+
+    #[test]
+    fn l2_contract_sections_parse_validate_and_round_trip() {
+        let manifest = parse_validated(&l2_contract_raw());
+        assert_eq!(manifest.agent_tools.len(), 2);
+        assert_eq!(manifest.installs.len(), 1);
+        assert_eq!(manifest.mcp_servers.len(), 1);
+        assert_eq!(manifest.installs[0].timeout_ms, 120_000);
+        assert_eq!(
+            manifest.installs[0].node_selector.as_deref(),
+            Some("capability:office")
+        );
+        assert_eq!(manifest.agent_tools[0].origin, "mcp:office-engine");
+        assert!(manifest.agent_tools[0].schema.is_object());
+        assert_eq!(manifest.mcp_servers[0].agent, "office");
+
+        let text = toml::to_string_pretty(&manifest).expect("serialize");
+        let back: PluginManifest = toml::from_str(&text).expect("re-parse");
+        assert_eq!(back, manifest, "round trip must be lossless");
+    }
+
+    #[test]
+    fn l2_contract_defaults_apply_when_optional_keys_are_absent() {
+        let raw = r#"
+schema = 1
+id = "acme-office"
+version = "0.1.0"
+provider = "acme"
+form = "web.vue-module"
+
+[[resources]]
+kind = "install.script"
+[resources.payload.File]
+path = "install/default.ts"
+
+[[agents]]
+folder = "office"
+name = "Office"
+[agents.description_i18n]
+en = "Office"
+
+[[installs]]
+id = "default"
+script = "install/default.ts"
+"#;
+        let manifest = parse_validated(raw);
+        assert_eq!(manifest.installs[0].tools, vec!["*"]);
+        assert_eq!(manifest.installs[0].timeout_ms, 120_000);
+        assert!(manifest.installs[0].node_selector.is_none());
+        // Agent tools absent = no lazy-visibility declarations; still valid.
+        assert!(manifest.agent_tools.is_empty());
+    }
+
+    /// Mutate one aspect of the valid contract and assert validation
+    /// refuses it. Every case names the rule it pins.
+    #[test]
+    fn l2_contract_rejects_broken_cross_references() {
+        let cases: &[(&str, String)] = &[
+            (
+                "agent_tools binds unknown agent folder",
+                r#"
+
+[[agent_tools]]
+agent = "ghost"
+name = "deck_build"
+description = "d"
+origin = "js"
+"#
+                .to_string(),
+            ),
+            (
+                "agent_tools origin names an undeclared mcp server",
+                r#"
+
+[[agent_tools]]
+agent = "office"
+name = "deck_build"
+description = "d"
+origin = "mcp:ghost-engine"
+"#
+                .to_string(),
+            ),
+            (
+                "agent_tools origin vocabulary is closed",
+                r#"
+
+[[agent_tools]]
+agent = "office"
+name = "deck_build"
+description = "d"
+origin = "wasm:office"
+"#
+                .to_string(),
+            ),
+            (
+                "agent_tools name shape is enforced",
+                r#"
+
+[[agent_tools]]
+agent = "office"
+name = "DeckBuild"
+description = "d"
+origin = "js"
+"#
+                .to_string(),
+            ),
+            (
+                "agent_tools description must not be empty",
+                r#"
+
+[[agent_tools]]
+agent = "office"
+name = "deck_build"
+description = ""
+origin = "js"
+"#
+                .to_string(),
+            ),
+            (
+                "mcp_servers stdio requires a command",
+                r#"
+
+[[mcp_servers]]
+id = "office-engine"
+transport = "stdio"
+agent = "office"
+"#
+                .to_string(),
+            ),
+            (
+                "mcp_servers http requires an http(s) url",
+                r#"
+
+[[mcp_servers]]
+id = "office-engine"
+transport = "http"
+url = "ftp://example.invalid"
+agent = "office"
+"#
+                .to_string(),
+            ),
+            (
+                "mcp_servers transport vocabulary is closed",
+                r#"
+
+[[mcp_servers]]
+id = "office-engine"
+transport = "grpc"
+command = "x"
+agent = "office"
+"#
+                .to_string(),
+            ),
+            (
+                "mcp_servers binds unknown agent folder",
+                r#"
+
+[[mcp_servers]]
+id = "office-engine"
+transport = "stdio"
+command = "office-mcp"
+agent = "ghost"
+"#
+                .to_string(),
+            ),
+            (
+                "mcp_servers ids must be unique",
+                r#"
+
+[[mcp_servers]]
+id = "office-engine"
+transport = "stdio"
+command = "a"
+agent = "office"
+
+[[mcp_servers]]
+id = "office-engine"
+transport = "stdio"
+command = "b"
+agent = "office"
+"#
+                .to_string(),
+            ),
+            (
+                "installs script must be a signed file resource",
+                r#"
+
+[[installs]]
+id = "rogue"
+script = "install/not-declared.ts"
+"#
+                .to_string(),
+            ),
+            (
+                "installs script must stay inside the plugin directory",
+                r#"
+
+[[installs]]
+id = "rogue"
+script = "../escape.ts"
+"#
+                .to_string(),
+            ),
+            (
+                "installs names must resolve to declared tools",
+                r#"
+
+[[installs]]
+id = "default"
+script = "install/default.ts"
+tools = ["no_such_tool"]
+"#
+                .to_string(),
+            ),
+            (
+                "installs timeout is clamped",
+                r#"
+
+[[installs]]
+id = "default"
+script = "install/default.ts"
+timeout_ms = 10
+"#
+                .to_string(),
+            ),
+            (
+                "installs ids must be unique",
+                r#"
+
+[[installs]]
+id = "default"
+script = "install/default.ts"
+
+[[installs]]
+id = "default"
+script = "install/default.ts"
+"#
+                .to_string(),
+            ),
+        ];
+
+        let template = l2_contract_raw();
+        for (label, snippet) in cases {
+            // Splice each mutation in just before the trailing quote of
+            // the template: additions override earlier same-key tables
+            // in TOML only for arrays-of-table (they append), so the
+            // mutation cases add NEW entries; the "unique"/"resolve"
+            // cases rely on the added entry conflicting with the
+            // baseline's own declarations.
+            let mutated = format!("{}{}", &template[..template.len() - 1], snippet);
+            let manifest: PluginManifest = match toml::from_str(&mutated) {
+                Ok(m) => m,
+                Err(e) => {
+                    // A parse failure is also an acceptable rejection for
+                    // shape-level cases (e.g. duplicate keys never parse).
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("duplicate") || msg.contains("invalid"),
+                        "{label}: unexpected parse error: {msg}"
+                    );
+                    continue;
+                }
+            };
+            assert!(
+                manifest.validate().is_err(),
+                "{label}: validation must reject"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_tools_per_agent_names_may_repeat_across_agents() {
+        // Same tool name under two different agents is legal — the
+        // dispatch name is folder-qualified at the host layer.
+        let raw = r#"
+schema = 1
+id = "acme"
+version = "1.0.0"
+provider = "acme"
+form = "web.vue-module"
+
+[[agents]]
+folder = "office"
+name = "Office"
+[agents.description_i18n]
+en = "a"
+
+[[agents]]
+folder = "devops"
+name = "DevOps"
+[agents.description_i18n]
+en = "b"
+
+[[agent_tools]]
+agent = "office"
+name = "shared_name"
+description = "d"
+origin = "js"
+
+[[agent_tools]]
+agent = "devops"
+name = "shared_name"
+description = "d"
+origin = "js"
+"#;
+        parse_validated(raw);
     }
 }
