@@ -250,6 +250,20 @@ fn dispatch_host_fn(
                 Err(e) => PluginResult::err(e.to_string()),
             }
         }
+        "host-tool" => {
+            let inner_tool = params["tool"].as_str().unwrap_or("").to_string();
+            let inner_params = params
+                .get("params")
+                .cloned()
+                .unwrap_or(serde_json::Value::Object(Default::default()));
+            if inner_tool.is_empty() {
+                return PluginResult::err("host-tool dispatch requires an inner tool name");
+            }
+            match api.host_tool(inner_tool, inner_params.to_string()) {
+                Ok(resp) => PluginResult::with_response(resp),
+                Err(e) => PluginResult::err(e.to_string()),
+            }
+        }
         "subscribe-trigger" => {
             let topic_pattern = params["topicPattern"]
                 .as_str()
@@ -1449,5 +1463,118 @@ var handleRequest = function(m, p, h, b) {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod host_tool_arm_tests {
+    use super::*;
+    use crate::grants::GrantSet;
+    use std::sync::{Arc as StdArc, Mutex};
+
+    /// Dispatch one host-tool call through the real match with a
+    /// hand-built provider: asserts the grant gate and the handler
+    /// wiring end to end. Answers the envelope's `success` flag plus
+    /// the response text ("" when absent).
+    fn dispatch_with(
+        caps: &[&str],
+        handler: Option<StdArc<dyn Fn(String, String) -> Result<String> + Send + Sync>>,
+        inner_tool: &str,
+    ) -> (bool, String) {
+        let mut api = HostFunctions::new();
+        let words: Vec<String> = caps.iter().map(|c| c.to_string()).collect();
+        api = api.with_grants(GrantSet::from_raw_words(words.into_iter()));
+        if let Some(h) = handler {
+            api = api.with_host_tool_handler(h);
+        }
+        let body = serde_json::json!({
+            "tool": inner_tool,
+            "params": { "k": "v" },
+        })
+        .to_string();
+        let envelope = dispatch_host_fn(
+            &StdArc::new(api),
+            "test-plugin",
+            "host-tool",
+            serde_json::from_str(&body).unwrap(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&envelope.to_string()).unwrap();
+        let success = value["success"].as_bool().unwrap_or(false);
+        let response = value["response"]
+            .as_str()
+            .unwrap_or(if success { "" } else { "refused" })
+            .to_string();
+        (success, response)
+    }
+
+    #[test]
+    fn diagnostic_grant_state() {
+        let g = GrantSet::from_raw_words(Vec::<String>::new());
+        assert!(
+            g.check_dispatch("host-tool", &serde_json::json!({"tool":"x"}))
+                .is_some(),
+            "empty grants must refuse host-tool"
+        );
+        let g2 = GrantSet::from_raw_words(vec!["host.tool".to_string()]);
+        assert!(
+            g2.check_dispatch("host-tool", &serde_json::json!({"tool":"x"}))
+                .is_none(),
+            "declared host.tool must grant host-tool"
+        );
+    }
+
+    #[test]
+    fn host_tool_without_the_capability_is_refused() {
+        let (success, response) = dispatch_with(&[], None, "anything");
+        assert!(!success, "the grant gate must refuse");
+        assert!(
+            response.contains("refused") || response.contains("not declared"),
+            "{response}"
+        );
+    }
+
+    #[test]
+    fn host_tool_with_the_capability_reaches_the_handler() {
+        let calls: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+        let handler = StdArc::new(move |tool: String, params: String| {
+            calls.lock().unwrap().push((tool, params));
+            Ok("\"done\"".to_string())
+        });
+        let (success, response) =
+            dispatch_with(&["host.tool"], Some(handler), "plugin_resource_push");
+        assert!(success, "the granted arm must reach the handler");
+        assert!(response.contains("done"), "{response}");
+    }
+
+    #[test]
+    fn host_tool_without_a_handler_fails_closed() {
+        let (success, response) = dispatch_with(&["host.tool"], None, "plugin_resource_push");
+        assert!(!success, "no handler = the arm stays closed");
+        assert!(
+            response.contains("not provided") || response.contains("refused"),
+            "{response}"
+        );
+    }
+
+    #[test]
+    fn host_tool_carries_the_inner_tool_name_and_params() {
+        let captured: StdArc<Mutex<Option<(String, String)>>> = StdArc::new(Mutex::new(None));
+        let captured2 = captured.clone();
+        let handler = StdArc::new(move |tool: String, params: String| {
+            *captured2.lock().unwrap() = Some((tool, params));
+            Ok("\"ok\"".to_string())
+        });
+        let _ = dispatch_with(&["host.tool"], Some(handler), "plugin_resource_push");
+        let captured = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the handler must be called");
+        assert_eq!(captured.0, "plugin_resource_push");
+        assert!(
+            captured.1.contains("\"k\""),
+            "params ride through: {}",
+            captured.1
+        );
     }
 }

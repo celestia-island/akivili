@@ -22,6 +22,11 @@ pub const CAP_MCP_REGISTER: &str = "mcp.register";
 pub const CAP_STATE_READ: &str = "state.read";
 /// Capability word: write host-managed plugin state.
 pub const CAP_STATE_WRITE: &str = "state.write";
+/// Capability word: call a host-provided tool through the gated
+/// `host-tool` dispatch arm (parameterized by the host's own inner
+/// allowlist — the arm carries `{tool, params}` and the host decides
+/// which inner tools it serves).
+pub const CAP_HOST_TOOL: &str = "host.tool";
 /// Capability word: scoped data-contract query (parameterized: `db.contract:usage.read`).
 pub const CAP_DB_CONTRACT: &str = "db.contract";
 /// Capability word: typed domain query (parameterized: `db.query:usage`).
