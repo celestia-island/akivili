@@ -97,6 +97,7 @@ pub const VOCABULARY: &[(&str, bool)] = &[
     (CAP_MCP_REGISTER, false),
     (CAP_STATE_READ, false),
     (CAP_STATE_WRITE, false),
+    (CAP_HOST_TOOL, false),
     (CAP_DB_CONTRACT, true),
     (CAP_DB_QUERY, true),
     (CAP_DB_SQL, false),
@@ -198,6 +199,20 @@ mod tests {
                 assert_eq!(cap.param(), None);
             }
         }
+    }
+
+    #[test]
+    fn host_tool_is_a_plain_vocabulary_word() {
+        // The `host-tool` dispatch arm grants through this word; if it
+        // ever drops out of the vocabulary again, every manifest that
+        // declares it fails deserialization (the grant becomes
+        // unreachable) — this pin must fail loud.
+        let cap = Capability::new(CAP_HOST_TOOL).expect("host.tool must validate");
+        assert_eq!(cap.base(), "host.tool");
+        assert_eq!(cap.param(), None);
+        // Plain word: the inner-tool allowlist is the host's own
+        // business, never a capability parameter.
+        assert!(Capability::new("host.tool:plugin_resource_push").is_err());
     }
 
     #[test]

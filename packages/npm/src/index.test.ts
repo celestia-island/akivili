@@ -66,7 +66,7 @@ describe("validateManifest", () => {
 
 describe("validateCapability", () => {
   it("accepts plain and parameterized vocabulary words", () => {
-    for (const word of ["log", "kv.read", "db.sql"]) {
+    for (const word of ["log", "kv.read", "db.sql", "host.tool"]) {
       expect(validateCapability(word)).toBeNull();
     }
     for (const word of [
@@ -76,6 +76,10 @@ describe("validateCapability", () => {
     ]) {
       expect(validateCapability(word)).toBeNull();
     }
+  });
+
+  it("keeps host.tool a plain word (no capability parameter)", () => {
+    expect(validateCapability("host.tool:plugin_resource_push")).not.toBeNull();
   });
 
   it("rejects unknown bases and malformed params", () => {

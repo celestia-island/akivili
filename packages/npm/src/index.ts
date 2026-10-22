@@ -45,6 +45,7 @@ export const CAPABILITY_WORDS: readonly string[] = [
   "mcp.register",
   "state.read",
   "state.write",
+  "host.tool",
   "db.contract",
   "db.query",
   "db.sql",

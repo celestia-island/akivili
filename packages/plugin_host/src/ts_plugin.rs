@@ -1500,10 +1500,14 @@ mod host_tool_arm_tests {
         );
         let value: serde_json::Value = serde_json::from_str(&envelope.to_string()).unwrap();
         let success = value["success"].as_bool().unwrap_or(false);
-        let response = value["response"]
-            .as_str()
-            .unwrap_or(if success { "" } else { "refused" })
-            .to_string();
+        // Failures surface the real denial reason (`error` field) so the
+        // assertions below pin WHICH deny path answered — a gate removal
+        // must not hide behind the missing-handler error.
+        let response = if success {
+            value["response"].as_str().unwrap_or("").to_string()
+        } else {
+            value["error"].as_str().unwrap_or("refused").to_string()
+        };
         (success, response)
     }
 
@@ -1527,8 +1531,11 @@ mod host_tool_arm_tests {
     fn host_tool_without_the_capability_is_refused() {
         let (success, response) = dispatch_with(&[], None, "anything");
         assert!(!success, "the grant gate must refuse");
+        // Pin the gate as the deny path (not the missing-handler one):
+        // if the TOOL_GRANTS row or the word check disappears, this
+        // assertion goes red instead of riding the handler refusal.
         assert!(
-            response.contains("refused") || response.contains("not declared"),
+            response.contains("capability denied") && response.contains("missing capability"),
             "{response}"
         );
     }
@@ -1550,10 +1557,7 @@ mod host_tool_arm_tests {
     fn host_tool_without_a_handler_fails_closed() {
         let (success, response) = dispatch_with(&["host.tool"], None, "plugin_resource_push");
         assert!(!success, "no handler = the arm stays closed");
-        assert!(
-            response.contains("not provided") || response.contains("refused"),
-            "{response}"
-        );
+        assert!(response.contains("not provided"), "{response}");
     }
 
     #[test]
