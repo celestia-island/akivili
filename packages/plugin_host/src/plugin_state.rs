@@ -193,6 +193,16 @@ pub trait HostApiProvider: Send + Sync + 'static {
         schema: String,
     ) -> Result<()>;
     fn subscribe_trigger(&self, plugin_name: &str, topic_pattern: &str) -> Result<()>;
+    /// Serve one `host-tool` dispatch call: `tool` names the host's own
+    /// inner tool and `params` is its JSON argument object. The arm is
+    /// gated by `host.tool`; WHICH inner tools a host serves is the
+    /// host's own allowlist (the default refuses everything, so hosts
+    /// without a lane keep the arm closed even when a manifest declares
+    /// the capability).
+    fn host_tool(&self, tool: String, params: String) -> Result<String> {
+        let _ = (tool, params);
+        bail!("host-tool dispatch is not provided by this host");
+    }
 }
 
 use crate::grants::GrantSet;
@@ -210,6 +220,7 @@ pub struct HostFunctions {
     http_client: reqwest::Client,
     network_guard: Arc<NetworkGuard>,
     pubsub_bus: Option<Arc<dyn PubSubBus>>,
+    host_tool_handler: Option<Arc<dyn Fn(String, String) -> Result<String> + Send + Sync>>,
     llm_service: Option<Arc<dyn LlmSubcallService>>,
     trigger_dispatcher: Option<Arc<dyn TriggerDispatcherHolder>>,
     /// Environment variables injected into every plugin sandbox. Holds the
@@ -249,6 +260,7 @@ impl HostFunctions {
             mcp_registry: Arc::new(PluginMcpRegistry::new()),
             http_client,
             network_guard: Arc::new(guard),
+            host_tool_handler: None,
             pubsub_bus: None,
             llm_service: None,
             trigger_dispatcher: None,
@@ -295,6 +307,18 @@ impl HostFunctions {
 
     pub fn with_trigger_dispatcher(mut self, dispatcher: Arc<dyn TriggerDispatcherHolder>) -> Self {
         self.trigger_dispatcher = Some(dispatcher);
+        self
+    }
+
+    /// Serves the `host-tool` dispatch arm: the closure receives the
+    /// inner tool name and its JSON params and answers the JSON result
+    /// string. Without it the arm answers "not provided" even when a
+    /// manifest declares `host.tool` (fail-closed).
+    pub fn with_host_tool_handler(
+        mut self,
+        handler: Arc<dyn Fn(String, String) -> Result<String> + Send + Sync>,
+    ) -> Self {
+        self.host_tool_handler = Some(handler);
         self
     }
 
@@ -566,6 +590,12 @@ impl HostApiProvider for HostFunctions {
             Ok(())
         } else {
             bail!("trigger dispatcher not configured")
+        }
+    }
+    fn host_tool(&self, tool: String, params: String) -> Result<String> {
+        match self.host_tool_handler.as_ref() {
+            Some(handler) => handler(tool, params),
+            None => bail!("host-tool dispatch is not provided by this host"),
         }
     }
 }

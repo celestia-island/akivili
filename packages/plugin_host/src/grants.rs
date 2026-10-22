@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use akivili_registry::capabilities::{
-    CAP_CONFIG_READ, CAP_EVENT_FORWARD, CAP_HTTP_EGRESS, CAP_KV_READ, CAP_KV_WRITE,
+    CAP_CONFIG_READ, CAP_EVENT_FORWARD, CAP_HOST_TOOL, CAP_HTTP_EGRESS, CAP_KV_READ, CAP_KV_WRITE,
     CAP_MCP_REGISTER, CAP_MESH_SUBSCRIBE, CAP_TOOL_REGISTER, Capability,
 };
 use serde_json::Value;
@@ -31,6 +31,7 @@ const TOOL_GRANTS: &[(&str, &str)] = &[
     ("config-get", CAP_CONFIG_READ),
     ("register-tool", CAP_TOOL_REGISTER),
     ("register-mcp-tool", CAP_MCP_REGISTER),
+    ("host-tool", CAP_HOST_TOOL),
     ("subscribe-trigger", CAP_MESH_SUBSCRIBE),
 ];
 
@@ -114,16 +115,24 @@ impl GrantSet {
             return None;
         }
 
+        // Dispatch tools that carry no capability word today: `query-ai`
+        // (its LLM subcall has no word in the closed v1 vocabulary — a
+        // documented gap tracked in the registry vocabulary's versioning
+        // process). Listed EXPLICITLY so a new arm that forgets its
+        // TOOL_GRANTS row fails closed instead of riding this list.
+        const UNGATED_TOOLS: &[&str] = &["query-ai"];
+        if UNGATED_TOOLS.contains(&tool) {
+            return None;
+        }
         let Some(word) = TOOL_GRANTS
             .iter()
             .find(|(t, _)| *t == tool)
             .map(|(_, w)| *w)
         else {
-            // Not a gated dispatch tool (e.g. `query-ai`, whose LLM
-            // subcall has no capability word in the closed v1
-            // vocabulary — a documented gap, tracked in the registry
-            // vocabulary's versioning process).
-            return None;
+            // Fail closed: a dispatch arm without a TOOL_GRANTS row is
+            // an authoring bug — refuse it rather than silently granting
+            // it to every plugin.
+            return Some(format!("unknown or ungated dispatch tool `{tool}`"));
         };
 
         let http_host: Option<String> = if word == CAP_HTTP_EGRESS {
