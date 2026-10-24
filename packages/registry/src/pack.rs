@@ -853,6 +853,161 @@ path = "agent.bin"
         );
     }
 
+    /// Ported from the superseded #65 lineage: the stale-replacement
+    /// guarantee at a manifest-DECLARED signature path (the default-path
+    /// case has its own test above).
+    #[test]
+    fn a_stale_signature_at_a_declared_path_is_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = fixture_package(root.path(), "pkg");
+        let manifest = fs::read_to_string(pkg.join(MANIFEST_FILE)).unwrap();
+        fs::write(
+            pkg.join(MANIFEST_FILE),
+            format!(
+                "{manifest}\n[trust]\nsignature = \"sigs/agent.sig\"\nmin-trust = \"signed\"\n"
+            ),
+        )
+        .unwrap();
+        // A stale signature from an earlier pack sits at the DECLARED
+        // path — the packer's own output location.
+        fs::create_dir_all(pkg.join("sigs")).unwrap();
+        fs::write(pkg.join("sigs/agent.sig"), [0u8; 64]).unwrap();
+
+        let key = SigningKey::generate(&mut OsRng);
+        let report = pack(&pkg, &root.path().join("store"), &key)
+            .expect("a stale sig at the declared path is replaced, not copied");
+
+        let sig = fs::read(report.bundle_dir.join("sigs/agent.sig")).unwrap();
+        assert_eq!(sig.len(), 64);
+        assert_ne!(
+            sig,
+            vec![0u8; 64],
+            "the bundle carries the fresh signature, not the stale bytes"
+        );
+        let registry = open_store(&root.path().join("store"), &key, &report.key_id);
+        assert!(
+            registry
+                .plugins()
+                .iter()
+                .any(|r| r.manifest.id == "pack-fixture"),
+            "the fresh signature must verify: {:?}",
+            registry.rejections()
+        );
+    }
+
+    /// Ported from the superseded #65 lineage.
+    #[test]
+    fn two_resources_on_one_file_sign_and_store_the_doubled_concat() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = fixture_package(root.path(), "pkg");
+        // Point the second resource at the SAME file as the first: the
+        // C4 concat then carries style.css's bytes twice, and both the
+        // signature and the store's re-assembly must agree on that.
+        let manifest = fs::read_to_string(pkg.join(MANIFEST_FILE)).unwrap();
+        fs::write(
+            pkg.join(MANIFEST_FILE),
+            manifest.replace("path = \"assets/theme.bin\"", "path = \"style.css\""),
+        )
+        .unwrap();
+
+        let key = SigningKey::generate(&mut OsRng);
+        let report =
+            pack(&pkg, &root.path().join("store"), &key).expect("same-file resources pack");
+
+        let registry = open_store(&root.path().join("store"), &key, &report.key_id);
+        assert!(
+            registry.rejections().is_empty(),
+            "the doubled concat must verify consistently: {:?}",
+            registry.rejections()
+        );
+        assert!(
+            registry
+                .plugins()
+                .iter()
+                .any(|r| r.manifest.id == "pack-fixture")
+        );
+        // The walk-based report counts the shared file once, and the
+        // sealed manifest pins the same digest on both entries.
+        assert_eq!(
+            report
+                .files
+                .iter()
+                .filter(|f| f.path == Path::new("style.css"))
+                .count(),
+            1
+        );
+        let sealed = fs::read_to_string(report.bundle_dir.join(MANIFEST_FILE)).unwrap();
+        assert_eq!(
+            sealed.matches(&sha256_hex(b"RESOURCE-STYLE")).count(),
+            2,
+            "both entries carry the same pin: {sealed}"
+        );
+    }
+
+    /// Ported from the superseded #65 lineage, adapted to #67: hosts may
+    /// now pin providers via [`crate::registry::RegistryOptions::require_signature_for`]
+    /// so their plugins can never ride the unsigned lane at all. This
+    /// test covers the (still-default) unpinned host: the signature
+    /// backstop removed — sig file deleted, `[trust]` stripped from the
+    /// sealed manifest (the manifest is outside the signed byte range by
+    /// design, so an attacker who can rewrite an installed bundle can
+    /// always do this) — and the store opened WITHOUT publisher keys.
+    /// The pinned digests the packer injected are then the only gate
+    /// left, so a one-byte payload tamper must still reject.
+    #[test]
+    fn pins_are_load_bearing_when_the_signature_lane_is_stripped() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = fixture_package(root.path(), "pkg");
+        let key = SigningKey::generate(&mut OsRng);
+        let report = pack(&pkg, &root.path().join("store"), &key).unwrap();
+
+        fs::remove_file(report.bundle_dir.join("pack-fixture.sig")).unwrap();
+        let sealed = fs::read_to_string(report.bundle_dir.join(MANIFEST_FILE)).unwrap();
+        let mut value: toml::Value = toml::from_str(&sealed).unwrap();
+        value.as_table_mut().unwrap().remove("trust");
+        fs::write(
+            report.bundle_dir.join(MANIFEST_FILE),
+            toml::to_string_pretty(&value).unwrap(),
+        )
+        .unwrap();
+
+        // Control: the stripped-but-honest bundle is still acceptable in
+        // the unsigned lane (this is what an unsigned dev plugin looks
+        // like) — the strip itself must not be what rejects.
+        let store = root.path().join("store");
+        let honest = Registry::open_quiet(&store, &root.path().join("audit-honest.jsonl")).unwrap();
+        assert!(
+            honest.rejections().is_empty(),
+            "the control must be clean: {:?}",
+            honest.rejections()
+        );
+        assert!(
+            honest
+                .plugins()
+                .iter()
+                .any(|r| r.manifest.id == "pack-fixture")
+        );
+
+        // Tamper one byte: no signature exists to catch it — the pin must.
+        fs::write(report.bundle_dir.join("style.css"), b"RESOURCE-STYLF").unwrap();
+        let tampered =
+            Registry::open_quiet(&store, &root.path().join("audit-tampered.jsonl")).unwrap();
+        assert!(
+            tampered
+                .rejections()
+                .iter()
+                .any(|r| r.reason.contains("sha256 mismatch")),
+            "the pin layer is load-bearing without signatures: {:?}",
+            tampered.rejections()
+        );
+        assert!(
+            tampered
+                .plugins()
+                .iter()
+                .all(|r| r.manifest.id != "pack-fixture")
+        );
+    }
+
     #[test]
     fn a_declared_trust_signature_path_is_honored() {
         let root = tempfile::tempdir().unwrap();
