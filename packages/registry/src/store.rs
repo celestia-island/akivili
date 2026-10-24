@@ -1058,6 +1058,68 @@ form = "web.resource"
         );
     }
 
+    /// WHICH key verified is load-bearing (R2's mutation: report the
+    /// list's FIRST key instead of the one that actually verified —
+    /// survived the single-key suite). With two configured keys, a
+    /// bundle signed by the second must report the second's id.
+    #[test]
+    fn the_reported_key_id_is_the_one_that_actually_verified() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::rngs::OsRng;
+
+        let wrong = SigningKey::generate(&mut OsRng);
+        let right = SigningKey::generate(&mut OsRng);
+        let root = trust_scan_root("key-which");
+        std::fs::create_dir_all(root.join("dual-key")).unwrap();
+        let manifest = r#"schema = 1
+id = "dual-key"
+version = "1.0.0"
+provider = "official"
+form = "web.resource"
+
+[trust]
+signature = "agent.sig"
+min-trust = "signed"
+"#;
+        std::fs::write(root.join("dual-key/akivili.plugin.toml"), manifest).unwrap();
+        std::fs::write(
+            root.join("dual-key/agent.sig"),
+            right.sign(manifest.as_bytes()).to_bytes(),
+        )
+        .unwrap();
+        // The WRONG key is listed first — a "report the first key"
+        // regression must fail this test.
+        let keys = vec![
+            crate::trust::PublisherKey {
+                key_id: "wrong-key".into(),
+                bytes: wrong.verifying_key().to_bytes(),
+            },
+            crate::trust::PublisherKey {
+                key_id: "right-key".into(),
+                bytes: right.verifying_key().to_bytes(),
+            },
+        ];
+        let results = scan_with_keys(
+            &root,
+            &EnabledState::default(),
+            crate::registry::DEFAULT_MAX_PAYLOAD_BYTES,
+            &keys,
+        )
+        .expect("scan runs");
+        let _ = std::fs::remove_dir_all(&root);
+        let reported = results.iter().find_map(|result| match result {
+            ScanResult::Accepted(record) if record.manifest.id == "dual-key" => {
+                Some(record.signed_by_key_id.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            reported,
+            Some(Some("right-key".to_string())),
+            "the reported key id must be the key that ACTUALLY verified, got {results:?}"
+        );
+    }
+
     /// The record surfaces WHICH anchor key verified (W11-3's
     /// signature-aware host policy depends on it).
     #[test]
