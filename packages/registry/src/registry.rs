@@ -35,6 +35,16 @@ pub struct RegistryOptions {
     /// (fail-closed). Empty (the default) keeps the unsigned lane:
     /// demanding plugins are rejected regardless, unsigned ones load.
     pub(crate) publisher_keys: Vec<crate::trust::PublisherKey>,
+    /// Providers that must ship a verifying signature regardless of what
+    /// their own `[trust]` section says (the host-side half of C4): the
+    /// trust demand lives inside the verified artifact, so an attacker who
+    /// can rewrite a bundle can delete the section — a host pins the
+    /// providers it refuses to load unsigned. Empty (the default) keeps
+    /// the artifact-driven behavior. Setting a provider here only makes
+    /// sense together with [`Self::publisher_keys`]: without keys no
+    /// signature can verify, so every plugin of that provider is rejected
+    /// (fail-closed).
+    pub(crate) required_signed_providers: Vec<String>,
 }
 
 impl Default for RegistryOptions {
@@ -43,6 +53,7 @@ impl Default for RegistryOptions {
             audit_scan_replay: true,
             max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
             publisher_keys: Vec::new(),
+            required_signed_providers: Vec::new(),
         }
     }
 }
@@ -56,6 +67,17 @@ impl RegistryOptions {
     /// Sets the publisher keys for the distribution trust gate (C4).
     pub fn publisher_keys(mut self, keys: Vec<crate::trust::PublisherKey>) -> Self {
         self.publisher_keys = keys;
+        self
+    }
+
+    /// Pins one provider as must-sign: its plugins are rejected unless a
+    /// signature verifies under the configured [`Self::publisher_keys`],
+    /// whatever the plugin's own `[trust]` section claims. Repeatable for
+    /// multiple providers.
+    pub fn require_signature_for(mut self, provider: &str) -> Self {
+        if !self.required_signed_providers.iter().any(|p| p == provider) {
+            self.required_signed_providers.push(provider.to_string());
+        }
         self
     }
 
@@ -200,16 +222,13 @@ impl Registry {
 
         let state_path = store_dir.join(STATE_FILE);
         let state = EnabledState::load(&state_path)?;
-        let scan = if options.publisher_keys.is_empty() {
-            store::scan(store_dir, &state, options.max_payload_bytes)?
-        } else {
-            store::scan_with_keys(
-                store_dir,
-                &state,
-                options.max_payload_bytes,
-                &options.publisher_keys,
-            )?
-        };
+        let scan = store::scan_with_policy(
+            store_dir,
+            &state,
+            options.max_payload_bytes,
+            &options.publisher_keys,
+            &options.required_signed_providers,
+        )?;
 
         let mut records = Vec::new();
         let mut rejections = Vec::new();
@@ -1905,6 +1924,54 @@ sha256 = "{}"
         );
     }
     // ── The publisher-keys builder option (C4-3) ───────────────────
+
+    /// The builder-side face of the signature policy: an unsigned plugin
+    /// of a pinned provider is absent from the accepted set.
+    #[test]
+    fn the_builder_signature_policy_rejects_unsigned_pinned_providers() {
+        use crate::trust::PublisherKey;
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::rngs::OsRng;
+
+        let root = std::env::temp_dir().join(format!(
+            "akivili-reg-policy-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let plugin = root.join("plugins/unsigned-official");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(
+            plugin.join("akivili.plugin.toml"),
+            r#"schema = 1
+id = "unsigned-official"
+version = "1.0.0"
+provider = "official"
+form = "web.resource"
+"#,
+        )
+        .unwrap();
+        let signing = SigningKey::generate(&mut OsRng);
+        let _ = signing.sign(b"irrelevant"); // keys configured, plugin unsigned
+        let audit = root.join("audit.jsonl");
+        let registry = Registry::options()
+            .publisher_keys(vec![PublisherKey {
+                key_id: "builder-policy-key".into(),
+                bytes: signing.verifying_key().to_bytes(),
+            }])
+            .require_signature_for("official")
+            .open(&root.join("plugins"), &audit)
+            .expect("the keyed lane opens");
+        assert!(
+            registry
+                .plugins()
+                .iter()
+                .all(|record| record.manifest.id != "unsigned-official"),
+            "the unsigned pinned provider must be absent from the accepted set"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn the_builder_keys_switch_the_scan_into_the_trust_lane() {
