@@ -1010,6 +1010,42 @@ form = "web.resource"
         );
     }
 
+    /// A pin without keys must fail closed, not silently widen into the
+    /// unsigned lane (R2's mutation M-R2 survived the suite before this
+    /// test: the code path was correct but unpinned by a test).
+    #[test]
+    fn a_pin_without_keys_fails_closed() {
+        let root = trust_scan_root("policy-nokeys");
+        std::fs::create_dir_all(root.join("unsigned-official")).unwrap();
+        std::fs::write(
+            root.join("unsigned-official/akivili.plugin.toml"),
+            r#"schema = 1
+id = "unsigned-official"
+version = "1.0.0"
+provider = "official"
+form = "web.resource"
+"#,
+        )
+        .unwrap();
+        let results = scan_with_policy(
+            &root,
+            &EnabledState::default(),
+            crate::registry::DEFAULT_MAX_PAYLOAD_BYTES,
+            &[], // no publisher keys configured
+            &["official".to_string()],
+        )
+        .expect("scan runs");
+        let _ = std::fs::remove_dir_all(&root);
+        let hit = results.iter().any(|result| match result {
+            ScanResult::Rejected(rejection) => rejection.reason.contains("signature policy"),
+            _ => false,
+        });
+        assert!(
+            hit,
+            "a pin without keys must reject the pinned provider's plugins, got {results:?}"
+        );
+    }
+
     /// The policy accepts what it demands: a signed plugin of the pinned
     /// provider scans in under its key (and a third-party provider stays
     /// out of the policy's reach).
