@@ -11,6 +11,7 @@
 //! akivili-plugin [--store <dir>] [--audit <path>] disable <id>
 //! akivili-plugin [--store <dir>] [--audit <path>] audit [N]
 //! akivili-plugin validate <manifest-path>
+//! akivili-plugin pack <package-dir> [--out <dir>] [--insecure-dev-key]
 //! ```
 //!
 //! `--store` defaults to `./plugins`; `--audit` defaults to
@@ -18,11 +19,16 @@
 //! scan produced rejections. `list` opens the registry quietly (no scan
 //! replay into the audit log); `check`/`enable`/`disable` keep the full
 //! open, so management actions leave their scan trail. `audit` reads the
-//! log directly and never opens the registry at all.
+//! log directly and never opens the registry at all. `pack` seals a
+//! package directory into a store-installable bundle (see
+//! [`crate::pack`]); it needs no store — the signing key comes from the
+//! `AKIVILI_SIGNING_KEY` env var (64 hex chars) or, for local seeding
+//! only, the loudly-marked `--insecure-dev-key` escape hatch.
 
 use std::path::{Path, PathBuf};
 
 use crate::error::RegistryResult;
+use crate::pack::SIGNING_KEY_ENV;
 use crate::registry::Registry;
 use crate::store::PluginRecord;
 
@@ -32,6 +38,9 @@ pub const DEFAULT_STORE_DIR: &str = "plugins";
 pub const DEFAULT_AUDIT_FILE: &str = "registry-audit.jsonl";
 /// Default number of trailing audit lines shown by `audit`.
 pub const DEFAULT_AUDIT_TAIL: usize = 20;
+/// Default output directory for `pack` bundles (relative to the working
+/// directory); the bundle lands in `<out>/<plugin-id>/`.
+pub const DEFAULT_PACK_OUT_DIR: &str = "dist";
 
 /// Resolved CLI paths.
 #[derive(Debug, Clone, PartialEq)]
@@ -166,6 +175,94 @@ pub fn check_has_failures(registry: &Registry) -> bool {
     !registry.rejections().is_empty()
 }
 
+/// The resolved arguments of a `pack` invocation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackArgs {
+    /// The package directory to pack (an `akivili.plugin.toml` inside).
+    pub package_dir: PathBuf,
+    /// Where the bundle directory is created (`<out>/<plugin-id>/`).
+    pub out_dir: PathBuf,
+    /// Whether `--insecure-dev-key` was passed (ephemeral local-seeding
+    /// key when no `AKIVILI_SIGNING_KEY` is set).
+    pub insecure_dev_key: bool,
+}
+
+/// Parses the positional tail of a `pack` command:
+/// `<package-dir> [--out <dir>] [--insecure-dev-key]`.
+pub fn parse_pack_args(positional: &[String]) -> Result<PackArgs, String> {
+    let package_dir = positional
+        .first()
+        .ok_or_else(|| "pack requires a package directory".to_string())?;
+    let mut out_dir: Option<PathBuf> = None;
+    let mut insecure_dev_key = false;
+    let mut iter = positional[1..].iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--out" => {
+                let value = iter.next().ok_or("--out requires a value")?;
+                out_dir = Some(PathBuf::from(value));
+            }
+            "--insecure-dev-key" => insecure_dev_key = true,
+            other => return Err(format!("unknown pack argument '{other}'")),
+        }
+    }
+    Ok(PackArgs {
+        package_dir: PathBuf::from(package_dir),
+        out_dir: out_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_PACK_OUT_DIR)),
+        insecure_dev_key,
+    })
+}
+
+/// Runs one `pack` invocation with an explicit environment value (the
+/// process env is read by the caller, so tests stay pure). Prints the
+/// report on success; returns the process exit code.
+pub fn run_pack(args: &PackArgs, env_value: Option<&str>) -> i32 {
+    let resolved = match crate::pack::resolve_signing_key(env_value, args.insecure_dev_key) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            eprintln!("akivili-plugin: pack: {e}");
+            return 2;
+        }
+    };
+    let report = if resolved.insecure_dev {
+        match crate::pack::pack_dev_key(&args.package_dir, &args.out_dir) {
+            Ok((report, dev_key)) => {
+                // The ephemeral seed is announced once for local
+                // re-seeding — loudly marked, never persisted anywhere.
+                eprintln!(
+                    "!! INSECURE-DEV-KEY seed (hex, save to re-sign, NEVER production): {}",
+                    hex_seed(&dev_key.to_bytes())
+                );
+                report
+            }
+            Err(e) => {
+                eprintln!("akivili-plugin: pack: {e}");
+                return 2;
+            }
+        }
+    } else {
+        match crate::pack::pack(&args.package_dir, &args.out_dir, &resolved.key) {
+            Ok(report) => report,
+            Err(e) => {
+                eprintln!("akivili-plugin: pack: {e}");
+                return 2;
+            }
+        }
+    };
+    print!("{}", report.summary());
+    0
+}
+
+/// Hex-encodes a 32-byte Ed25519 seed (the `AKIVILI_SIGNING_KEY` shape).
+fn hex_seed(seed: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for byte in seed {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// Returns the last `n` audit lines (each a JSON object), oldest first.
 pub fn audit_tail(path: &Path, n: usize) -> RegistryResult<String> {
     let text = std::fs::read_to_string(path)?;
@@ -194,8 +291,11 @@ pub fn usage() -> String {
          enable <id>          enable a plugin\n  \
          disable <id>         disable a plugin\n  \
          audit [N]            show the last N audit events (default {DEFAULT_AUDIT_TAIL})\n  \
-         validate <path>      parse and validate one manifest file (no store needed)\n\n\
-         defaults: --store ./{DEFAULT_STORE_DIR}  --audit <store>/{DEFAULT_AUDIT_FILE}\n"
+         validate <path>      parse and validate one manifest file (no store needed)\n  \
+         pack <dir> [--out <dir>] [--insecure-dev-key]\n  \
+         seal a package directory into a store-installable signed bundle\n\n\
+         defaults: --store ./{DEFAULT_STORE_DIR}  --audit <store>/{DEFAULT_AUDIT_FILE}\n  \
+         pack: --out ./{DEFAULT_PACK_OUT_DIR}  key from {SIGNING_KEY_ENV} (64 hex chars)\n"
     )
 }
 
@@ -289,6 +389,14 @@ fn run_inner(args: &[String]) -> Result<i32, String> {
                 }
                 Err(e) => Err(format!("cannot read audit log: {e}")),
             }
+        }
+        "pack" => {
+            // No store, no audit: the packer works off the package
+            // directory alone. The env value is threaded in so the
+            // logic stays testable without touching process state.
+            let pack_args = parse_pack_args(&positional[1..])?;
+            let env_value = std::env::var(crate::pack::SIGNING_KEY_ENV).ok();
+            Ok(run_pack(&pack_args, env_value.as_deref()))
         }
         other => Err(format!("unknown command '{other}'")),
     }
@@ -533,9 +641,124 @@ primary = "#181825"
     #[test]
     fn usage_lists_every_command() {
         let text = usage();
-        for command in ["list", "check", "enable", "disable", "audit", "validate"] {
+        for command in [
+            "list", "check", "enable", "disable", "audit", "validate", "pack",
+        ] {
             assert!(text.contains(command), "usage must mention {command}");
         }
+        assert!(
+            text.contains(SIGNING_KEY_ENV),
+            "usage must name the signing-key env var"
+        );
+    }
+
+    #[test]
+    fn parse_pack_args_defaults_and_flags() {
+        let args = parse_pack_args(&["pkg".to_string()]).expect("positional-only parses");
+        assert_eq!(args.package_dir, PathBuf::from("pkg"));
+        assert_eq!(args.out_dir, PathBuf::from(DEFAULT_PACK_OUT_DIR));
+        assert!(!args.insecure_dev_key);
+
+        let args = parse_pack_args(&[
+            "pkg".to_string(),
+            "--out".to_string(),
+            "/tmp/o".to_string(),
+            "--insecure-dev-key".to_string(),
+        ])
+        .expect("flags parse");
+        assert_eq!(args.out_dir, PathBuf::from("/tmp/o"));
+        assert!(args.insecure_dev_key);
+
+        assert!(parse_pack_args(&[]).is_err(), "package dir is required");
+        assert!(
+            parse_pack_args(&["p".to_string(), "--out".to_string()]).is_err(),
+            "dangling --out"
+        );
+        assert!(
+            parse_pack_args(&["p".to_string(), "--wat".to_string()]).is_err(),
+            "unknown flag"
+        );
+    }
+
+    /// A minimal packable package for the CLI-level tests.
+    fn pack_fixture(dir: &std::path::Path) -> PathBuf {
+        let pkg = dir.join("clipack");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join(crate::manifest::MANIFEST_FILE),
+            r#"schema = 1
+id = "clipack"
+version = "1.0.0"
+provider = "official"
+form = "web.resource"
+
+[[resources]]
+kind = "webui.style"
+[resources.payload.File]
+path = "style.css"
+"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("style.css"), b"body {}").unwrap();
+        pkg
+    }
+
+    #[test]
+    fn run_pack_without_a_key_refuses() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = pack_fixture(root.path());
+        let args = PackArgs {
+            package_dir: pkg,
+            out_dir: root.path().join("dist"),
+            insecure_dev_key: false,
+        };
+        assert_eq!(run_pack(&args, None), 2, "missing key must refuse");
+        assert!(
+            !args.out_dir.join("clipack").exists(),
+            "no bundle on refusal"
+        );
+    }
+
+    #[test]
+    fn run_pack_with_an_env_key_or_dev_key_succeeds() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = pack_fixture(root.path());
+
+        // Env key lane.
+        let signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut hex_seed = String::new();
+        for byte in signing.to_bytes() {
+            use std::fmt::Write as _;
+            let _ = write!(hex_seed, "{byte:02x}");
+        }
+        let args = PackArgs {
+            package_dir: pkg.clone(),
+            out_dir: root.path().join("dist"),
+            insecure_dev_key: false,
+        };
+        assert_eq!(run_pack(&args, Some(&hex_seed)), 0, "env key packs");
+        assert!(args.out_dir.join("clipack").exists());
+        // The env lane is not dev-marked.
+        assert_eq!(
+            run_pack(
+                &PackArgs {
+                    package_dir: pkg.clone(),
+                    out_dir: root.path().join("dist2"),
+                    insecure_dev_key: false,
+                },
+                Some(&hex_seed)
+            ),
+            0
+        );
+
+        // Dev key lane.
+        let dev_args = PackArgs {
+            package_dir: pkg,
+            out_dir: root.path().join("dist3"),
+            insecure_dev_key: true,
+        };
+        assert_eq!(run_pack(&dev_args, None), 0, "dev key packs");
+        assert!(dev_args.out_dir.join("clipack").exists());
     }
 
     #[test]
