@@ -106,6 +106,7 @@ pub mod handle;
 pub mod kinds;
 pub mod lanes;
 pub mod manifest;
+pub mod pack;
 pub mod registry;
 pub mod store;
 pub mod trust;
@@ -123,5 +124,6 @@ pub use manifest::{
     Payload, PluginManifest, ResourceEntry, RollbackPolicy, SCHEMA, Surface, SystemSection,
     TrustSection, UnknownVersionPolicy, UpgradeMode, UpgradeSection, UpgradeStrategy,
 };
+pub use pack::{PackError, PackReport, ResolvedKey, SIGNING_KEY_ENV};
 pub use registry::{DEFAULT_MAX_PAYLOAD_BYTES, Registry, RegistryOptions};
 pub use store::{PluginRecord, Rejection, ScanResult};

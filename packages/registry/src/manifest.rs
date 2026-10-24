@@ -1238,11 +1238,25 @@ impl MigrationEntry {
                 self.id
             )));
         }
-        if self.up.as_os_str().is_empty() {
-            return Err(RegistryError::InvalidManifest(format!(
-                "migration {} must carry an 'up' path",
-                self.id
-            )));
+        for (label, path) in [("up", Some(&self.up)), ("down", self.down.as_ref())] {
+            let Some(path) = path else { continue };
+            if path.as_os_str().is_empty() {
+                return Err(RegistryError::InvalidManifest(format!(
+                    "migration {} must carry a non-empty '{label}' path",
+                    self.id
+                )));
+            }
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+                return Err(RegistryError::InvalidManifest(format!(
+                    "migration {} '{label}' path '{}' must be a relative path inside the plugin directory",
+                    self.id,
+                    path.display()
+                )));
+            }
         }
         if !is_sha256_hex(&self.sha256) {
             return Err(RegistryError::InvalidManifest(format!(

@@ -1921,9 +1921,7 @@ sha256 = "{}"
         ));
         let plugin = root.join("plugins/signed-plugin");
         std::fs::create_dir_all(&plugin).unwrap();
-        std::fs::write(
-            plugin.join("akivili.plugin.toml"),
-            r#"schema = 1
+        let manifest = r#"schema = 1
 id = "signed-plugin"
 version = "1.0.0"
 provider = "official"
@@ -1932,11 +1930,11 @@ form = "web.vue-module"
 [trust]
 signature = "agent.sig"
 min-trust = "signed"
-"#,
-        )
-        .unwrap();
+"#;
+        std::fs::write(plugin.join("akivili.plugin.toml"), manifest).unwrap();
         let signing = SigningKey::generate(&mut OsRng);
-        let signature = signing.sign(b"");
+        // C4 v2: no payload files, so the signed stream is the manifest.
+        let signature = signing.sign(manifest.as_bytes());
         std::fs::write(plugin.join("agent.sig"), signature.to_bytes()).unwrap();
         let audit = root.join("audit.jsonl");
 
@@ -2356,12 +2354,10 @@ path = "agent.bin"
         std::fs::write(plugin.join("style.css"), b"RESOURCE").unwrap();
         std::fs::write(plugin.join("agent.bin"), b"ATTACHMENT").unwrap();
 
-        // Correct order: resource bytes ‖ attachment bytes.
-        std::fs::write(
-            plugin.join("agent.sig"),
-            signing.sign(b"RESOURCEATTACHMENT").to_bytes(),
-        )
-        .unwrap();
+        // Correct order: manifest bytes ‖ resource bytes ‖ attachment bytes.
+        let mut signed = manifest.as_bytes().to_vec();
+        signed.extend_from_slice(b"RESOURCEATTACHMENT");
+        std::fs::write(plugin.join("agent.sig"), signing.sign(&signed).to_bytes()).unwrap();
         let registry = Registry::options()
             .publisher_keys(vec![PublisherKey {
                 key_id: "concat-key".into(),
@@ -2377,10 +2373,13 @@ path = "agent.bin"
             "the resources‖attachments signature must verify"
         );
 
-        // Wrong order (attachments‖resources): the plugin fails closed.
+        // Wrong order (manifest‖attachments‖resources): the plugin
+        // fails closed.
+        let mut wrong_order = manifest.as_bytes().to_vec();
+        wrong_order.extend_from_slice(b"ATTACHMENTRESOURCE");
         std::fs::write(
             plugin.join("agent.sig"),
-            signing.sign(b"ATTACHMENTRESOURCE").to_bytes(),
+            signing.sign(&wrong_order).to_bytes(),
         )
         .unwrap();
         let wrong = Registry::options()

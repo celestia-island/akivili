@@ -338,9 +338,15 @@ fn validate_dir(
         ));
     }
 
-    // The payload assembly for the trust gate: resource file bytes in
-    // manifest order (the C4 concatenation contract).
+    // The payload assembly for the trust gate (C4 v2): the manifest
+    // bytes first, then resource file bytes in manifest order, then
+    // attachment file bytes in manifest order, then migration file bytes
+    // (`up` then `down` per migration). `raw` is the exact on-disk text
+    // the packer signed after sealing — any post-seal manifest edit
+    // (migrations, agents, capabilities, trust removal) changes this
+    // stream and fails the signature.
     let mut payload_bytes: Vec<u8> = Vec::new();
+    payload_bytes.extend_from_slice(raw.as_bytes());
     for entry in &manifest.resources {
         if let Payload::File { path, sha256 } = &entry.payload {
             let full = match confined_payload_path(dir, path) {
@@ -424,6 +430,66 @@ fn validate_dir(
                     ));
                 }
             }
+            payload_bytes.extend_from_slice(&bytes);
+        }
+    }
+    // Migration files join the signed stream after attachments. The up
+    // file is digest-checked against the (now signed) manifest; the
+    // optional down file rides the signature without a declared digest
+    // (the signature covers its bytes, so any post-seal edit fails).
+    for migration in &manifest.migrations {
+        let up_label = format!("migration '{}' up", migration.id);
+        let full = match confined_payload_path(dir, &migration.up) {
+            Ok(full) => full,
+            Err(reason) => {
+                return Err(reject(
+                    Some(manifest.id.clone()),
+                    format!("payload rejected for {up_label}: {reason}"),
+                ));
+            }
+        };
+        let bytes = match read_capped(&full, max_payload_bytes) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Err(reject(
+                    Some(manifest.id.clone()),
+                    format!("payload rejected for {up_label}: {}", e.reason(&full)),
+                ));
+            }
+        };
+        let actual = sha256_hex(&bytes);
+        if migration.sha256 != actual {
+            return Err(reject(
+                Some(manifest.id.clone()),
+                format!(
+                    "sha256 mismatch for {up_label} '{}': declared {}, actual {actual}",
+                    migration.up.display(),
+                    migration.sha256
+                ),
+            ));
+        }
+        payload_bytes.extend_from_slice(&bytes);
+
+        if let Some(down) = &migration.down {
+            let down_label = format!("migration '{}' down", migration.id);
+            let full = match confined_payload_path(dir, down) {
+                Ok(full) => full,
+                Err(reason) => {
+                    return Err(reject(
+                        Some(manifest.id.clone()),
+                        format!("payload rejected for {down_label}: {reason}"),
+                    ));
+                }
+            };
+            let bytes = match read_capped(&full, max_payload_bytes) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Err(reject(
+                        Some(manifest.id.clone()),
+                        format!("payload rejected for {down_label}: {}", e.reason(&full)),
+                    ));
+                }
+            };
             payload_bytes.extend_from_slice(&bytes);
         }
     }
@@ -863,15 +929,14 @@ sha256 = "{sha_b}"
         use rand::rngs::OsRng;
 
         let signing = SigningKey::generate(&mut OsRng);
-        // The payload is resource bytes in manifest order — alpha then
-        // beta, a NON-empty ordered body.
-        let signature = signing.sign(b"alpha payload bytesbeta payload bytes");
+        // C4 v2: the sealed manifest bytes lead, then resource bytes in
+        // manifest order — alpha then beta, a NON-empty ordered body.
+        let manifest = two_file_trust_manifest();
+        let mut signed = manifest.as_bytes().to_vec();
+        signed.extend_from_slice(b"alpha payload bytesbeta payload bytes");
+        let signature = signing.sign(&signed);
         let root = trust_scan_root("ok");
-        std::fs::write(
-            root.join("signed-plugin/akivili.plugin.toml"),
-            two_file_trust_manifest(),
-        )
-        .unwrap();
+        std::fs::write(root.join("signed-plugin/akivili.plugin.toml"), &manifest).unwrap();
         std::fs::write(root.join("signed-plugin/alpha.bin"), b"alpha payload bytes").unwrap();
         std::fs::write(root.join("signed-plugin/beta.bin"), b"beta payload bytes").unwrap();
         std::fs::write(root.join("signed-plugin/agent.sig"), signature.to_bytes()).unwrap();
