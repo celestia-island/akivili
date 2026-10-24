@@ -114,12 +114,27 @@ pub struct SandboxEnvFeed {
 }
 
 impl SandboxEnvFeed {
-    /// Opens the feed against a plugin store and its audit log.
+    /// Opens the feed against a plugin store with HOST-ANCHORED
+    /// [`RegistryOptions`] — the production entry point.
     ///
-    /// A missing store directory degrades to an empty feed (see the module
-    /// docs); everything else fails loudly. Feeding and loading audit
-    /// `fed`/`loaded` events into the JSONL log like any other host.
-    pub fn open(store_dir: &Path, audit_path: &Path) -> Result<Self> {
+    /// This is the open site scepter and every other production host
+    /// MUST use: the caller supplies the trust configuration (publisher
+    /// keys, must-sign provider policy, quiet/audit and payload-cap
+    /// knobs), so signature-demanding plugins verify instead of being
+    /// rejected by a keyless lane — the fourth store-open site #624
+    /// missed, which made both node-3 instances refuse all 15 official
+    /// signed bundles ("trust gate: signature mismatch": 45 discovered,
+    /// 45 rejected).
+    ///
+    /// A missing store directory degrades to an empty feed (see the
+    /// module docs); everything else fails loudly. Feeding and loading
+    /// audit `fed`/`loaded` events into the JSONL log like any other
+    /// host.
+    pub fn open_with(
+        options: akivili_registry::RegistryOptions,
+        store_dir: &Path,
+        audit_path: &Path,
+    ) -> Result<Self> {
         if !store_dir.exists() {
             info!(
                 store = %store_dir.display(),
@@ -132,7 +147,8 @@ impl SandboxEnvFeed {
             });
         }
 
-        let registry = Registry::open(store_dir, audit_path)
+        let registry = options
+            .open(store_dir, audit_path)
             .with_context(|| format!("cannot open plugin registry at {}", store_dir.display()))?;
         let (handles, env) = Self::pull(&registry)?;
         Ok(Self {
@@ -140,6 +156,22 @@ impl SandboxEnvFeed {
             handles,
             env,
         })
+    }
+
+    /// Opens the feed with DEFAULT (keyless, scan-replay-audited)
+    /// registry options.
+    ///
+    /// **Tests and CLIs only**: a keyless open runs the unsigned trust
+    /// lane, so signature-demanding plugins are rejected (and host-side
+    /// must-sign pins are absent). Production hosts must pass their
+    /// anchored trust configuration through
+    /// [`SandboxEnvFeed::open_with`] instead.
+    pub fn open(store_dir: &Path, audit_path: &Path) -> Result<Self> {
+        Self::open_with(
+            akivili_registry::RegistryOptions::new(),
+            store_dir,
+            audit_path,
+        )
     }
 
     /// Feeds the acceptance, loads each fed resource (handles kept), and
@@ -596,5 +628,92 @@ var handleRequest = function(method, path, headers, body) {
             anyhow::Ok(())
         })?;
         Ok(())
+    }
+
+    // ── open_with: the anchored (production) open ─────────────────────
+
+    /// Adds a signature-DEMANDING `sandbox.env` plugin to the store:
+    /// `[trust] signature/min-trust = signed`, `agent.sig` holding the
+    /// throwaway key's signature over the manifest (inline payloads
+    /// only, so the signed stream is the manifest itself). This is the
+    /// production-incident shape: an official bundle that legitimately
+    /// demands a signature.
+    fn add_demanding_plugin(store: &TestStore, signing: &ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        let manifest = r#"schema = 1
+id = "signedenv"
+version = "0.1.0"
+provider = "official"
+form = "web.resource"
+
+[trust]
+signature = "agent.sig"
+min-trust = "signed"
+
+[[resources]]
+kind = "sandbox.env"
+order = 1
+
+[resources.payload.Inline]
+AKIVILI_SIGNED = "yes"
+"#;
+        let dir = store.root.path().join("signedenv");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("akivili.plugin.toml"), manifest).unwrap();
+        let sig = signing.sign(manifest.as_bytes());
+        std::fs::write(dir.join("agent.sig"), sig.to_bytes()).unwrap();
+    }
+
+    #[test]
+    fn open_with_honors_the_anchor_where_bare_open_rejects() {
+        use akivili_registry::trust::PublisherKey;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let store = TestStore::new();
+        let signing = SigningKey::generate(&mut OsRng);
+        add_demanding_plugin(&store, &signing);
+
+        // Anchored open: the key verifies the signature, the plugin
+        // feeds its sandbox env (the lane production needs).
+        let options = akivili_registry::RegistryOptions::new().publisher_keys(vec![PublisherKey {
+            key_id: "test-anchor".into(),
+            bytes: signing.verifying_key().to_bytes(),
+        }]);
+        let feed =
+            SandboxEnvFeed::open_with(options, store.store_dir(), &store.audit_path()).unwrap();
+        assert_eq!(feed.resource_count(), 1, "the signed plugin must feed");
+        assert_eq!(feed.env()["AKIVILI_SIGNED"], "yes");
+
+        // The SAME store via the keyless default lane: the demanding
+        // plugin fails closed — the production incident shape (both
+        // node-3 instances rejected all 15 official bundles with
+        // "trust gate: signature mismatch").
+        let bare = SandboxEnvFeed::open(store.store_dir(), &store.audit_path()).unwrap();
+        assert_eq!(
+            bare.resource_count(),
+            0,
+            "a keyless open must not feed the demanding plugin"
+        );
+        assert!(bare.env().is_empty(), "nothing fed, nothing merged");
+    }
+
+    #[test]
+    fn open_with_missing_store_dir_still_degrades_gracefully() {
+        let store = TestStore::new();
+        let missing = store.root.path().join("missing-store");
+
+        let feed = SandboxEnvFeed::open_with(
+            akivili_registry::RegistryOptions::new(),
+            &missing,
+            &store.audit_path(),
+        )
+        .unwrap();
+        assert!(feed.env().is_empty(), "degraded feed must be empty");
+        assert_eq!(feed.resource_count(), 0);
+        assert!(
+            feed.registry().is_none(),
+            "no registry handle in the degraded case"
+        );
     }
 }
