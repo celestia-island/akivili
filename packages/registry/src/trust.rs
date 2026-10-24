@@ -6,10 +6,13 @@
 //! manifest order, every attachment file's bytes in manifest order, and
 //! every migration file's bytes (`up` then `down`, in manifest order).
 //! The manifest leads the stream so a post-seal edit of `[[migrations]]`,
-//! `[[agents]]`, `capabilities`, or `[trust]` itself cannot verify. A
-//! plugin demanding trust (`min-trust` above unsigned, or an explicit
-//! signature path) fails closed: missing file, malformed bytes, or a
-//! key mismatch all refuse the load.
+//! `[[agents]]`, or `capabilities` cannot verify **while `[trust]` remains
+//! present**. Removing the `[trust]` section removes the demand itself —
+//! the gate never runs — so a host that requires signatures must enforce
+//! that independently of the plugin's own declaration. A plugin that does
+//! demand trust (`min-trust` above unsigned, or an explicit signature
+//! path) fails closed: missing file, malformed bytes, or a key mismatch
+//! all refuse the load.
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 

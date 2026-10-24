@@ -1130,11 +1130,16 @@ path = "agent.bin"
         fs::create_dir_all(pkg.join("migrations")).unwrap();
         let sql = b"CREATE TABLE t (id int);\n";
         let manifest = format!(
-            "schema = 1\nid = \"migration-fixture\"\nversion = \"1.0.0\"\nprovider = \"official\"\nform = \"web.vue-module\"\n\n[[migrations]]\nid = \"0001-init\"\nengine = \"sql\"\nup = \"migrations/0001_init.up.sql\"\nsha256 = \"{}\"\n",
+            "schema = 1\nid = \"migration-fixture\"\nversion = \"1.0.0\"\nprovider = \"official\"\nform = \"web.vue-module\"\n\n[[migrations]]\nid = \"0001-init\"\nengine = \"sql\"\nup = \"migrations/0001_init.up.sql\"\ndown = \"migrations/0001_init.down.sql\"\nsha256 = \"{}\"\n",
             sha256_hex(sql)
         );
         fs::write(pkg.join(MANIFEST_FILE), manifest).unwrap();
         fs::write(pkg.join("migrations/0001_init.up.sql"), sql).unwrap();
+        fs::write(
+            pkg.join("migrations/0001_init.down.sql"),
+            b"DROP TABLE t;\n",
+        )
+        .unwrap();
 
         let key = SigningKey::generate(&mut OsRng);
         let out = root.path().join("store");
@@ -1164,6 +1169,50 @@ path = "agent.bin"
                 .all(|record| record.manifest.id != "migration-fixture"),
             "a tampered migration file must fail closed"
         );
+
+        // Restore the up file and tamper the DOWN file instead: down
+        // bytes are in the C4 v2 stream (no declared digest, so the
+        // signature is the only guard) and must be load-bearing.
+        fs::write(report.bundle_dir.join("migrations/0001_init.up.sql"), sql).unwrap();
+        fs::write(
+            report.bundle_dir.join("migrations/0001_init.down.sql"),
+            b"DROP TABLE t; -- tampered\n",
+        )
+        .unwrap();
+        let down_tampered = open_store(&out, &key, "migration-key");
+        assert!(
+            down_tampered
+                .plugins()
+                .iter()
+                .all(|record| record.manifest.id != "migration-fixture"),
+            "a tampered down-migration file must fail closed"
+        );
+    }
+
+    /// P2 (R1 find): an absolute migration path must be refused as
+    /// well (the `..` case has its own test).
+    #[test]
+    fn an_absolute_migration_path_refuses() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = root.path().join("pkg");
+        fs::create_dir_all(&pkg).unwrap();
+        let manifest = r#"schema = 1
+id = "absolute-fixture"
+version = "1.0.0"
+provider = "official"
+form = "web.vue-module"
+
+[[migrations]]
+id = "0001-init"
+engine = "sql"
+up = "/etc/passwd"
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#;
+        fs::write(pkg.join(MANIFEST_FILE), manifest).unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let err = pack(&pkg, &root.path().join("store"), &key)
+            .expect_err("an absolute migration path must refuse");
+        assert!(err.to_string().contains("relative path"), "{err}");
     }
 
     /// P2 (R1 find): a migration path may not escape the package.
