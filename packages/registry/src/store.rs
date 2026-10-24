@@ -255,6 +255,21 @@ pub fn scan_with_keys(
     max_payload_bytes: u64,
     publisher_keys: &[crate::trust::PublisherKey],
 ) -> RegistryResult<Vec<ScanResult>> {
+    scan_with_policy(root, state, max_payload_bytes, publisher_keys, &[])
+}
+
+/// [`scan_with_keys`] plus the host-side signature policy: every plugin
+/// whose `provider` is listed in `required_signed_providers` must carry a
+/// signature that verifies under `publisher_keys`, regardless of its own
+/// `[trust]` section (C4's host half — deleting the section must not
+/// delete the demand).
+pub(crate) fn scan_with_policy(
+    root: &Path,
+    state: &EnabledState,
+    max_payload_bytes: u64,
+    publisher_keys: &[crate::trust::PublisherKey],
+    required_signed_providers: &[String],
+) -> RegistryResult<Vec<ScanResult>> {
     let entries = fs::read_dir(root).map_err(|e| {
         RegistryError::Io(std::io::Error::new(
             e.kind(),
@@ -272,7 +287,13 @@ pub fn scan_with_keys(
     let mut results = Vec::new();
     let mut seen: HashMap<String, PathBuf> = HashMap::new();
     for dir in dirs {
-        match validate_dir(&dir, &seen, max_payload_bytes, publisher_keys) {
+        match validate_dir(
+            &dir,
+            &seen,
+            max_payload_bytes,
+            publisher_keys,
+            required_signed_providers,
+        ) {
             Ok(manifest) => {
                 let record = PluginRecord {
                     enabled: state.get(&manifest.id),
@@ -295,6 +316,7 @@ fn validate_dir(
     seen: &HashMap<String, PathBuf>,
     max_payload_bytes: u64,
     publisher_keys: &[crate::trust::PublisherKey],
+    required_signed_providers: &[String],
 ) -> Result<PluginManifest, Rejection> {
     let reject = |plugin_id: Option<String>, reason: String| Rejection {
         dir: dir.to_path_buf(),
@@ -496,6 +518,7 @@ fn validate_dir(
 
     // The trust gate (C4-2): plugins demanding a signature must verify
     // under a listed publisher key — fail-closed on every failure shape.
+    let mut signed_ok = false;
     if let Some(trust) = &manifest.trust
         && trust.requires_signature()
     {
@@ -521,7 +544,7 @@ fn validate_dir(
         };
         match verdict {
             crate::manifest::TrustVerdict::UnsignedOk => {}
-            crate::manifest::TrustVerdict::SignedOk { .. } => {}
+            crate::manifest::TrustVerdict::SignedOk { .. } => signed_ok = true,
             crate::manifest::TrustVerdict::UnsignedButDemanded => {
                 return Err(reject(
                         Some(manifest.id.clone()),
@@ -535,6 +558,23 @@ fn validate_dir(
                 ));
             }
         }
+    }
+
+    // The host-side signature policy (C4's host half): a pinned provider
+    // may not ride the unsigned lane. The `[trust]` section lives inside
+    // the verified artifact — deleting it must not delete the demand.
+    if required_signed_providers
+        .iter()
+        .any(|provider| provider == &manifest.provider)
+        && !signed_ok
+    {
+        return Err(reject(
+            Some(manifest.id.clone()),
+            format!(
+                "signature policy: provider '{}' must ship a signature that verifies under the configured publisher keys (unsigned or unverified is rejected)",
+                manifest.provider
+            ),
+        ));
     }
 
     Ok(manifest)
@@ -921,6 +961,166 @@ sha256 = "{sha_b}"
             sha_a = sha(&alpha),
             sha_b = sha(&beta),
         )
+    }
+
+    /// C4 host half: a pinned provider may not ride the unsigned lane —
+    /// deleting the plugin's own `[trust]` section must not delete the
+    /// demand.
+    #[test]
+    fn a_policy_pinned_provider_is_rejected_unsigned() {
+        let root = trust_scan_root("policy-unsigned");
+        std::fs::create_dir_all(root.join("unsigned-official")).unwrap();
+        std::fs::write(
+            root.join("unsigned-official/akivili.plugin.toml"),
+            r#"schema = 1
+id = "unsigned-official"
+version = "1.0.0"
+provider = "official"
+form = "web.resource"
+"#,
+        )
+        .unwrap();
+        let signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let keys = vec![crate::trust::PublisherKey {
+            key_id: "policy-key".into(),
+            bytes: signing.verifying_key().to_bytes(),
+        }];
+        let results = scan_with_policy(
+            &root,
+            &EnabledState::default(),
+            crate::registry::DEFAULT_MAX_PAYLOAD_BYTES,
+            &keys,
+            &["official".to_string()],
+        )
+        .expect("scan runs");
+        let _ = std::fs::remove_dir_all(&root);
+        // The helper's stray `signed-plugin/` directory also rejects (no
+        // manifest) — assert on the policy rejection itself, not on
+        // scan order.
+        let hit = results.iter().any(|result| match result {
+            ScanResult::Rejected(rejection) => {
+                rejection.reason.contains("signature policy")
+                    && rejection.reason.contains("'official'")
+            }
+            _ => false,
+        });
+        assert!(
+            hit,
+            "the unsigned pinned provider must be rejected with the policy reason, got {results:?}"
+        );
+    }
+
+    /// A pin without keys must fail closed, not silently widen into the
+    /// unsigned lane (R2's mutation M-R2 survived the suite before this
+    /// test: the code path was correct but unpinned by a test).
+    #[test]
+    fn a_pin_without_keys_fails_closed() {
+        let root = trust_scan_root("policy-nokeys");
+        std::fs::create_dir_all(root.join("unsigned-official")).unwrap();
+        std::fs::write(
+            root.join("unsigned-official/akivili.plugin.toml"),
+            r#"schema = 1
+id = "unsigned-official"
+version = "1.0.0"
+provider = "official"
+form = "web.resource"
+"#,
+        )
+        .unwrap();
+        let results = scan_with_policy(
+            &root,
+            &EnabledState::default(),
+            crate::registry::DEFAULT_MAX_PAYLOAD_BYTES,
+            &[], // no publisher keys configured
+            &["official".to_string()],
+        )
+        .expect("scan runs");
+        let _ = std::fs::remove_dir_all(&root);
+        let hit = results.iter().any(|result| match result {
+            ScanResult::Rejected(rejection) => rejection.reason.contains("signature policy"),
+            _ => false,
+        });
+        assert!(
+            hit,
+            "a pin without keys must reject the pinned provider's plugins, got {results:?}"
+        );
+    }
+
+    /// The policy accepts what it demands: a signed plugin of the pinned
+    /// provider scans in under its key (and a third-party provider stays
+    /// out of the policy's reach).
+    #[test]
+    fn a_policy_pinned_provider_with_a_valid_signature_scans_in() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::rngs::OsRng;
+
+        let signing = SigningKey::generate(&mut OsRng);
+        let root = trust_scan_root("policy-signed");
+        std::fs::create_dir_all(root.join("signed-official")).unwrap();
+        std::fs::create_dir_all(root.join("third-party")).unwrap();
+        let manifest = r#"schema = 1
+id = "signed-official"
+version = "1.0.0"
+provider = "official"
+form = "web.resource"
+
+[[resources]]
+kind = "webui.style"
+[resources.payload.File]
+path = "alpha.bin"
+
+[trust]
+signature = "agent.sig"
+min-trust = "signed"
+"#;
+        std::fs::write(root.join("signed-official/akivili.plugin.toml"), manifest).unwrap();
+        std::fs::write(root.join("signed-official/alpha.bin"), b"payload").unwrap();
+        // C4 v2: the manifest bytes lead the signed stream.
+        let mut signed = manifest.as_bytes().to_vec();
+        signed.extend_from_slice(b"payload");
+        std::fs::write(
+            root.join("signed-official/agent.sig"),
+            signing.sign(&signed).to_bytes(),
+        )
+        .unwrap();
+        // A third-party unsigned plugin rides along untouched.
+        std::fs::write(
+            root.join("third-party/akivili.plugin.toml"),
+            r#"schema = 1
+id = "third-party"
+version = "1.0.0"
+provider = "acme"
+form = "web.resource"
+"#,
+        )
+        .unwrap();
+        let keys = vec![crate::trust::PublisherKey {
+            key_id: "policy-key".into(),
+            bytes: signing.verifying_key().to_bytes(),
+        }];
+        let results = scan_with_policy(
+            &root,
+            &EnabledState::default(),
+            crate::registry::DEFAULT_MAX_PAYLOAD_BYTES,
+            &keys,
+            &["official".to_string()],
+        )
+        .expect("scan runs");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut accepted: Vec<&str> = Vec::new();
+        for result in &results {
+            if let ScanResult::Accepted(record) = result {
+                accepted.push(record.manifest.id.as_str());
+            }
+        }
+        assert!(
+            accepted.contains(&"signed-official"),
+            "the signed pinned provider must scan in, got {results:?}"
+        );
+        assert!(
+            accepted.contains(&"third-party"),
+            "an unpinned provider stays out of the policy's reach, got {results:?}"
+        );
     }
 
     #[test]
