@@ -50,8 +50,11 @@ jobs:
           cd packages/npm
           npm version "${{ steps.ver.outputs.version }}" --no-git-tag-version --allow-same-version
       - name: Publish
+        # Secretless: pnpm exchanges the job's short-lived OIDC identity
+        # (`id-token: write` above) with npmjs against the trusted-publisher
+        # binding on the package page. No static publish token exists — npmjs
+        # deprecated fixed tokens, and a token in `env` would silently win over
+        # the OIDC path while weakening the `--provenance` identity chain.
         run: |
           cd packages/npm
           pnpm publish --access public --provenance --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
