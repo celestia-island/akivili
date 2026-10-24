@@ -1123,12 +1123,19 @@ min-trust = "signed"
         )
         .expect("scan runs");
         let _ = std::fs::remove_dir_all(&root2);
-        match results2.first() {
-            Some(ScanResult::Accepted(record)) => {
-                assert_eq!(record.signed_by_key_id, None);
+        // The helper's stray `signed-plugin/` directory also rejects (no
+        // manifest) — find OUR plugin instead of trusting scan order.
+        let unsigned = results2.iter().find_map(|result| match result {
+            ScanResult::Accepted(record) if record.manifest.id == "unsigned" => {
+                Some(record.signed_by_key_id.clone())
             }
-            other => panic!("the unsigned plugin must scan in (unpinned provider), got {other:?}"),
-        }
+            _ => None,
+        });
+        assert_eq!(
+            unsigned,
+            Some(None),
+            "the unsigned plugin must scan in (unpinned provider) with no key id, got {results2:?}"
+        );
     }
 
     /// The policy accepts what it demands: a signed plugin of the pinned
