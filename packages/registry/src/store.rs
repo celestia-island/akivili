@@ -21,6 +21,12 @@ pub struct PluginRecord {
     pub dir: PathBuf,
     /// Effective enable state (defaults to `true` for unknown ids).
     pub enabled: bool,
+    /// The publisher key id whose signature verified at scan time
+    /// (`Some` only when the trust gate ran and the verdict was
+    /// `SignedOk`). This is the host's "provably from that publisher"
+    /// signal — with a single anchor key it binds the plugin to that
+    /// key's identity regardless of self-declared id/provider fields.
+    pub signed_by_key_id: Option<String>,
 }
 
 /// Why a plugin source was rejected during a scan.
@@ -294,11 +300,12 @@ pub(crate) fn scan_with_policy(
             publisher_keys,
             required_signed_providers,
         ) {
-            Ok(manifest) => {
+            Ok((manifest, signed_by_key_id)) => {
                 let record = PluginRecord {
                     enabled: state.get(&manifest.id),
                     dir,
                     manifest,
+                    signed_by_key_id,
                 };
                 seen.insert(record.manifest.id.clone(), record.dir.clone());
                 results.push(ScanResult::Accepted(record));
@@ -317,7 +324,7 @@ fn validate_dir(
     max_payload_bytes: u64,
     publisher_keys: &[crate::trust::PublisherKey],
     required_signed_providers: &[String],
-) -> Result<PluginManifest, Rejection> {
+) -> Result<(PluginManifest, Option<String>), Rejection> {
     let reject = |plugin_id: Option<String>, reason: String| Rejection {
         dir: dir.to_path_buf(),
         plugin_id,
@@ -518,7 +525,10 @@ fn validate_dir(
 
     // The trust gate (C4-2): plugins demanding a signature must verify
     // under a listed publisher key — fail-closed on every failure shape.
-    let mut signed_ok = false;
+    // `signed_by` carries WHICH anchor key verified (None = unsigned or
+    // unverified) — hosts use it for signature-aware policy (the
+    // "official id ↔ single official key" binding).
+    let mut signed_by: Option<String> = None;
     if let Some(trust) = &manifest.trust
         && trust.requires_signature()
     {
@@ -544,7 +554,9 @@ fn validate_dir(
         };
         match verdict {
             crate::manifest::TrustVerdict::UnsignedOk => {}
-            crate::manifest::TrustVerdict::SignedOk { .. } => signed_ok = true,
+            crate::manifest::TrustVerdict::SignedOk { key_id } => {
+                signed_by = Some(key_id.clone());
+            }
             crate::manifest::TrustVerdict::UnsignedButDemanded => {
                 return Err(reject(
                         Some(manifest.id.clone()),
@@ -566,7 +578,7 @@ fn validate_dir(
     if required_signed_providers
         .iter()
         .any(|provider| provider == &manifest.provider)
-        && !signed_ok
+        && signed_by.is_none()
     {
         return Err(reject(
             Some(manifest.id.clone()),
@@ -577,7 +589,7 @@ fn validate_dir(
         ));
     }
 
-    Ok(manifest)
+    Ok((manifest, signed_by))
 }
 
 #[cfg(test)]
@@ -1044,6 +1056,79 @@ form = "web.resource"
             hit,
             "a pin without keys must reject the pinned provider's plugins, got {results:?}"
         );
+    }
+
+    /// The record surfaces WHICH anchor key verified (W11-3's
+    /// signature-aware host policy depends on it).
+    #[test]
+    fn a_signed_plugin_record_carries_its_key_id() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::rngs::OsRng;
+
+        let signing = SigningKey::generate(&mut OsRng);
+        let root = trust_scan_root("key-surface");
+        std::fs::create_dir_all(root.join("signed-plugin")).unwrap();
+        let manifest = r#"schema = 1
+id = "signed-plugin"
+version = "1.0.0"
+provider = "official"
+form = "web.resource"
+
+[trust]
+signature = "agent.sig"
+min-trust = "signed"
+"#;
+        std::fs::write(root.join("signed-plugin/akivili.plugin.toml"), manifest).unwrap();
+        // C4 v2: the manifest bytes lead the signed stream.
+        std::fs::write(
+            root.join("signed-plugin/agent.sig"),
+            signing.sign(manifest.as_bytes()).to_bytes(),
+        )
+        .unwrap();
+        let keys = vec![crate::trust::PublisherKey {
+            key_id: "surface-key".into(),
+            bytes: signing.verifying_key().to_bytes(),
+        }];
+        let results = scan_with_keys(
+            &root,
+            &EnabledState::default(),
+            crate::registry::DEFAULT_MAX_PAYLOAD_BYTES,
+            &keys,
+        )
+        .expect("scan runs");
+        let _ = std::fs::remove_dir_all(&root);
+        match results.first() {
+            Some(ScanResult::Accepted(record)) => {
+                assert_eq!(
+                    record.signed_by_key_id.as_deref(),
+                    Some("surface-key"),
+                    "the verifying key id must ride on the record"
+                );
+            }
+            other => panic!("the signed plugin must scan in, got {other:?}"),
+        }
+        // And an unsigned plugin's record carries None.
+        let root2 = trust_scan_root("key-surface-unsigned");
+        std::fs::create_dir_all(root2.join("unsigned")).unwrap();
+        std::fs::write(
+            root2.join("unsigned/akivili.plugin.toml"),
+            "schema = 1\nid = \"unsigned\"\nversion = \"1.0.0\"\nprovider = \"acme\"\nform = \"web.resource\"\n",
+        )
+        .unwrap();
+        let results2 = scan_with_keys(
+            &root2,
+            &EnabledState::default(),
+            crate::registry::DEFAULT_MAX_PAYLOAD_BYTES,
+            &keys,
+        )
+        .expect("scan runs");
+        let _ = std::fs::remove_dir_all(&root2);
+        match results2.first() {
+            Some(ScanResult::Accepted(record)) => {
+                assert_eq!(record.signed_by_key_id, None);
+            }
+            other => panic!("the unsigned plugin must scan in (unpinned provider), got {other:?}"),
+        }
     }
 
     /// The policy accepts what it demands: a signed plugin of the pinned
