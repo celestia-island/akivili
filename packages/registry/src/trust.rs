@@ -1,11 +1,13 @@
 //! Ed25519 signature verification for plugin distribution (C4).
 //!
 //! The `[trust]` section's `signature` names a signature file inside
-//! the plugin directory; the signature is Ed25519 over the plugin's
-//! PAYLOAD — every resource file's bytes in manifest order, then every
-//! attachment file's bytes in manifest order (the content-addressed
-//! digest chain the store already computes per file). A plugin
-//! demanding trust (`min-trust` above unsigned, or an explicit
+//! the plugin directory; the signature is Ed25519 over **C4 v2** — the
+//! sealed manifest bytes first, then every resource file's bytes in
+//! manifest order, every attachment file's bytes in manifest order, and
+//! every migration file's bytes (`up` then `down`, in manifest order).
+//! The manifest leads the stream so a post-seal edit of `[[migrations]]`,
+//! `[[agents]]`, `capabilities`, or `[trust]` itself cannot verify. A
+//! plugin demanding trust (`min-trust` above unsigned, or an explicit
 //! signature path) fails closed: missing file, malformed bytes, or a
 //! key mismatch all refuse the load.
 
@@ -23,12 +25,13 @@ pub struct PublisherKey {
     pub bytes: [u8; 32],
 }
 
-/// Verify a plugin's declared signature over its payload bytes.
+/// Verify a plugin's declared signature over its signed byte stream.
 ///
 /// `signature_file` is the signature file's content; `payload` is the
-/// concatenation the distribution format defines (v0: resource files'
-/// bytes in manifest order, then attachment files' bytes in manifest
-/// order — the store hands it in already assembled).
+/// C4 v2 stream: the sealed manifest bytes, then resource files' bytes
+/// in manifest order, then attachment files' bytes in manifest order,
+/// then migration files' bytes (`up` then `down`, in manifest order) —
+/// the store hands it in already assembled.
 pub fn verify_plugin_signature(
     trust: &TrustSection,
     signature_file: Option<&[u8]>,

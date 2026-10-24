@@ -12,16 +12,16 @@
 //! - the package's manifest, **sealed**: a `[trust]` section naming the
 //!   signature file (a declared `trust.signature` path is honored;
 //!   otherwise `<id>.sig` is injected with `min-trust = "signed"`), and
-//!   a pinned `sha256` on every file payload that lacked one — both
-//!   manifest-side edits, and the manifest is deliberately outside the
-//!   signed byte range, so sealing never invalidates the signature;
+//!   a pinned `sha256` on every file payload that lacked one;
 //! - every file of the package directory, copied verbatim (walked in
 //!   sorted order; nothing is excluded except a stale file at the
 //!   signature path — the signature output itself);
-//! - the signature file: the raw 64-byte Ed25519 signature over the C4
-//!   payload concatenation — resource file payload bytes in manifest
-//!   order, then attachment file payload bytes in manifest order, the
-//!   exact assembly [`crate::store::scan_with_keys`] verifies.
+//! - the signature file: the raw 64-byte Ed25519 signature over
+//!   **C4 v2** — the sealed manifest bytes, then resource file payload
+//!   bytes in manifest order, then attachment file payload bytes in
+//!   manifest order, then migration file bytes (`up`, then `down` per
+//!   migration, in manifest order). [`crate::store::scan_with_keys`]
+//!   assembles the exact same byte stream.
 //!
 //! The signing key comes from the `AKIVILI_SIGNING_KEY` environment
 //! variable (64 hex chars — the 32-byte Ed25519 seed). Without it the
@@ -315,8 +315,10 @@ type PayloadDigestList = Vec<(PathBuf, String)>;
 
 /// Assembles the C4 payload concatenation from a parsed manifest —
 /// resource file bytes in manifest order, then attachment file bytes in
-/// manifest order — reading each payload with the store's own
-/// confinement, cap, and digest checks.
+/// manifest order, then migration file bytes (`up` then `down` per
+/// migration, in manifest order) — reading each payload with the store's
+/// own confinement, cap, and digest checks. The sealed manifest bytes
+/// are prepended by the caller (C4 v2).
 fn assemble_payload_concat(
     package_dir: &Path,
     manifest: &PluginManifest,
@@ -346,6 +348,22 @@ fn assemble_payload_concat(
                 .map(|kind| format!("attachment kind '{kind}'"))
                 .unwrap_or_else(|| format!("attachment surface '{}'", attachment.surface));
             push(path, sha256, label)?;
+        }
+    }
+    for migration in &manifest.migrations {
+        let up_sha = Some(migration.sha256.clone());
+        push(
+            &migration.up,
+            &up_sha,
+            format!("migration '{}' up", migration.id),
+        )?;
+        if let Some(down) = &migration.down {
+            let no_digest: Option<String> = None;
+            push(
+                down,
+                &no_digest,
+                format!("migration '{}' down", migration.id),
+            )?;
         }
     }
     Ok((concat, payload_files))
@@ -499,15 +517,51 @@ pub fn pack(package_dir: &Path, out_dir: &Path, key: &SigningKey) -> Result<Pack
             sig_rel.display()
         )));
     }
+    // The signature path is the packer's output, never a payload: a
+    // collision would overwrite a declared file with 64 signature bytes
+    // and produce a bundle the store rejects (or, worse, a payload
+    // substitution). Refuse before writing anything.
+    let mut declared_paths: Vec<&Path> = Vec::new();
+    for resource in &manifest.resources {
+        if let Payload::File { path, .. } = &resource.payload {
+            declared_paths.push(path);
+        }
+    }
+    for attachment in &manifest.attachments {
+        if let Some(Payload::File { path, .. }) = &attachment.payload {
+            declared_paths.push(path);
+        }
+    }
+    for migration in &manifest.migrations {
+        declared_paths.push(&migration.up);
+        if let Some(down) = &migration.down {
+            declared_paths.push(down);
+        }
+    }
+    if sig_rel == Path::new(crate::manifest::MANIFEST_FILE)
+        || declared_paths.contains(&sig_rel.as_path())
+    {
+        return Err(PackError::InvalidManifest(format!(
+            "trust.signature '{}' collides with a declared payload path",
+            sig_rel.display()
+        )));
+    }
 
-    // 4) Assemble the C4 concat (resources, then attachments) with the
-    // store's own read-time checks, and sign it.
+    // 4) Assemble the C4 payload concat (resources, then attachments,
+    // then migration files) with the store's own read-time checks.
     let (concat, payload_files) = assemble_payload_concat(package_dir, &manifest)?;
-    let signature = key.sign(&concat);
 
     // 5) Seal the manifest (trust + pinned digests) and re-validate.
     let digests: std::collections::HashMap<PathBuf, String> = payload_files.into_iter().collect();
     let sealed_text = seal_manifest(&manifest, &sig_rel, &digests)?;
+
+    // 6) Sign C4 v2: the sealed manifest bytes first, then the payload
+    // concat. Signing the manifest closes the "append a migration (or
+    // rewrite agents/capabilities) after sealing" class.
+    let mut signed_bytes = Vec::with_capacity(sealed_text.len() + concat.len());
+    signed_bytes.extend_from_slice(sealed_text.as_bytes());
+    signed_bytes.extend_from_slice(&concat);
+    let signature = key.sign(&signed_bytes);
 
     // 6+7) Write the bundle (fresh directory, verbatim copies, sealed
     // manifest, signature last), then digest it as written. Any failure
@@ -1031,5 +1085,155 @@ path = "agent.bin"
         assert_eq!(fp.len(), 16);
         assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(fp, key_fingerprint(&key.verifying_key().to_bytes()));
+    }
+
+    /// P1 (R1 find): the C4 v2 stream leads with the sealed manifest, so
+    /// appending `[[migrations]]` (or editing any manifest field) after
+    /// the packer signed it must fail the store's trust gate. Before
+    /// C4 v2 this attack scanned in with the migration attached.
+    #[test]
+    fn a_post_seal_manifest_edit_fails_the_trust_gate() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = fixture_package(root.path(), "pkg");
+        let key = SigningKey::generate(&mut OsRng);
+        let out = root.path().join("store");
+        let report = pack(&pkg, &out, &key).expect("packs");
+
+        // Append a migration the publisher never signed, plus its SQL.
+        let sql = b"CREATE TABLE evil (id int);\n";
+        fs::write(report.bundle_dir.join("evil.sql"), sql).unwrap();
+        let manifest_path = report.bundle_dir.join(MANIFEST_FILE);
+        let mut sealed = fs::read_to_string(&manifest_path).unwrap();
+        sealed.push_str(&format!(
+            "\n[[migrations]]\nid = \"0001-evil\"\nengine = \"sql\"\nup = \"evil.sql\"\nsha256 = \"{}\"\n",
+            sha256_hex(sql)
+        ));
+        fs::write(&manifest_path, sealed).unwrap();
+
+        let registry = open_store(&out, &key, "pack-key");
+        assert!(
+            registry
+                .plugins()
+                .iter()
+                .all(|record| record.manifest.id != "pack-fixture"),
+            "a post-seal manifest edit must be rejected by the trust gate"
+        );
+    }
+
+    /// P2 (R1 find): a migration `up` file is part of the C4 v2 stream;
+    /// changing its bytes after the pack makes the signed digest and the
+    /// stream disagree, so the scan rejects (fail closed).
+    #[test]
+    fn a_tampered_migration_file_fails_the_trust_gate() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = root.path().join("pkg");
+        fs::create_dir_all(pkg.join("migrations")).unwrap();
+        let sql = b"CREATE TABLE t (id int);\n";
+        let manifest = format!(
+            "schema = 1\nid = \"migration-fixture\"\nversion = \"1.0.0\"\nprovider = \"official\"\nform = \"web.vue-module\"\n\n[[migrations]]\nid = \"0001-init\"\nengine = \"sql\"\nup = \"migrations/0001_init.up.sql\"\nsha256 = \"{}\"\n",
+            sha256_hex(sql)
+        );
+        fs::write(pkg.join(MANIFEST_FILE), manifest).unwrap();
+        fs::write(pkg.join("migrations/0001_init.up.sql"), sql).unwrap();
+
+        let key = SigningKey::generate(&mut OsRng);
+        let out = root.path().join("store");
+        let report = pack(&pkg, &out, &key).expect("packs a migration-bearing package");
+        // The migration-bearing bundle scans in as sealed.
+        let registry = open_store(&out, &key, "migration-key");
+        assert!(
+            registry
+                .plugins()
+                .iter()
+                .any(|record| record.manifest.id == "migration-fixture"),
+            "the sealed migration bundle must scan in"
+        );
+
+        // Tamper the bundled migration file; the signed stream and the
+        // declared sha256 both disagree with it.
+        fs::write(
+            report.bundle_dir.join("migrations/0001_init.up.sql"),
+            b"DROP TABLE t;\n",
+        )
+        .unwrap();
+        let tampered = open_store(&out, &key, "migration-key");
+        assert!(
+            tampered
+                .plugins()
+                .iter()
+                .all(|record| record.manifest.id != "migration-fixture"),
+            "a tampered migration file must fail closed"
+        );
+    }
+
+    /// P2 (R1 find): a migration path may not escape the package.
+    #[test]
+    fn a_migration_path_escape_refuses() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = root.path().join("pkg");
+        fs::create_dir_all(&pkg).unwrap();
+        let manifest = r#"schema = 1
+id = "escape-fixture"
+version = "1.0.0"
+provider = "official"
+form = "web.vue-module"
+
+[[migrations]]
+id = "0001-init"
+engine = "sql"
+up = "../etc/passwd"
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#;
+        fs::write(pkg.join(MANIFEST_FILE), manifest).unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let err = pack(&pkg, &root.path().join("store"), &key)
+            .expect_err("a migration path escape must refuse");
+        assert!(err.to_string().contains("relative path"), "{err}");
+        assert!(
+            !root.path().join("store").exists(),
+            "nothing may be written on refusal"
+        );
+    }
+
+    /// P2 (R1 find): the signature output path must not collide with a
+    /// declared payload (that would overwrite the payload with 64
+    /// signature bytes and produce a bundle the store rejects).
+    #[test]
+    fn a_signature_path_collision_refuses() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = fixture_package(root.path(), "pkg");
+        let manifest = fs::read_to_string(pkg.join(MANIFEST_FILE)).unwrap();
+        fs::write(
+            pkg.join(MANIFEST_FILE),
+            format!("{manifest}\n[trust]\nsignature = \"style.css\"\nmin-trust = \"signed\"\n"),
+        )
+        .unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let err = pack(&pkg, &root.path().join("store"), &key)
+            .expect_err("a signature/payload collision must refuse");
+        assert!(err.to_string().contains("collides"), "{err}");
+    }
+
+    /// P2 (R1 find): a declared `verified-publisher` trust level must be
+    /// preserved by sealing; a silent downgrade is a trust regression.
+    #[test]
+    fn sealing_preserves_a_declared_verified_publisher_level() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = fixture_package(root.path(), "pkg");
+        let manifest = fs::read_to_string(pkg.join(MANIFEST_FILE)).unwrap();
+        fs::write(
+            pkg.join(MANIFEST_FILE),
+            format!("{manifest}\n[trust]\nsignature = \"pack-fixture.sig\"\nmin-trust = \"verified-publisher\"\n"),
+        )
+        .unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let report = pack(&pkg, &root.path().join("store"), &key).expect("packs");
+        let sealed = fs::read_to_string(report.bundle_dir.join(MANIFEST_FILE)).unwrap();
+        let parsed: PluginManifest = toml::from_str(&sealed).expect("sealed manifest parses");
+        assert_eq!(
+            parsed.trust.expect("trust is present").min_trust,
+            crate::manifest::MinTrust::VerifiedPublisher,
+            "sealing must not downgrade verified-publisher"
+        );
     }
 }
