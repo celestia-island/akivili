@@ -131,11 +131,23 @@ pub struct PluginManifest {
     pub mcp_servers: Vec<McpServerEntry>,
 }
 
+/// Cap on one agent's declared `tools`/`skills` stems — mirrors the
+/// scepter consumer's `MAX_CAPABILITY_STEMS` (the per-section doc cap
+/// in `agent_config_service`), so a manifest cannot declare more
+/// capability stems than the widest embedded agent.
+pub const MAX_AGENT_CAPABILITY_STEMS: usize = 64;
+
 /// One domain agent declared by a plugin (manifest `[[agents]]`).
 ///
 /// `folder` follows plana's folder-name conventions so scepter's
 /// prompt/tool paths resolve unchanged; the host merges declared agents
 /// into the L2 roster beside the static registry (registry = fallback).
+/// `tools`/`skills` stems are shape-gated by [`PluginManifest::validate`]
+/// against the same vocabulary the scepter consumer enforces
+/// (`is_capability_stem`: `^[a-z0-9_]+$`, 1..=64 chars, ≤ 64 per array)
+/// — gating at the manifest layer keeps a bad stem from reaching the
+/// consumer, where it cost the agent its whole roster row instead of
+/// just the one stem (chest #1862 R2-P2-1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentEntry {
     /// Agent folder name, `^[a-z][a-z0-9_]*$` (matches plana
@@ -672,7 +684,8 @@ impl PluginManifest {
         // [[agents]] — the 10-12 binding section. Folder names must
         // match plana's vocabulary shape and be unique within the
         // manifest; `en` description is required (the roster's
-        // fallback label convention).
+        // fallback label convention); tools/skills stems share the
+        // scepter consumer's capability-stem vocabulary.
         {
             let mut seen_folders = std::collections::BTreeSet::new();
             for agent in &self.agents {
@@ -704,6 +717,46 @@ impl PluginManifest {
                         "agent '{}' requires an \"en\" description_i18n entry",
                         agent.folder
                     )));
+                }
+                // Capability stems (tools/skills) — the SAME vocabulary
+                // the scepter consumer enforces (`is_capability_stem` /
+                // `MAX_CAPABILITY_STEMS` in agent_config_service):
+                // `^[a-z0-9_]+$`, 1..=64 chars, ≤ 64 stems per array.
+                // Gating here (pack/scan time) means a bad stem fails
+                // loudly and early; on the consumer side it only
+                // warn-dropped the whole roster row (chest #1862
+                // R2-P2-1). One deliberate narrowing: duplicates are
+                // refused here even though the consumer tolerates
+                // repeats — a manifest naming the same stem twice is a
+                // manifest smell, and the error says so explicitly.
+                for (kind, stems) in [("tools", &agent.tools), ("skills", &agent.skills)] {
+                    if stems.len() > MAX_AGENT_CAPABILITY_STEMS {
+                        return Err(RegistryError::InvalidManifest(format!(
+                            "agent '{}' declares {} {kind} stems (cap is {MAX_AGENT_CAPABILITY_STEMS}, mirroring the consumer's per-section doc cap)",
+                            agent.folder,
+                            stems.len()
+                        )));
+                    }
+                    let mut seen_stems = std::collections::BTreeSet::new();
+                    for stem in stems.iter() {
+                        let ok_stem = !stem.is_empty()
+                            && stem.len() <= 64
+                            && stem
+                                .chars()
+                                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                        if !ok_stem {
+                            return Err(RegistryError::InvalidManifest(format!(
+                                "agent '{}' declares {kind} stem '{stem}' outside the capability vocabulary ^[a-z0-9_]+$ (1..=64 chars)",
+                                agent.folder
+                            )));
+                        }
+                        if !seen_stems.insert(stem.as_str()) {
+                            return Err(RegistryError::InvalidManifest(format!(
+                                "agent '{}' declares duplicate {kind} stem '{stem}' — the consumer tolerates repeats but the manifest layer requires each stem once",
+                                agent.folder
+                            )));
+                        }
+                    }
                 }
                 if !seen_folders.insert(agent.folder.clone()) {
                     return Err(RegistryError::InvalidManifest(format!(
@@ -2353,6 +2406,150 @@ en = "b"
 "#;
         let manifest: PluginManifest = toml::from_str(dup).unwrap();
         assert!(manifest.validate().is_err(), "duplicate folders rejected");
+    }
+
+    /// Builds a one-agent manifest with literal TOML arrays for
+    /// `tools`/`skills` (already quoted, e.g. `"a", "b"`; empty string
+    /// = omit the key).
+    fn agent_stems_raw(tools: &str, skills: &str) -> String {
+        let tools = if tools.is_empty() {
+            String::new()
+        } else {
+            format!("tools = [{tools}]")
+        };
+        let skills = if skills.is_empty() {
+            String::new()
+        } else {
+            format!("skills = [{skills}]")
+        };
+        format!(
+            r#"
+schema = 1
+id = "acme"
+version = "1.0.0"
+provider = "acme"
+form = "web.vue-module"
+
+[[agents]]
+folder = "devops"
+name = "DevOps"
+{tools}
+{skills}
+
+[agents.description_i18n]
+en = "desc"
+"#
+        )
+    }
+
+    #[test]
+    fn agents_capability_stems_accept_official_shapes() {
+        // Real stems from chest's official manifest pack (e.g.
+        // celestia-kanban) — the positive reference shape.
+        let manifest: PluginManifest = toml::from_str(&agent_stems_raw(
+            r#""create_board", "move_card", "set_wip_limit""#,
+            r#""run_standup", "unclog_lane""#,
+        ))
+        .expect("official-shaped stems parse");
+        manifest.validate().expect("official-shaped stems validate");
+
+        // Boundary values pass: exactly 64 chars, digits-only, a lone
+        // underscore, and exactly 64 stems per array (the cap).
+        let stem64 = "s".repeat(64);
+        let manifest: PluginManifest =
+            toml::from_str(&agent_stems_raw(&format!(r#""{stem64}", "007", "_""#), ""))
+                .expect("boundary stems parse");
+        manifest
+            .validate()
+            .expect("64-char stem at the cap validates");
+
+        let many: Vec<String> = (0..MAX_AGENT_CAPABILITY_STEMS)
+            .map(|i| format!("\"tool_{i}\""))
+            .collect();
+        let manifest: PluginManifest =
+            toml::from_str(&agent_stems_raw(&many.join(", "), "")).expect("64 stems parse");
+        manifest.validate().expect("exactly 64 stems validate");
+    }
+
+    #[test]
+    fn agents_reject_bad_capability_stem_shapes() {
+        // The scepter vocabulary is ^[a-z0-9_]+$ (1..=64 chars):
+        // uppercase, dots, hyphens, empty and overlong stems are all
+        // refused — each error names the agent folder and the stem.
+        for bad in [
+            "ListPrs",
+            "list.prs",
+            "list-prs",
+            "",
+            &"s".repeat(65),
+            "看板",
+        ] {
+            for (kind, raw) in [
+                (
+                    "tools",
+                    agent_stems_raw(&format!(r#""{bad}""#), r#""ok_skill""#),
+                ),
+                (
+                    "skills",
+                    agent_stems_raw(r#""ok_tool""#, &format!(r#""{bad}""#)),
+                ),
+            ] {
+                let manifest: PluginManifest =
+                    toml::from_str(&raw).unwrap_or_else(|e| panic!("parses: {e}"));
+                let err = manifest.validate().unwrap_err().to_string();
+                assert!(err.contains("devops"), "error names the folder: {err}");
+                assert!(err.contains(kind), "error names the array: {err}");
+                assert!(
+                    err.contains(&format!("'{bad}'")),
+                    "error quotes the bad stem verbatim: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn agents_reject_too_many_capability_stems() {
+        let many: Vec<String> = (0..=MAX_AGENT_CAPABILITY_STEMS)
+            .map(|i| format!("\"tool_{i}\""))
+            .collect();
+        let manifest: PluginManifest =
+            toml::from_str(&agent_stems_raw(&many.join(", "), "")).expect("65 stems parse");
+        let err = manifest.validate().unwrap_err().to_string();
+        assert!(err.contains("devops"), "error names the folder: {err}");
+        assert!(err.contains("tools"), "error names the array: {err}");
+        assert!(
+            err.contains("65") && err.contains("64"),
+            "error reports the count and the cap: {err}"
+        );
+    }
+
+    #[test]
+    fn agents_reject_duplicate_capability_stems() {
+        // Stricter than the scepter consumer (which tolerates repeats):
+        // the manifest layer requires each stem once, and the error
+        // says both halves explicitly.
+        let manifest: PluginManifest = toml::from_str(&agent_stems_raw(
+            r#""list_prs", "list_prs""#,
+            r#""release_flow""#,
+        ))
+        .expect("parses");
+        let err = manifest.validate().unwrap_err().to_string();
+        assert!(err.contains("devops"), "error names the folder: {err}");
+        assert!(
+            err.contains("duplicate tools stem 'list_prs'"),
+            "got: {err}"
+        );
+
+        let manifest: PluginManifest = toml::from_str(&agent_stems_raw(
+            r#""list_prs""#,
+            r#""release_flow", "release_flow""#,
+        ))
+        .expect("parses");
+        let err = manifest.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate skills stem 'release_flow'"),
+            "got: {err}"
+        );
     }
 
     // ── agent_tools / mcp_servers / installs (the L2 execution contract) ──
