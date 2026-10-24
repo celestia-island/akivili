@@ -1097,16 +1097,19 @@ min-trust = "signed"
         )
         .expect("scan runs");
         let _ = std::fs::remove_dir_all(&root);
-        match results.first() {
-            Some(ScanResult::Accepted(record)) => {
-                assert_eq!(
-                    record.signed_by_key_id.as_deref(),
-                    Some("surface-key"),
-                    "the verifying key id must ride on the record"
-                );
+        // Find OUR plugin (the helper's stray `signed-plugin/` fixture
+        // directory also rejects) instead of trusting scan order.
+        let signed = results.iter().find_map(|result| match result {
+            ScanResult::Accepted(record) if record.manifest.id == "signed-plugin" => {
+                Some(record.signed_by_key_id.clone())
             }
-            other => panic!("the signed plugin must scan in, got {other:?}"),
-        }
+            _ => None,
+        });
+        assert_eq!(
+            signed,
+            Some(Some("surface-key".to_string())),
+            "the signed plugin must scan in carrying its verifying key id, got {results:?}"
+        );
         // And an unsigned plugin's record carries None.
         let root2 = trust_scan_root("key-surface-unsigned");
         std::fs::create_dir_all(root2.join("unsigned")).unwrap();
