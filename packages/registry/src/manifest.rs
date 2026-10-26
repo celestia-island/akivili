@@ -678,6 +678,29 @@ impl PluginManifest {
                 }
             }
         }
+        // [[resources]] — list-level invariants. The webui host takes
+        // a plugin's page-type class from its `webui.page-type`
+        // resource, so a manifest declaring SEVERAL leaves the winner
+        // to feed order — an ambiguity no consumer can resolve (each
+        // host would silently first-win, the exact smell chest's
+        // catalog surfaced). At most one may appear; validate/pack
+        // rejects the ambiguity here, at the source (#1904 R2 and
+        // chest #1893 R2, S3 closeout).
+        {
+            let mut seen_page_type = false;
+            for (position, entry) in self.resources.iter().enumerate() {
+                if entry.kind.as_str() == crate::kinds::WEBUI_PAGE_TYPE {
+                    if seen_page_type {
+                        return Err(RegistryError::InvalidManifest(format!(
+                            "duplicate webui.page-type resource '{}' (manifest position {}): at most one webui.page-type resource per manifest — several leave the page class ambiguous",
+                            entry.name.as_deref().unwrap_or("<unnamed>"),
+                            position + 1,
+                        )));
+                    }
+                    seen_page_type = true;
+                }
+            }
+        }
         for migration in &self.migrations {
             migration.validate()?;
         }
@@ -2061,6 +2084,43 @@ kind = "edge.deploy"
         let err = manifest.validate().unwrap_err().to_string();
         assert!(
             err.contains("duplicate [[attachments]] surface 'engine'"),
+            "{err}"
+        );
+    }
+
+    /// A `webui.page-type` resource entry — the shape every page-class
+    /// plugin carries exactly once.
+    fn page_type_resource(name: &str) -> ResourceEntry {
+        ResourceEntry {
+            kind: ResourceKind::new(crate::kinds::WEBUI_PAGE_TYPE).expect("well-known kind"),
+            name: Some(name.to_string()),
+            order: 0,
+            payload: Payload::Inline(serde_json::json!({ "title": name })),
+        }
+    }
+
+    #[test]
+    fn one_page_type_resource_validates() {
+        // The legal shape: exactly one webui.page-type resource names
+        // the plugin's page class — validate passes.
+        let mut manifest = baseline();
+        manifest.resources = vec![page_type_resource("panel")];
+        manifest
+            .validate()
+            .expect("exactly one webui.page-type resource validates");
+    }
+
+    #[test]
+    fn two_page_type_resources_are_refused_at_validate() {
+        // The ambiguity the webui host cannot resolve: two page-type
+        // resources leave the class winner feed-order-dependent. The
+        // manifest layer refuses it loudly, naming the duplicate
+        // resource and its manifest position.
+        let mut manifest = baseline();
+        manifest.resources = vec![page_type_resource("panel"), page_type_resource("shell")];
+        let err = manifest.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate webui.page-type resource 'shell' (manifest position 2)"),
             "{err}"
         );
     }
