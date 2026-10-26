@@ -8,6 +8,9 @@ pub const WEBUI_STYLE: &str = "webui.style";
 pub const WEBUI_THEME: &str = "webui.theme";
 /// Well-known resource kind: a webui runtime module.
 pub const WEBUI_MODULE: &str = "webui.module";
+/// Well-known resource kind: a webui page-type registration — the
+/// plugin's page class for the webui host (at most one per manifest).
+pub const WEBUI_PAGE_TYPE: &str = "webui.page-type";
 /// Well-known resource kind: environment variables injected into a sandbox.
 pub const SANDBOX_ENV: &str = "sandbox.env";
 /// Well-known resource kind: an MCP tool registration.
