@@ -15,7 +15,7 @@ akivili_guard = { path = "../guard" }
 akivili_ptc = { path = "../ptc" }
 akivili_registry = { path = "../registry" }
 plana_domain_skills = { git = "https://github.com/celestia-island/plana.git", branch = "master" }
-plana_infra_utils = { package = "plana-infra-utils", version = "0.1" }
+plana_infra_utils = { package = "plana-infra-utils", git = "https://github.com/celestia-island/plana.git", branch = "master" }
 plana_state_sync = { git = "https://github.com/celestia-island/plana.git", branch = "master" }
 
 anyhow.workspace = true
