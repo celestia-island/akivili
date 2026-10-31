@@ -5,12 +5,12 @@ name: Publish crates
 # declaring that environment can read it. Trigger by pushing a `v*` tag (the
 # tag must match [workspace.package] version) or via workflow_dispatch.
 #
-# The published set is the "first batch": the three dependency-free crates
-# (guard, ptc, registry). The dependent crates (plugin-host, wasm-host,
-# loader) stay on publish = false until their git dependencies land on
-# crates.io; extend CRATES when they do. Order inside CRATES does not matter
-# for batch 1 (no intra-workspace deps); keep future additions in dependency
-# order anyway.
+# Order inside CRATES is dependency order (guard/ptc/registry ← akivili ←
+# wasm-host ← plugin-host ← loader). A dependent crate can only publish in a
+# run where its registry deps already exist: loader's package check resolves
+# akivili-plugin-host from crates.io, so the first deployment publishes the
+# dependency subset (workflow_dispatch `crates` input) and the follow-up run
+# publishes the rest. The default list is the full set.
 on:
   push:
     tags: [v*]
@@ -20,13 +20,17 @@ on:
         description: "Version to publish (must equal [workspace.package] version, e.g. 0.2.23)"
         required: true
         type: string
+      crates:
+        description: "Space-separated subset to publish this run (default: the full dependency-ordered list)"
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
-  CRATES: akivili-guard akivili-ptc akivili-registry akivili akivili-wasm-host akivili-plugin-host akivili-loader
+  CRATES: ${{ inputs.crates || 'akivili-guard akivili-ptc akivili-registry akivili akivili-wasm-host akivili-plugin-host akivili-loader' }}
 
 jobs:
   # ── Refuse to publish anything but the version the tag (or input) names ──
