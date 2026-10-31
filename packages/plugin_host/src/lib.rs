@@ -22,7 +22,8 @@ pub mod sandbox_env;
 pub mod ts_plugin;
 
 pub use host_ports::{
-    LlmReply, ModelTier, PluginEventBus, PluginLlmService, TriggerPattern, TriggerSubscription,
+    BoxFuture, LlmReply, ModelTier, PluginEventBus, PluginLlmService, TriggerPattern,
+    TriggerSubscription,
 };
 pub use plugin_router::PluginRouter;
 pub use plugin_state::{
