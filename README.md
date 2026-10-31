@@ -30,7 +30,7 @@ Plugins are defined inside a project's `.amphoreus/` directory (agent manifests,
 `plugin.ts` sources, and the Layer-3 subscription config), mirroring the role
 CLAUDE.md / AGENTS.md play for agent configuration.
 
-## The plugin registry (`akivili_registry`)
+## The plugin registry (`akivili-registry`)
 
 The registry unifies scattered extension mechanisms behind one model: hosts
 declare *what plugin resources they accept* (`HostAcceptance`), plugin management
@@ -113,7 +113,7 @@ installed from source — this requires members with repo access (GitHub
 credentials for `celestia-island/akivili`):
 
 ```sh
-cargo install --git https://github.com/celestia-island/akivili.git akivili_registry
+cargo install --git https://github.com/celestia-island/akivili.git akivili-registry
 ```
 
 | Command | Effect |

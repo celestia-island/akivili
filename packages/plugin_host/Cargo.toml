@@ -1,5 +1,5 @@
 [package]
-name = "akivili_plugin_host"
+name = "akivili-plugin-host"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,9 +11,9 @@ categories.workspace = true
 publish.workspace = true
 
 [dependencies]
-akivili_guard = { path = "../guard" }
-akivili_ptc = { path = "../ptc" }
-akivili_registry = { path = "../registry" }
+akivili-guard = { path = "../guard" }
+akivili-ptc = { path = "../ptc" }
+akivili-registry = { path = "../registry" }
 plana_domain_skills = { git = "https://github.com/celestia-island/plana.git", branch = "master" }
 plana_infra_utils = { package = "plana-infra-utils", git = "https://github.com/celestia-island/plana.git", branch = "master" }
 plana_state_sync = { git = "https://github.com/celestia-island/plana.git", branch = "master" }

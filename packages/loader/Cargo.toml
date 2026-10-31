@@ -1,5 +1,5 @@
 [package]
-name = "akivili_loader"
+name = "akivili-loader"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ categories.workspace = true
 publish.workspace = true
 
 [dependencies]
-akivili_registry = { path = "../registry" }
+akivili-registry = { path = "../registry" }
 anyhow.workspace = true
 bytes.workspace = true
 serde.workspace = true
@@ -22,15 +22,15 @@ tracing.workspace = true
 
 # The F1 outlet: only consumers who opt into wasm pull the runtime stack
 # (the D9 weight discipline — the loader core itself stays tairitsu-free).
-akivili_wasm_host = { path = "../wasm_host", optional = true }
+akivili-wasm-host = { path = "../wasm_host", optional = true }
 # The F3 outlet: script plugins ride the boa PTC stack (plugin_host);
 # hosts that never run scripts stay free of the JS engine.
-akivili_plugin_host = { path = "../plugin_host", optional = true }
+akivili-plugin-host = { path = "../plugin_host", optional = true }
 
 [features]
 default = []
-wasm = ["dep:akivili_wasm_host", "akivili_wasm_host/tairitsu"]
-script = ["dep:akivili_plugin_host"]
+wasm = ["dep:akivili-wasm-host", "akivili-wasm-host/tairitsu"]
+script = ["dep:akivili-plugin-host"]
 
 [dev-dependencies]
 tempfile.workspace = true

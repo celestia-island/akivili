@@ -1,5 +1,5 @@
 [package]
-name = "akivili_wasm_host"
+name = "akivili-wasm-host"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

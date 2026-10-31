@@ -1,5 +1,5 @@
 [package]
-name = "akivili_registry"
+name = "akivili-registry"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

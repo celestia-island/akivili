@@ -1,5 +1,5 @@
 [package]
-name = "akivili_ptc"
+name = "akivili-ptc"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
