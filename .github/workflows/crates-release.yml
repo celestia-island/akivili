@@ -89,10 +89,19 @@ jobs:
         run: |
           # Resumable: a mid-batch failure (e.g. crate 2 of 3 loses network)
           # is fixed by rerunning the workflow — crates already on crates.io
-          # are detected via `cargo info` and skipped instead of failing the
-          # rerun with "already uploaded".
+          # are skipped instead of failing the rerun with "already uploaded".
+          #
+          # The probe hits the crates.io sparse index directly. `cargo info`
+          # is deliberately NOT used: inside this workspace it matches the
+          # LOCAL member first ("from ./packages/...") and reports success
+          # for crates that were never published (v0.2.23 lesson).
+          published() {
+            local name="$1" ver="$2"
+            curl -fsSL "https://index.crates.io/${name:0:2}/${name:2:2}/${name}" 2>/dev/null \
+              | grep -q "\"vers\":\"${ver}\""
+          }
           for crate in $CRATES; do
-            if cargo info "${crate}@${CRATE_VERSION}" > /dev/null 2>&1; then
+            if published "$crate" "$CRATE_VERSION"; then
               echo "::notice::${crate}@${CRATE_VERSION} is already on crates.io — skipping"
               continue
             fi
