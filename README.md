@@ -1,4 +1,22 @@
-# akivili — Plugin SDK for celestia-island
+<p align="center"><img src="https://raw.githubusercontent.com/celestia-island/akivili/master/res/logo/celestia.webp" alt="akivili" width="240" /></p>
+
+<h1 align="center">Akivili</h1>
+
+<p align="center">
+  <strong>Plugin SDK for celestia-island — the agent plugin host and the TypeScript execution pipeline</strong>
+</p>
+
+<br />
+
+<div align="center">
+
+[![CI](https://img.shields.io/github/actions/workflow/status/celestia-island/akivili/checks.yml?branch=master)](https://github.com/celestia-island/akivili/actions/workflows/checks.yml)
+[![License: SySL-1.0](https://img.shields.io/badge/License-SySL--1.0-blue.svg)](https://sysl.celestia.world)
+[![GitHub](https://img.shields.io/badge/github-celestia--island%2Fakivili-blue.svg)](https://github.com/celestia-island/akivili)
+
+</div>
+
+<br />
 
 > Named after Akivili, the Trailblaze Aeon from *Honkai: Star Rail* — the spirit of
 > trailblazing third-party agent ecosystems.
@@ -108,9 +126,9 @@ from any runtime. See the `packages/registry` rustdoc for the full reference.
 ## The `akivili-plugin` CLI
 
 `akivili-plugin` is a thin shell over the registry library, for humans and ops.
-The repository is private (it will not be published to crates.io), so the CLI is
-installed from source — this requires members with repo access (GitHub
-credentials for `celestia-island/akivili`):
+The crates are on their way to crates.io (publication in preparation); until the
+first publish lands, the CLI is installed from source — this requires members
+with repo access (GitHub credentials for `celestia-island/akivili`):
 
 ```sh
 cargo install --git https://github.com/celestia-island/akivili.git akivili-registry
