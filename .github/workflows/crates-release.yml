@@ -1,0 +1,91 @@
+name: Publish crates
+
+# Publishes the crates.io batch to crates.io. The token is an *environment*
+# secret on the `release` environment (CRATES_IO_API_TOKEN), so only the job
+# declaring that environment can read it. Trigger by pushing a `v*` tag (the
+# tag must match [workspace.package] version) or via workflow_dispatch.
+#
+# The published set is the "first batch": the three dependency-free crates
+# (guard, ptc, registry). The dependent crates (plugin-host, wasm-host,
+# loader) stay on publish = false until their git dependencies land on
+# crates.io; extend CRATES when they do. Order inside CRATES does not matter
+# for batch 1 (no intra-workspace deps); keep future additions in dependency
+# order anyway.
+on:
+  push:
+    tags: [v*]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (must equal [workspace.package] version, e.g. 0.2.23)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CRATES: akivili-guard akivili-ptc akivili-registry
+
+jobs:
+  # ── Refuse to publish anything but the version the tag (or input) names ──
+  verify-version:
+    name: Verify version matches tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve the requested version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Compare with [workspace.package] version
+        run: |
+          WANT="${{ steps.version.outputs.version }}"
+          HAVE=$(grep -oP '^\s*version\s*=\s*"\K[^"]+' Cargo.toml | head -1)
+          if [ "$HAVE" != "$WANT" ]; then
+            echo "::error::[workspace.package] version ($HAVE) != requested version ($WANT)"
+            exit 1
+          fi
+          echo "Publishing version $HAVE for: $CRATES"
+
+  # ── Package check: what exactly will be uploaded ────────────────────────-
+  package-check:
+    name: Package check
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: verify-version
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: List and package every crate without verification
+        run: |
+          for crate in $CRATES; do
+            cargo package -p "$crate" --list
+            cargo package -p "$crate" --no-verify
+          done
+
+  # ── Real publish, gated on the `release` environment token ──────────────-
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    needs: [verify-version, package-check]
+    environment: release
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
+        run: |
+          for crate in $CRATES; do
+            cargo publish -p "$crate"
+          done
