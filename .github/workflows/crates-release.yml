@@ -26,7 +26,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  CRATES: akivili-guard akivili-ptc akivili-registry
+  CRATES: akivili-guard akivili-ptc akivili-registry akivili
 
 jobs:
   # ── Refuse to publish anything but the version the tag (or input) names ──

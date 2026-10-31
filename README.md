@@ -183,6 +183,7 @@ packages/plugin_host/   plugin host core (Boa TS runtime, router, state)
 packages/ptc/           TypeScript → JavaScript pipeline (SWC + Boa)
 packages/registry/      plugin registry (manifests, feed, audit, akivili-plugin CLI)
 packages/guard/         egress network guard (URL/IP policy, DNS-rebinding-safe)
+packages/umbrella/      the `akivili` facade crate (feature-gated re-exports)
 docs/                   architecture & contract documentation
 res/logo/               brand assets (temporary celestia-island logo)
 ```

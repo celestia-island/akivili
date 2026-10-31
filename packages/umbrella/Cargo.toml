@@ -1,0 +1,26 @@
+[package]
+name = "akivili"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Plugin SDK for celestia-island — one-line dependency for the plugin registry, the egress network guard and the TypeScript execution pipeline"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = true
+
+# The umbrella facade: every outlet is optional and feature-gated so a
+# consumer only pays for what they use (the D9 weight discipline — the
+# default build pulls in the registry alone, not the SWC stack).
+[dependencies]
+akivili-guard = { path = "../guard", version = "^0.2", optional = true }
+akivili-ptc = { path = "../ptc", version = "^0.2", optional = true }
+akivili-registry = { path = "../registry", version = "^0.2", optional = true }
+
+[features]
+default = ["registry"]
+guard = ["dep:akivili-guard"]
+ptc = ["dep:akivili-ptc"]
+registry = ["dep:akivili-registry"]
+full = ["guard", "ptc", "registry"]
