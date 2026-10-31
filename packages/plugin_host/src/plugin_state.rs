@@ -10,12 +10,10 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::guard::NetworkGuard;
-use plana_domain_skills::{
-    llm_subcall::LlmSubcallService,
-    trigger_types::{TriggerPattern, TriggerSubscription},
+use crate::host_ports::{
+    ModelTier, PluginEventBus as PubSubBus, PluginLlmService as LlmSubcallService, TriggerPattern,
+    TriggerSubscription,
 };
-use plana_infra_utils::pubsub::PubSubBus;
-use plana_state_sync::ModelTier;
 
 /// Installs the ring-based rustls crypto provider once per process.
 ///

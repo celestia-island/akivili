@@ -1115,14 +1115,13 @@ var onMessage = function(platform, message) {
     /// one request), with no runtime entered anywhere in the process.
     mod bare_thread_host_apis {
         use super::*;
-        use async_trait::async_trait;
-        use plana_domain_skills::llm_subcall::{LlmSubcallResult, LlmSubcallService};
-        use plana_infra_utils::pubsub::{PubSubBus, PubSubEvent};
-        use plana_state_sync::{Agent, ModelTier};
+        use crate::host_ports::{
+            BoxFuture, LlmReply, ModelTier, PluginEventBus as PubSubBus,
+            PluginLlmService as LlmSubcallService,
+        };
         use serde_json::Value;
         use std::io::{Read, Write};
         use std::net::{IpAddr, Ipv4Addr, TcpListener};
-        use tokio::sync::broadcast;
 
         /// Runs one plugin dispatch on a bare `std::thread`, mirroring
         /// `TsPluginPool`'s worker loop (`create_and_load` then
@@ -1148,52 +1147,34 @@ var onMessage = function(platform, message) {
             published: Mutex<Vec<(String, Value)>>,
         }
 
-        #[async_trait]
         impl PubSubBus for RecordingBus {
-            async fn publish(&self, topic: &str, payload: Value) {
-                self.published
-                    .lock()
-                    .unwrap()
-                    .push((topic.to_string(), payload));
-            }
-
-            async fn subscribe(&self, _pattern: &str) -> broadcast::Receiver<PubSubEvent> {
-                broadcast::channel(1).1
-            }
-
-            fn subscriber_count(&self, _topic: &str) -> usize {
-                0
+            fn publish<'a>(&'a self, topic: &'a str, payload: Value) -> BoxFuture<'a, ()> {
+                Box::pin(async move {
+                    self.published
+                        .lock()
+                        .unwrap()
+                        .push((topic.to_string(), payload));
+                })
             }
         }
 
         struct EchoLlm;
 
-        #[async_trait]
         impl LlmSubcallService for EchoLlm {
-            async fn llm_chat(
-                &self,
+            fn llm_chat<'a>(
+                &'a self,
                 _tier: ModelTier,
-                prompt: &str,
-                _system_prompt: Option<&str>,
+                prompt: &'a str,
+                _system_prompt: Option<&'a str>,
                 _max_tokens: Option<u32>,
                 _temperature: Option<f32>,
-            ) -> LlmSubcallResult {
-                LlmSubcallResult {
-                    success: true,
-                    content: format!("echo:{}", prompt),
-                    model_name: None,
-                    token_usage: None,
-                }
-            }
-
-            fn record_token_usage(
-                &self,
-                _agent_id: &str,
-                _agent_type: Agent,
-                _model_name: Option<&str>,
-                _input_tokens: u32,
-                _output_tokens: u32,
-            ) {
+            ) -> BoxFuture<'a, LlmReply> {
+                Box::pin(async move {
+                    LlmReply {
+                        success: true,
+                        content: format!("echo:{}", prompt),
+                    }
+                })
             }
         }
 

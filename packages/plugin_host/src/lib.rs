@@ -15,11 +15,15 @@
 
 pub use akivili_guard as guard;
 pub mod grants;
+pub mod host_ports;
 pub mod plugin_router;
 pub mod plugin_state;
 pub mod sandbox_env;
 pub mod ts_plugin;
 
+pub use host_ports::{
+    LlmReply, ModelTier, PluginEventBus, PluginLlmService, TriggerPattern, TriggerSubscription,
+};
 pub use plugin_router::PluginRouter;
 pub use plugin_state::{
     HostApiProvider, HostFunctions, RegisteredMcpTool, TriggerDispatcherHolder,

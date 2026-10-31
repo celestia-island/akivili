@@ -8,15 +8,12 @@ description = "Agent plugin host — Boa TypeScript runtime, plugin router and h
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
-publish.workspace = true
+publish = true
 
 [dependencies]
-akivili-guard = { path = "../guard" }
-akivili-ptc = { path = "../ptc" }
-akivili-registry = { path = "../registry" }
-plana_domain_skills = { package = "plana-domain-skills", git = "https://github.com/celestia-island/plana.git", branch = "master" }
-plana_infra_utils = { package = "plana-infra-utils", git = "https://github.com/celestia-island/plana.git", branch = "master" }
-plana_state_sync = { package = "plana-state-sync", git = "https://github.com/celestia-island/plana.git", branch = "master" }
+akivili-guard = { path = "../guard", version = "^0.2" }
+akivili-ptc = { path = "../ptc", version = "^0.2" }
+akivili-registry = { path = "../registry", version = "^0.2" }
 
 anyhow.workspace = true
 boa_engine.workspace = true

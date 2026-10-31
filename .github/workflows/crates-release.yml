@@ -26,7 +26,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+<<<<<<< HEAD
   CRATES: akivili-guard akivili-ptc akivili-registry akivili akivili-wasm-host
+=======
+  CRATES: akivili-guard akivili-ptc akivili-registry akivili akivili-wasm-host akivili-plugin-host akivili-loader
+>>>>>>> 15070b1 (♻️ Extract the host ports so the plugin host ships plana-free.)
 
 jobs:
   # ── Refuse to publish anything but the version the tag (or input) names ──
