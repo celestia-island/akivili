@@ -14,9 +14,9 @@ publish.workspace = true
 akivili-guard = { path = "../guard" }
 akivili-ptc = { path = "../ptc" }
 akivili-registry = { path = "../registry" }
-plana_domain_skills = { git = "https://github.com/celestia-island/plana.git", branch = "master" }
+plana_domain_skills = { package = "plana-domain-skills", git = "https://github.com/celestia-island/plana.git", branch = "master" }
 plana_infra_utils = { package = "plana-infra-utils", git = "https://github.com/celestia-island/plana.git", branch = "master" }
-plana_state_sync = { git = "https://github.com/celestia-island/plana.git", branch = "master" }
+plana_state_sync = { package = "plana-state-sync", git = "https://github.com/celestia-island/plana.git", branch = "master" }
 
 anyhow.workspace = true
 boa_engine.workspace = true
