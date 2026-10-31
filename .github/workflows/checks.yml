@@ -75,10 +75,10 @@ jobs:
       - name: Install wasm32-wasip2 target
         run: rustup target add wasm32-wasip2
       - name: Compile check (tairitsu adapter)
-        run: cargo check -p akivili_wasm_host --features tairitsu --all-targets
+        run: cargo check -p akivili-wasm-host --features tairitsu --all-targets
       - name: Clippy (tairitsu adapter)
-        run: cargo clippy -p akivili_wasm_host --features tairitsu --all-targets -- -D warnings
+        run: cargo clippy -p akivili-wasm-host --features tairitsu --all-targets -- -D warnings
       - name: Tests (tairitsu adapter)
-        run: cargo test -p akivili_wasm_host --features tairitsu
+        run: cargo test -p akivili-wasm-host --features tairitsu
       - name: Tests (loader wasm face)
-        run: cargo test -p akivili_loader --features wasm
+        run: cargo test -p akivili-loader --features wasm
