@@ -1,0 +1,5 @@
+[cross]
+# The cargo workspace and the npm package are one line moved together
+# (0.2.23/0.2.23); a release commit must bump both slots in lockstep or the
+# gate goes red (ledger #19, devtools #227).
+cargo_npm = "lockstep"
