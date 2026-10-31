@@ -25,9 +25,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 tairitsu = { git = "https://github.com/celestia-island/tairitsu.git", branch = "master", optional = true, features = ["dynamic"] }
-# Aligned with tairitsu's wasmtime (^47 — one copy after unification);
+# Aligned with tairitsu's wasmtime (^48 — one copy after unification);
 # only the Error type and the ABI surfaces the closures need.
-wasmtime = { version = "^47", optional = true }
+wasmtime = { version = "^48", optional = true }
 
 [dev-dependencies]
 tokio = { version = "^1", features = ["rt", "macros"] }
