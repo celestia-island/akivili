@@ -24,11 +24,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
-# The published tairitsu line (0.5.22) still carries wasmtime ^47; the
-# registry pin keeps this crate publishable (crates.io rejects git deps).
-# The 0.5.23 line moves to wasmtime ^48 — bump both together once it ships.
+# tairitsu 0.5.23 moved the runtime to wasmtime ^48; both pins move
+# together (0.2.24 rides that line, keeping the single-copy discipline).
 tairitsu = { version = "^0.5", optional = true, features = ["dynamic"] }
-wasmtime = { version = "^47", optional = true }
+wasmtime = { version = "^48", optional = true }
 
 [dev-dependencies]
 tokio = { version = "^1", features = ["rt", "macros"] }
