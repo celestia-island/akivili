@@ -1,6 +1,13 @@
 name: npm Release
 
 on:
+  # Tag anchor added per versioning-audit B1 (2026-11-04): this lane was the
+  # only npm publisher with no tag at all — dispatch-only with a hand-typed
+  # version let npm drift 2-3 waves behind the crates line unnoticed.
+  # npm-v<version> now anchors every real release; dispatch stays for
+  # re-publishes and version bumps that outpace the tag.
+  push:
+    tags: ["npm-v*"]
   workflow_dispatch:
     inputs:
       version:
