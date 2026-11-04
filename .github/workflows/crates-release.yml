@@ -77,11 +77,22 @@ jobs:
           done
 
   # ── Real publish, gated on the `release` environment token ──────────────-
+  # ── Semver gate: a tag whose API diff requires a bigger bump than the
+  #    manifest must never reach crates.io (versioning-audit B2, 2026-11-04;
+  #    the wasm-host 0.2.24 lone-shark wave made the family's bump discipline
+  #    visible). Pinned devtools ref per H14.
+  semver-checks:
+    name: Semver API diff (published crates)
+    needs: verify-version
+    uses: celestia-island/celestia-devtools/.github/workflows/semver-checks.yml@f39afe4c782e4bcf66d2aca291274624afa615dd
+    with:
+      runs-on-json: '["ubuntu-latest"]'
+
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    needs: [verify-version, package-check]
+    needs: [verify-version, package-check, semver-checks]
     environment: release
     steps:
       - uses: actions/checkout@v7
