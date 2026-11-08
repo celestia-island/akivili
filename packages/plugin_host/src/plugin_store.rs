@@ -101,12 +101,16 @@ pub enum PluginStoreError {
         source: anyhow::Error,
     },
 
-    /// A migration step failed. Disk keeps the last successfully persisted
-    /// version, so the plugin stays runnable at that version (loss-free
-    /// rollback = reload the snapshot still on disk).
+    /// A migration step failed. The input state was persisted at `from`
+    /// before the first step ran, so that snapshot stays loadable via
+    /// [`PluginDataStore::load_version`] (loss-free rollback = reload it).
+    /// Versions persisted by *earlier* migrations may still sit on disk
+    /// above `from`: `from` is this migration's last good write, not
+    /// necessarily the store's latest version.
     #[error(
         "plugin {plugin_id}: state migration step {from} -> {to} failed: {source} \
-         (state on disk remains at {from})"
+         (this migration last persisted version {from}: reload it with load_version; \
+         disk may also hold newer versions from earlier migrations)"
     )]
     MigrationFailed {
         plugin_id: String,
@@ -285,6 +289,13 @@ impl PluginDataStore {
     ///   explicit host action, never a silent conversion.
     /// - Latest file unparsable or declaring 0:
     ///   [`PluginStoreError::CorruptState`] / [`PluginStoreError::InvalidStateVersion`].
+    ///
+    /// The comparison trusts the file's declared `state_version` over the
+    /// directory number: `save` derives the directory from the declared
+    /// version, so the two agree for every host-written state; a
+    /// foreign-written file that disagrees is still *reached* through its
+    /// directory but classified by its declared version, and
+    /// [`PluginStoreError::VersionMismatch`] reports the declared number.
     pub fn load(
         &self,
         plugin_id: &str,
@@ -428,7 +439,7 @@ impl std::fmt::Debug for StateMigrationTable {
                 &self
                     .steps
                     .keys()
-                    .map(|from| (*from, *from + 1))
+                    .map(|from| (*from, from.saturating_add(1)))
                     .collect::<Vec<_>>(),
             )
             .finish()
@@ -454,9 +465,14 @@ impl StateMigrationTable {
                 found: from,
             });
         }
-        if self.steps.insert(from, f).is_some() {
+        if self.steps.contains_key(&from) {
+            // Check before insert: `BTreeMap::insert` would otherwise
+            // REPLACE the registered step and only then report the error,
+            // leaving the table running the *new* function — a refused
+            // registration must change nothing.
             return Err(PluginStoreError::TableConflict { from });
         }
+        self.steps.insert(from, f);
         Ok(self)
     }
 
@@ -480,8 +496,12 @@ impl MigrationRunner {
     /// - Missing intermediate step: [`PluginStoreError::MissingStep`],
     ///   detected *before* any step runs (and before the snapshot below) —
     ///   a misconfigured table never does partial work.
-    /// - Step failure: [`PluginStoreError::MigrationFailed`]; the last
-    ///   successfully persisted version stays loadable on disk.
+    /// - Step failure: [`PluginStoreError::MigrationFailed`]; the input
+    ///   snapshot at `from` (plus every version this run persisted before
+    ///   the failing step) stays loadable via
+    ///   [`PluginDataStore::load_version`]. Disk may additionally hold
+    ///   newer versions from earlier migrations — this runner never
+    ///   consults or prunes those (recovery policy is the caller's).
     ///
     /// Before the first step runs, the runner persists the input state at
     /// its *own* version (pre-migration snapshot, design §4.3) — even when
@@ -987,6 +1007,10 @@ mod tests {
         state.kv.insert("k".into(), "v".into());
         store.save("p1", &state).unwrap();
         let before = fs::read_to_string(store.state_path("p1", 2)).unwrap();
+        let mtime_before = fs::metadata(store.state_path("p1", 2))
+            .unwrap()
+            .modified()
+            .unwrap();
 
         let table = StateMigrationTable::new();
         let out = MigrationRunner::default()
@@ -998,6 +1022,16 @@ mod tests {
         assert_eq!(
             fs::read_to_string(store.state_path("p1", 2)).unwrap(),
             before
+        );
+        // Zero-IO pin: a regression that re-saves instead of early-
+        // returning would move the mtime even when the bytes come out
+        // identical.
+        assert_eq!(
+            fs::metadata(store.state_path("p1", 2))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            mtime_before
         );
     }
 
@@ -1030,6 +1064,10 @@ mod tests {
             .migrate(&store, &table, "p1", store.load("p1", 1).unwrap(), 2)
             .unwrap();
         let before = fs::read_to_string(store.state_path("p1", 2)).unwrap();
+        let mtime_before = fs::metadata(store.state_path("p1", 2))
+            .unwrap()
+            .modified()
+            .unwrap();
 
         // Replay: same (from -> to) registered, state already migrated.
         let replayed = MigrationRunner::default()
@@ -1039,6 +1077,14 @@ mod tests {
         assert_eq!(
             fs::read_to_string(store.state_path("p1", 2)).unwrap(),
             before
+        );
+        // Zero-IO pin (same rationale as the no-op test above).
+        assert_eq!(
+            fs::metadata(store.state_path("p1", 2))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            mtime_before
         );
         let raw: serde_json::Value = serde_json::from_str(&replayed.kv["cfg"]).unwrap();
         assert_eq!(raw["$version"], serde_json::json!("2"));
@@ -1079,9 +1125,9 @@ mod tests {
         // A broken table (missing step) must do ZERO IO — not even the
         // pre-migration snapshot — pinning the deliberate order: version
         // checks -> gap check -> snapshot -> steps. Config errors have no
-        // side effects by design; the unsaved input is returned to the
-        // caller as the MissingStep error path's moved value, never
-        // partially persisted.
+        // side effects by design; the unsaved input is dropped with the
+        // error (migrate consumes it by value — a caller that needs it
+        // back must save before migrating), never partially persisted.
         let (_dir, store) = tmp_store();
         let state = PluginState::empty_at(1).unwrap();
         let table = StateMigrationTable::new(); // no 1->2 step registered
@@ -1212,11 +1258,39 @@ mod tests {
 
     #[test]
     fn duplicate_step_registration_is_refused() {
+        // The refused duplicate must leave the table UNCHANGED: the first
+        // step keeps running, not the one passed to the failing call
+        // (an insert-then-error implementation would have swapped it —
+        // pinned by giving the two closures different observable effects).
+        let (_dir, store) = tmp_store();
         let mut table = StateMigrationTable::new();
-        assert!(table.step(1, raw_step(|_| Ok(()))).is_ok());
+        table
+            .step(
+                1,
+                raw_step(|s| {
+                    s.kv.insert("first".into(), "kept".into());
+                    Ok(())
+                }),
+            )
+            .unwrap();
         assert!(matches!(
-            table.step(1, raw_step(|_| Ok(()))),
+            table.step(
+                1,
+                raw_step(|s| {
+                    s.kv.insert("second".into(), "swapped-in".into());
+                    Ok(())
+                })
+            ),
             Err(PluginStoreError::TableConflict { from: 1 })
         ));
+
+        // Unit struct: constructing directly keeps this new call site free
+        // of the `default_constructed_unit_structs` lint (the surrounding
+        // pre-existing call sites predate this test — see PR residuals).
+        let out = MigrationRunner
+            .migrate(&store, &table, "p1", PluginState::empty_at(1).unwrap(), 2)
+            .unwrap();
+        assert_eq!(out.kv["first"], "kept");
+        assert!(!out.kv.contains_key("second"));
     }
 }
