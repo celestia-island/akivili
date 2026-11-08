@@ -36,6 +36,7 @@ async-trait = "^0.1"
 boa_engine = "^0.21"
 boa_gc = "^0.21"
 boa_runtime = "^0.21"
+hifumi = "^0.2"
 parking_lot = "^0.12"
 reqwest = { version = "^0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
 rustls = { version = "^0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }

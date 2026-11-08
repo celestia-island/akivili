@@ -19,6 +19,7 @@ anyhow.workspace = true
 boa_engine.workspace = true
 boa_gc.workspace = true
 boa_runtime.workspace = true
+hifumi.workspace = true
 parking_lot.workspace = true
 reqwest.workspace = true
 rustls.workspace = true

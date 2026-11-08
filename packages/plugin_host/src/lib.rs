@@ -8,7 +8,9 @@
 //! - [`TsPlugin`]: Executes PTC TypeScript tool code in the Boa JS sandbox.
 //! - [`PluginRouter`]: Central registry that dispatches MCP tool calls to
 //!   the correct agent package by tool name.
-//! - [`PluginState`]: Host API surface exposed to TS tools.
+//! - [`plugin_state`]: Host API surface (in-memory kv) exposed to TS tools.
+//! - [`plugin_store`]: Persistent per-plugin state store with versioned
+//!   state migrations ([`PersistentPluginState`]).
 //! - [`SandboxEnvFeed`]: Feeds sandbox environment variables from the plugin
 //!   registry ([`akivili_registry`]) into the plugin sandboxes.
 #![allow(clippy::type_complexity)]
@@ -18,6 +20,7 @@ pub mod grants;
 pub mod host_ports;
 pub mod plugin_router;
 pub mod plugin_state;
+pub mod plugin_store;
 pub mod sandbox_env;
 pub mod ts_plugin;
 
@@ -28,5 +31,9 @@ pub use host_ports::{
 pub use plugin_router::PluginRouter;
 pub use plugin_state::{
     HostApiProvider, HostFunctions, RegisteredMcpTool, TriggerDispatcherHolder,
+};
+pub use plugin_store::{
+    MIN_STATE_VERSION, MigrationRunner, PluginDataStore, PluginState as PersistentPluginState,
+    PluginStoreError, StateMigrationFn, StateMigrationTable,
 };
 pub use sandbox_env::SandboxEnvFeed;
