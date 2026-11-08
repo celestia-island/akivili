@@ -18,6 +18,7 @@ pub mod grants;
 pub mod host_ports;
 pub mod plugin_router;
 pub mod plugin_state;
+pub mod plugin_store;
 pub mod sandbox_env;
 pub mod ts_plugin;
 
@@ -28,5 +29,9 @@ pub use host_ports::{
 pub use plugin_router::PluginRouter;
 pub use plugin_state::{
     HostApiProvider, HostFunctions, RegisteredMcpTool, TriggerDispatcherHolder,
+};
+pub use plugin_store::{
+    MIN_STATE_VERSION, MigrationRunner, PluginDataStore, PluginState as PersistentPluginState,
+    PluginStoreError, StateMigrationFn, StateMigrationTable,
 };
 pub use sandbox_env::SandboxEnvFeed;
