@@ -93,6 +93,16 @@ resources at startup which they load one by one (`ResourceFeed` → `ResourceHan
   120 s). Every cross-reference must resolve inside the same manifest —
   unknown agent folders, undeclared server origins, unsigned scripts and
   dangling tool names are validation errors.
+- **Permission declarations (`[[permissions]]`)** — the RBAC catalog
+  contract: a plugin may declare new grantable permission points, each a
+  dotted path namespaced `plugin.<plugin-id>.<verb…>` (verb segments are
+  `^[a-z][a-z0-9_]*$`, ≤ 64 entries per manifest, `en` description
+  required). Namespacing makes cross-plugin collisions and host-vocabulary
+  shadowing (`plugin.read` &co. stay two-segment) impossible by
+  construction. The host surfaces declared points in its live permission
+  catalog the moment the store record carries them; enforcement stays the
+  host's string-grant machinery. Absent/empty = no declarations (fully
+  backward compatible).
 - **Feed semantics** — `Registry::feed(&HostAcceptance)` filters enabled plugins'
   entries down to the kinds the host accepts, ordered by `order` (ties broken by
   plugin id, then manifest position). A feed is a snapshot: file payloads are read

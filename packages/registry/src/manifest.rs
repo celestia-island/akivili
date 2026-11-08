@@ -129,6 +129,16 @@ pub struct PluginManifest {
     /// cosmos containers), each bound to one declared agent folder.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerEntry>,
+    /// Permission declarations (manifest `[[permissions]]`) — the RBAC
+    /// catalog contract: a plugin may declare new grantable permission
+    /// points, each namespaced `plugin.<id>.<verb>` so two plugins can
+    /// never collide and neither can shadow the closed host vocabulary.
+    /// The host merges declared points into its live permission catalog
+    /// (admin editors list them; grants travel as the raw dotted
+    /// string). Absent/empty = no declarations (fully backward
+    /// compatible).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permissions: Vec<PermissionEntry>,
 }
 
 /// Cap on one agent's declared `tools`/`skills` stems — mirrors the
@@ -197,6 +207,37 @@ pub struct AgentToolEntry {
 
 fn default_tool_schema() -> serde_json::Value {
     serde_json::json!({})
+}
+
+/// Cap on declared `[[permissions]]` entries per manifest — keeps one
+/// plugin from flooding the host's admin catalog (the builtin typed
+/// vocabulary it joins is ~50 leaves).
+pub const MAX_PERMISSION_DECLARATIONS: usize = 64;
+
+/// One permission declaration (manifest `[[permissions]]`).
+///
+/// The RBAC catalog half of the plugin permission contract. The host
+/// surfaces declared points in its live permission catalog the moment
+/// the store record carries them (install/sync feeds the catalog; the
+/// admin editors list them; grants travel as the raw dotted string).
+/// Enforcement stays the host's string-grant machinery — the plugins.rs
+/// "permission point + grant decides" pattern; nothing here forces a
+/// handler to check the point.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionEntry {
+    /// Dotted permission path. MUST be prefixed `plugin.<plugin-id>.`
+    /// and end in one or more verb segments (`^[a-z][a-z0-9_]*$` per
+    /// segment): `plugin.<id>.export`, never bare `plugin.read` — the
+    /// two-segment shape is the closed host vocabulary and stays
+    /// unreachable by construction.
+    pub path: String,
+    /// Un-localized one-line description (the catalog's fallback label).
+    pub description: String,
+    /// Localized descriptions keyed by locale tag; `en` is required
+    /// (the family's manifest i18n convention).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub description_i18n: BTreeMap<String, String>,
 }
 
 /// One install script (manifest `[[installs]]`).
@@ -566,6 +607,7 @@ impl Default for PluginManifest {
             agent_tools: Vec::new(),
             installs: Vec::new(),
             mcp_servers: Vec::new(),
+            permissions: Vec::new(),
         }
     }
 }
@@ -1053,6 +1095,66 @@ impl PluginManifest {
                 }
             }
         }
+
+        // [[permissions]] — the RBAC catalog contract. Every path is
+        // namespaced `plugin.<this manifest's id>.…`: two plugins can
+        // never collide, and the two-segment host vocabulary
+        // (`plugin.read` … `plugin.manage`) is unreachable by
+        // construction (a declaration always carries ≥ 3 segments).
+        // Verbs share the capability-stem charset per segment; `en`
+        // description is required (the family's i18n convention).
+        {
+            if self.permissions.len() > MAX_PERMISSION_DECLARATIONS {
+                return Err(RegistryError::InvalidManifest(format!(
+                    "manifest declares {} [[permissions]] entries (cap is {MAX_PERMISSION_DECLARATIONS})",
+                    self.permissions.len()
+                )));
+            }
+            let namespace = format!("plugin.{}.", self.id);
+            let mut seen_paths = std::collections::BTreeSet::new();
+            for permission in &self.permissions {
+                let Some(rest) = permission.path.strip_prefix(&namespace) else {
+                    return Err(RegistryError::InvalidManifest(format!(
+                        "permission path '{}' must be prefixed '{namespace}' (plugin-namespaced points cannot shadow the host vocabulary)",
+                        permission.path
+                    )));
+                };
+                let ok_rest = !rest.is_empty()
+                    && rest.len() <= 96
+                    && rest.split('.').all(|seg| {
+                        !seg.is_empty()
+                            && seg.len() <= 48
+                            && seg.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                            && seg
+                                .chars()
+                                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    });
+                if !ok_rest {
+                    return Err(RegistryError::InvalidManifest(format!(
+                        "permission path '{}' verb part must be dot-joined ^[a-z][a-z0-9_]*$ segments (<= 48 chars each, <= 96 total)",
+                        permission.path
+                    )));
+                }
+                if permission.description.trim().is_empty() {
+                    return Err(RegistryError::InvalidManifest(format!(
+                        "permission '{}' carries an empty description",
+                        permission.path
+                    )));
+                }
+                if !permission.description_i18n.contains_key("en") {
+                    return Err(RegistryError::InvalidManifest(format!(
+                        "permission '{}' requires an \"en\" description_i18n entry",
+                        permission.path
+                    )));
+                }
+                if !seen_paths.insert(permission.path.clone()) {
+                    return Err(RegistryError::InvalidManifest(format!(
+                        "duplicate [[permissions]] path '{}'",
+                        permission.path
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -1433,7 +1535,90 @@ mod tests {
             agent_tools: Vec::new(),
             installs: Vec::new(),
             mcp_servers: Vec::new(),
+            permissions: Vec::new(),
         }
+    }
+
+    // ── [[permissions]] ───────────────────────────────────────────────
+
+    fn permission(path: &str) -> PermissionEntry {
+        PermissionEntry {
+            path: path.into(),
+            description: "Export table rows".into(),
+            description_i18n: BTreeMap::from([("en".into(), "Export table rows".into())]),
+        }
+    }
+
+    #[test]
+    fn permissions_section_is_optional_and_backward_compatible() {
+        let mut m = baseline();
+        assert!(m.validate().is_ok());
+        m.permissions = vec![permission("plugin.acme.export")];
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn permission_paths_must_carry_the_plugin_namespace() {
+        let mut m = baseline();
+        // Bare host vocabulary (two segments) — unreachable.
+        m.permissions = vec![permission("plugin.read")];
+        assert!(m.validate().is_err());
+        // Another plugin's namespace — refused.
+        m.permissions = vec![permission("plugin.other.export")];
+        assert!(m.validate().is_err());
+        // A host-looking domain — refused (not plugin-namespaced).
+        m.permissions = vec![permission("device.enroll")];
+        assert!(m.validate().is_err());
+        // Trailing dot / empty verb — refused.
+        m.permissions = vec![permission("plugin.acme.")];
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn permission_verb_segments_share_the_capability_charset() {
+        let mut m = baseline();
+        // Multi-segment verbs are fine when each segment is well-formed.
+        m.permissions = vec![permission("plugin.acme.table.export_rows")];
+        assert!(m.validate().is_ok());
+        // Bad first char / uppercase / hyphen / empty segment — refused.
+        for bad in [
+            "plugin.acme.1export",
+            "plugin.acme.Export",
+            "plugin.acme.export-rows",
+            "plugin.acme.export..rows",
+            "plugin.acme.export.",
+        ] {
+            m.permissions = vec![permission(bad)];
+            assert!(m.validate().is_err(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn permission_entries_need_description_and_en_i18n() {
+        let mut m = baseline();
+        let mut entry = permission("plugin.acme.export");
+        entry.description = "  ".into();
+        m.permissions = vec![entry];
+        assert!(m.validate().is_err());
+        let mut entry = permission("plugin.acme.export");
+        entry.description_i18n.remove("en");
+        m.permissions = vec![entry];
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn permission_paths_must_be_unique_and_capped() {
+        let mut m = baseline();
+        m.permissions = vec![
+            permission("plugin.acme.export"),
+            permission("plugin.acme.export"),
+        ];
+        assert!(m.validate().is_err());
+        let mut m = baseline();
+        m.permissions = (0..=MAX_PERMISSION_DECLARATIONS)
+            .map(|i| permission(&format!("plugin.acme.export_{i}")))
+            .collect();
+        assert!(m.validate().is_err());
     }
 
     #[test]
