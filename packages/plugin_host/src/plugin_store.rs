@@ -780,6 +780,25 @@ mod tests {
     }
 
     #[test]
+    fn foreign_zero_version_dir_is_ignored_by_discovery() {
+        // Only host code obeys the state_version>=1 contract (save refuses
+        // 0 before mkdir), so a "0" directory can only come from a foreign
+        // writer. Discovery ignores it: fresh-install reads stay fresh and
+        // the max stays over legal versions (mutation-round survivor M9 —
+        // without the filter the foreign dir would turn fresh installs
+        // into InvalidStateVersion errors; both fail-closed, but ignore is
+        // the documented classification).
+        let (_dir, store) = tmp_store();
+        let path = store.state_path("p1", 0);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"state_version":0,"kv":{}}"#).unwrap();
+
+        assert_eq!(store.latest_version("p1").unwrap(), None);
+        let state = store.load("p1", 1).unwrap();
+        assert!(state.kv.is_empty());
+    }
+
+    #[test]
     fn zero_version_is_illegal_everywhere() {
         let (_dir, store) = tmp_store();
         assert!(matches!(PluginState::empty_at(0), Err(_)));
@@ -1073,6 +1092,34 @@ mod tests {
         ));
         // No snapshot was written: the plugin directory was never created.
         assert!(!store.state_path("p1", 1).exists());
+    }
+
+    #[test]
+    fn typed_step_missing_key_fails_closed() {
+        // A typed step whose key is absent from the kv must FAIL the
+        // migration, never silently skip and advance state_version past an
+        // unmigrated document (mutation-round survivor M-X1: a silent-skip
+        // regression here would ship green without this test).
+        #[hifumi::version("2")]
+        #[derive(Debug, Clone, PartialEq)]
+        struct Cfg {
+            greeting: String,
+        }
+
+        let (_dir, store) = tmp_store();
+        let state = PluginState::empty_at(1).unwrap(); // no "cfg" entry
+        store.save("p1", &state).unwrap();
+
+        let mut table = StateMigrationTable::new();
+        table.step(1, typed_state_step::<Cfg>("cfg")).unwrap();
+        let err = MigrationRunner::default()
+            .migrate(&store, &table, "p1", store.load("p1", 1).unwrap(), 2)
+            .unwrap_err();
+        assert!(matches!(
+            &err,
+            PluginStoreError::MigrationFailed { from: 1, to: 2, .. }
+        ));
+        assert!(!store.state_path("p1", 2).exists());
     }
 
     #[test]
