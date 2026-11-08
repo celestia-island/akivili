@@ -11,9 +11,9 @@ categories.workspace = true
 publish = true
 
 [dependencies]
-akivili-guard = { path = "../guard", version = "^0.2" }
-akivili-ptc = { path = "../ptc", version = "^0.2" }
-akivili-registry = { path = "../registry", version = "^0.2" }
+akivili-guard = { path = "../guard", version = "^0.3" }
+akivili-ptc = { path = "../ptc", version = "^0.3" }
+akivili-registry = { path = "../registry", version = "^0.3" }
 
 anyhow.workspace = true
 boa_engine.workspace = true
