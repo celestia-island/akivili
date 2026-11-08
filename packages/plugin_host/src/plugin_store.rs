@@ -838,6 +838,7 @@ mod tests {
         // and otherwise illegal ids fail closed instead of escaping the
         // root (registry charset [a-z0-9][a-z0-9-]*).
         let (_dir, store) = tmp_store();
+        let table = StateMigrationTable::new();
         for bad in ["../evil", "a/b", "", "-x", "UPPER", "spa ce", "."] {
             assert!(
                 matches!(
@@ -852,6 +853,33 @@ mod tests {
                     Err(PluginStoreError::InvalidPluginId { .. })
                 ),
                 "load accepted illegal id {bad:?}"
+            );
+            assert!(
+                matches!(
+                    store.load_version(bad, 1),
+                    Err(PluginStoreError::InvalidPluginId { .. })
+                ),
+                "load_version accepted illegal id {bad:?}"
+            );
+            assert!(
+                matches!(
+                    store.latest_version(bad),
+                    Err(PluginStoreError::InvalidPluginId { .. })
+                ),
+                "latest_version accepted illegal id {bad:?}"
+            );
+            assert!(
+                matches!(
+                    MigrationRunner::default().migrate(
+                        &store,
+                        &table,
+                        bad,
+                        PluginState::empty_at(1).unwrap(),
+                        2
+                    ),
+                    Err(PluginStoreError::InvalidPluginId { .. })
+                ),
+                "migrate accepted illegal id {bad:?}"
             );
         }
         // Nothing escaped the data root.
@@ -1025,6 +1053,26 @@ mod tests {
         // The pre-migration snapshot exists on disk and carries the kv.
         assert_eq!(store.load_version("p1", 1).unwrap().kv["keep"], "1");
         assert!(!store.state_path("p1", 2).exists());
+    }
+
+    #[test]
+    fn gap_check_fires_before_the_snapshot_save() {
+        // A broken table (missing step) must do ZERO IO — not even the
+        // pre-migration snapshot — pinning the deliberate order: version
+        // checks -> gap check -> snapshot -> steps. Config errors have no
+        // side effects by design; the unsaved input is returned to the
+        // caller as the MissingStep error path's moved value, never
+        // partially persisted.
+        let (_dir, store) = tmp_store();
+        let state = PluginState::empty_at(1).unwrap();
+        let table = StateMigrationTable::new(); // no 1->2 step registered
+
+        assert!(matches!(
+            MigrationRunner::default().migrate(&store, &table, "p1", state, 2),
+            Err(PluginStoreError::MissingStep { from: 1, .. })
+        ));
+        // No snapshot was written: the plugin directory was never created.
+        assert!(!store.state_path("p1", 1).exists());
     }
 
     #[test]
