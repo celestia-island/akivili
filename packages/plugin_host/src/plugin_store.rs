@@ -19,6 +19,13 @@
 //! form and auto-migrates old payloads on deserialization; [`typed_state_step`]
 //! wraps that chain as one migration step over a kv entry, so compile-time
 //! typed plugin state migrates through the same runner as dynamic state.
+//!
+//! Concurrency invariant: one writer per `(plugin_id, state_version)` at a
+//! time. P1 ships no call sites and the host is single-process, so nothing
+//! can race today; P2's hot-swap deliberately overlaps draining (old
+//! instance) with loading (new instance) of the same plugin, and MUST add a
+//! per-plugin lock or drain barrier around `save`/`migrate` before that
+//! overlap exists.
 
 use std::{collections::BTreeMap, fs, path::PathBuf, sync::Arc};
 
@@ -79,6 +86,13 @@ pub enum PluginStoreError {
     #[error("plugin {plugin_id}: illegal state_version {found} (minimum {MIN_STATE_VERSION})")]
     InvalidStateVersion { plugin_id: String, found: u32 },
 
+    /// The `plugin_id` is not a legal id (`[a-z0-9][a-z0-9-]*`). Ids become
+    /// path segments under the data root, so traversal-shaped ids (`..`,
+    /// `/`, absolute) are rejected fail-closed instead of escaping the root
+    /// (design §4.2: no silent fallback).
+    #[error("invalid plugin id {plugin_id:?}: expected [a-z0-9][a-z0-9-]*")]
+    InvalidPluginId { plugin_id: String },
+
     /// The state file exists but cannot be parsed as a [`PluginState`].
     #[error("plugin {plugin_id}: corrupt state file {path}: {source}")]
     CorruptState {
@@ -131,6 +145,7 @@ impl PluginStoreError {
         match self {
             Self::VersionMismatch { .. } => "version-mismatch",
             Self::InvalidStateVersion { .. } => "invalid-state-version",
+            Self::InvalidPluginId { .. } => "invalid-plugin-id",
             Self::CorruptState { .. } => "corrupt-state",
             Self::MigrationFailed { .. } => "migration-failed",
             Self::MissingStep { .. } => "missing-step",
@@ -149,6 +164,23 @@ fn check_version(plugin_id: &str, version: u32) -> std::result::Result<(), Plugi
         });
     }
     Ok(())
+}
+
+/// Validates `plugin_id` against the registry id charset (`[a-z0-9][a-z0-9-]*`,
+/// mirroring `akivili_registry`'s manifest id rule). Ids become path segments
+/// under the data root, so traversal-shaped ids (`..`, `/`, absolute) are
+/// rejected fail-closed instead of escaping the root.
+fn check_plugin_id(plugin_id: &str) -> std::result::Result<(), PluginStoreError> {
+    let mut chars = plugin_id.chars();
+    let valid = matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if valid {
+        Ok(())
+    } else {
+        Err(PluginStoreError::InvalidPluginId {
+            plugin_id: plugin_id.to_string(),
+        })
+    }
 }
 
 /// Per-plugin data store rooted at a host-chosen plugin data root (design
@@ -178,19 +210,70 @@ impl PluginDataStore {
             .join("state.json")
     }
 
-    /// The highest `state_version` directory that exists for `plugin_id`
-    /// (`None` when the plugin has no persisted state yet — fresh install).
-    /// Non-numeric entries in the plugin directory are foreign and ignored.
-    pub fn latest_version(&self, plugin_id: &str) -> Option<u32> {
+    /// The highest `state_version` directory that holds a persisted
+    /// `state.json` for `plugin_id` (`None` when the plugin has no
+    /// persisted state yet — fresh install).
+    ///
+    /// Fail-closed (design §4.2): only `NotFound` on the plugin directory
+    /// maps to "no state yet"; any other IO error — and any unreadable
+    /// directory entry — surfaces as [`PluginStoreError::Io`] instead of
+    /// being silently read as empty or stale state. Non-numeric entries
+    /// are foreign and ignored; a numeric entry without `state.json`
+    /// (e.g. a crash leftover from an interrupted save) is not a persisted
+    /// version and cannot hijack discovery.
+    pub fn latest_version(
+        &self,
+        plugin_id: &str,
+    ) -> std::result::Result<Option<u32>, PluginStoreError> {
+        check_plugin_id(plugin_id)?;
         let dir = self.root.join(plugin_id);
-        let entries = fs::read_dir(&dir).ok()?;
-        entries
-            .filter_map(|entry| {
-                let name = entry.ok()?.file_name();
-                name.to_str()?.parse::<u32>().ok()
-            })
-            .filter(|v| *v >= MIN_STATE_VERSION)
-            .max()
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // Only "nothing here yet" may read as a fresh install; every
+            // other error (EACCES, ENOTDIR, …) fails loud.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(PluginStoreError::Io {
+                    plugin_id: plugin_id.to_string(),
+                    path: dir,
+                    source: e,
+                });
+            }
+        };
+        let mut latest = None;
+        for entry in entries {
+            let entry = entry.map_err(|e| PluginStoreError::Io {
+                plugin_id: plugin_id.to_string(),
+                path: dir.clone(),
+                source: e,
+            })?;
+            let Some(version) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue; // foreign entry, ignored by design
+            };
+            if version < MIN_STATE_VERSION {
+                continue;
+            }
+            // A version directory without a loadable state.json is not a
+            // persisted version (e.g. an interrupted-save leftover).
+            match fs::metadata(entry.path().join("state.json")) {
+                Ok(m) if m.is_file() => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(PluginStoreError::Io {
+                        plugin_id: plugin_id.to_string(),
+                        path: entry.path(),
+                        source: e,
+                    });
+                }
+                Ok(_) => continue,
+            }
+            latest = Some(latest.map_or(version, |max: u32| max.max(version)));
+        }
+        Ok(latest)
     }
 
     /// Loads the state of `plugin_id` as the plugin expects it at `expected`.
@@ -207,13 +290,19 @@ impl PluginDataStore {
         plugin_id: &str,
         expected: u32,
     ) -> std::result::Result<PluginState, PluginStoreError> {
+        check_plugin_id(plugin_id)?;
         check_version(plugin_id, expected)?;
-        match self.latest_version(plugin_id) {
-            None => PluginState::empty_at(expected).map_err(|e| PluginStoreError::CorruptState {
-                plugin_id: plugin_id.to_string(),
-                path: self.state_path(plugin_id, expected),
-                source: e,
-            }),
+        match self.latest_version(plugin_id)? {
+            None => {
+                // Fresh install: `expected` was validated against
+                // MIN_STATE_VERSION two lines up, so constructing directly
+                // (instead of routing through `empty_at`) keeps this branch
+                // free of an unmappable error.
+                Ok(PluginState {
+                    state_version: expected,
+                    kv: BTreeMap::new(),
+                })
+            }
             Some(found) => {
                 let state = self.load_version(plugin_id, found)?;
                 if state.state_version != expected {
@@ -237,6 +326,7 @@ impl PluginDataStore {
         plugin_id: &str,
         version: u32,
     ) -> std::result::Result<PluginState, PluginStoreError> {
+        check_plugin_id(plugin_id)?;
         check_version(plugin_id, version)?;
         let path = self.state_path(plugin_id, version);
         let text = fs::read_to_string(&path).map_err(|e| PluginStoreError::Io {
@@ -260,11 +350,18 @@ impl PluginDataStore {
     /// registry `registry-state.json` convention). Versioned directories
     /// accumulate: older versions stay readable as migration snapshots until
     /// an explicit uninstall policy removes them.
+    ///
+    /// The tmp sibling is pid-unique, so concurrent host processes never
+    /// share one tmp file. The store otherwise assumes a single writer per
+    /// `(plugin_id, state_version)` (see the module docs): P2's hot-swap
+    /// wiring must serialize draining/loading instances before that
+    /// invariant is relaxed.
     pub fn save(
         &self,
         plugin_id: &str,
         state: &PluginState,
     ) -> std::result::Result<(), PluginStoreError> {
+        check_plugin_id(plugin_id)?;
         check_version(plugin_id, state.state_version)?;
         let path = self.state_path(plugin_id, state.state_version);
         if let Some(parent) = path.parent() {
@@ -274,7 +371,10 @@ impl PluginDataStore {
                 source: e,
             })?;
         }
-        let tmp = path.with_extension("json.tmp");
+        // Pid-unique tmp sibling in the same version directory (same
+        // filesystem → rename stays atomic); a crash may leave the tmp
+        // behind, which is inert for discovery.
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
         let text = serde_json::to_string_pretty(state).map_err(|e| {
             let source = anyhow!(e);
             PluginStoreError::CorruptState {
@@ -373,16 +473,22 @@ impl MigrationRunner {
     /// Migrates `state` (at `state.state_version`) up to `target`.
     ///
     /// Semantics:
-    /// - `state.state_version == target`: no-op success (idempotent rerun).
+    /// - `state.state_version == target`: no-op success (idempotent rerun,
+    ///   zero IO).
     /// - `state.state_version > target`: [`PluginStoreError::VersionMismatch`]
     ///   — the contract never downgrades.
     /// - Missing intermediate step: [`PluginStoreError::MissingStep`],
-    ///   detected *before* any step runs — a misconfigured table never does
-    ///   partial work (fail-closed, no skip).
-    /// - Step failure: [`PluginStoreError::MigrationFailed`]; disk keeps the
-    ///   last successfully persisted version and the caller's input state was
-    ///   never mutated — the in-memory snapshot and the on-disk snapshot are
-    ///   both loss-free rollback points.
+    ///   detected *before* any step runs (and before the snapshot below) —
+    ///   a misconfigured table never does partial work.
+    /// - Step failure: [`PluginStoreError::MigrationFailed`]; the last
+    ///   successfully persisted version stays loadable on disk.
+    ///
+    /// Before the first step runs, the runner persists the input state at
+    /// its *own* version (pre-migration snapshot, design §4.3) — even when
+    /// the caller never saved it — so a failure always leaves a concrete
+    /// on-disk rollback point instead of dropping the only in-memory copy.
+    /// Re-saving an already-persisted snapshot is idempotent
+    /// (byte-identical).
     ///
     /// Each successful step is persisted at its new version before the next
     /// step runs, so a crash mid-chain leaves the last good version loadable.
@@ -394,11 +500,16 @@ impl MigrationRunner {
         state: PluginState,
         target: u32,
     ) -> std::result::Result<PluginState, PluginStoreError> {
+        check_plugin_id(plugin_id)?;
         if target < MIN_STATE_VERSION || state.state_version < MIN_STATE_VERSION {
             return Err(PluginStoreError::InvalidStateVersion {
                 plugin_id: plugin_id.to_string(),
                 found: target.min(state.state_version),
             });
+        }
+        if state.state_version == target {
+            // Already at target: idempotent no-op, zero IO.
+            return Ok(state);
         }
         if state.state_version > target {
             return Err(PluginStoreError::VersionMismatch {
@@ -419,6 +530,11 @@ impl MigrationRunner {
             }
         }
         let mut working = state;
+        // Pre-migration snapshot (design §4.3): persist the input at its own
+        // version before any step runs, so failure always leaves a concrete
+        // on-disk rollback point even when the caller never saved the state.
+        // For an already-persisted snapshot this rewrite is byte-identical.
+        store.save(plugin_id, &working)?;
         while working.state_version < target {
             let from = working.state_version;
             let to = from + 1;
@@ -464,6 +580,15 @@ impl MigrationRunner {
 /// deserialization, so this step is: deserialize as `T` (auto-migrating),
 /// re-serialize, write back. This is the load-bearing hifumi seam of the
 /// runner — dynamic (closure) steps need no types and need no hifumi.
+///
+/// Version alignment: this step migrates the kv *document's* `$version` to
+/// `T`'s current schema version (possibly several chain hops in one runner
+/// step), while the runner advances `state_version` by exactly one. The two
+/// version families are deliberately decoupled — the typed document is
+/// plugin-internal — so register `T` at the step where its `$version` chain
+/// matches the plugin's intent. hifumi fail-closes on unknown/future
+/// `$version`s (the hidden version enum has no such variant → deserialize
+/// error → `MigrationFailed`), never silently guessing.
 pub fn typed_state_step<T>(key: &str) -> StateMigrationFn
 where
     T: Serialize + serde::de::DeserializeOwned + 'static,
@@ -504,7 +629,11 @@ mod tests {
 
     #[test]
     fn fresh_install_yields_empty_state_at_expected_version() {
-        let (_dir, store) = tmp_store();
+        let (dir, store) = tmp_store();
+        // Plugin directory already exists but holds no persisted version
+        // (crash leftover, foreign files): still a fresh install, not an
+        // error, and junk entries never surface.
+        fs::create_dir_all(dir.path().join("p1").join("not-a-version")).unwrap();
         let state = store.load("p1", 1).unwrap();
         assert_eq!(state.state_version, 1);
         assert!(state.kv.is_empty());
@@ -552,6 +681,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(migrated.state_version, 2);
+        // Pin the hifumi write-back seam on the RAW persisted JSON: the
+        // payload must carry T's CURRENT $version and the migrated field
+        // name. Deserializing as `Cfg` alone proves nothing here — hifumi
+        // auto-migrates any older payload at read time, which would mask a
+        // missing/neutralized write-back.
+        let raw: serde_json::Value = serde_json::from_str(&migrated.kv["cfg"]).unwrap();
+        assert_eq!(raw["$version"], serde_json::json!("2"));
+        assert!(raw.get("label").is_some());
+        assert!(raw.get("display_name").is_none());
         let cfg: Cfg = serde_json::from_str(&migrated.kv["cfg"]).unwrap();
         assert_eq!(
             cfg,
@@ -613,6 +751,35 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_plugin_dir_fails_loud_not_fresh() {
+        // Any IO error other than NotFound on the plugin directory must
+        // surface as Io — never silently read as a fresh (empty) install
+        // (design §4.2 fail-closed). ENOTDIR repro: a file sits where the
+        // plugin directory should be.
+        let (dir, store) = tmp_store();
+        fs::write(dir.path().join("p1"), "not a directory").unwrap();
+
+        let err = store.load("p1", 1).unwrap_err();
+        assert!(matches!(err, PluginStoreError::Io { .. }));
+        assert_eq!(err.code(), "state-io");
+    }
+
+    #[test]
+    fn crash_leftover_version_dir_does_not_hijack_discovery() {
+        // An interrupted save can leave an empty <version> directory; that
+        // is not a persisted version and must not shadow older, loadable
+        // state (no stale read, no misleading NotFound).
+        let (_dir, store) = tmp_store();
+        let mut state = PluginState::empty_at(2).unwrap();
+        state.kv.insert("k".into(), "v".into());
+        store.save("p1", &state).unwrap();
+
+        fs::create_dir_all(store.state_path("p1", 9).parent().unwrap()).unwrap();
+        assert_eq!(store.latest_version("p1").unwrap(), Some(2));
+        assert_eq!(store.load("p1", 2).unwrap().kv["k"], "v");
+    }
+
+    #[test]
     fn zero_version_is_illegal_everywhere() {
         let (_dir, store) = tmp_store();
         assert!(matches!(PluginState::empty_at(0), Err(_)));
@@ -628,6 +795,67 @@ mod tests {
             store.save("p1", &bad),
             Err(PluginStoreError::InvalidStateVersion { found: 0, .. })
         ));
+        // Migration: zero input version and zero target both refused.
+        let table = StateMigrationTable::new();
+        assert!(matches!(
+            MigrationRunner::default().migrate(&store, &table, "p1", bad, 2),
+            Err(PluginStoreError::InvalidStateVersion { found: 0, .. })
+        ));
+        assert!(matches!(
+            MigrationRunner::default().migrate(
+                &store,
+                &table,
+                "p1",
+                PluginState::empty_at(1).unwrap(),
+                0
+            ),
+            Err(PluginStoreError::InvalidStateVersion { found: 0, .. })
+        ));
+        // Exact-read channel and table registration reject 0 too.
+        assert!(matches!(
+            store.load_version("p1", 0),
+            Err(PluginStoreError::InvalidStateVersion { found: 0, .. })
+        ));
+        let mut table = StateMigrationTable::new();
+        assert!(matches!(
+            table.step(0, raw_step(|_| Ok(()))),
+            Err(PluginStoreError::InvalidStateVersion { found: 0, .. })
+        ));
+        // A file that parses but declares state_version 0 is refused the
+        // same way — no silent acceptance anywhere.
+        let path = store.state_path("p1", 1);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"state_version":0,"kv":{}}"#).unwrap();
+        assert!(matches!(
+            store.load("p1", 1),
+            Err(PluginStoreError::InvalidStateVersion { found: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn traversal_shaped_plugin_ids_are_rejected() {
+        // Ids become path segments under the data root: `..`, `/`, absolute
+        // and otherwise illegal ids fail closed instead of escaping the
+        // root (registry charset [a-z0-9][a-z0-9-]*).
+        let (_dir, store) = tmp_store();
+        for bad in ["../evil", "a/b", "", "-x", "UPPER", "spa ce", "."] {
+            assert!(
+                matches!(
+                    store.save(bad, &PluginState::empty_at(1).unwrap()),
+                    Err(PluginStoreError::InvalidPluginId { .. })
+                ),
+                "save accepted illegal id {bad:?}"
+            );
+            assert!(
+                matches!(
+                    store.load(bad, 1),
+                    Err(PluginStoreError::InvalidPluginId { .. })
+                ),
+                "load accepted illegal id {bad:?}"
+            );
+        }
+        // Nothing escaped the data root.
+        assert_eq!(fs::read_dir(_dir.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -727,10 +955,10 @@ mod tests {
     }
 
     #[test]
-    fn replaying_a_completed_step_is_stable() {
-        // Same (from, to) re-executed on an already-migrated payload yields
-        // the same result — the hifumi typed chain is deterministic and
-        // version-stepping keeps re-runs from double-applying.
+    fn replaying_a_completed_migration_is_a_byte_identical_noop() {
+        // True replay: migrate v1 -> v2 once with the typed step, then run
+        // the SAME table against the loaded v2 state again. The second run
+        // must be a no-op — no double-apply, disk byte-identical.
         #[hifumi::version("2")]
         #[derive(Debug, Clone, PartialEq)]
         #[migration("1" => "2" {
@@ -745,19 +973,95 @@ mod tests {
         let mut state = PluginState::empty_at(1).unwrap();
         state.kv.insert(
             "cfg".into(),
-            r#"{"$version":"2","greeting":"hi","label":"demo"}"#.into(),
+            r#"{"$version":"1","greeting":"hi","display_name":"demo"}"#.into(),
         );
         store.save("p1", &state).unwrap();
 
         let mut table = StateMigrationTable::new();
         table.step(1, typed_state_step::<Cfg>("cfg")).unwrap();
-        let out = MigrationRunner::default()
-            .migrate(&store, &table, "p1", state.clone(), 2)
+        MigrationRunner::default()
+            .migrate(&store, &table, "p1", store.load("p1", 1).unwrap(), 2)
             .unwrap();
-        assert_eq!(out.kv["cfg"], state.kv["cfg"]);
+        let before = fs::read_to_string(store.state_path("p1", 2)).unwrap();
+
+        // Replay: same (from -> to) registered, state already migrated.
+        let replayed = MigrationRunner::default()
+            .migrate(&store, &table, "p1", store.load("p1", 2).unwrap(), 2)
+            .unwrap();
+        assert_eq!(replayed.state_version, 2);
+        assert_eq!(
+            fs::read_to_string(store.state_path("p1", 2)).unwrap(),
+            before
+        );
+        let raw: serde_json::Value = serde_json::from_str(&replayed.kv["cfg"]).unwrap();
+        assert_eq!(raw["$version"], serde_json::json!("2"));
     }
 
     // ---- class 4: rollback is loss-free ----
+
+    #[test]
+    fn migrate_snapshots_unsaved_input_before_stepping() {
+        // The runner persists the input state at its own version before the
+        // first step (pre-migration snapshot, design §4.3): a failure with
+        // an input the caller never saved still leaves a concrete on-disk
+        // rollback point — the kv is not silently dropped with the moved
+        // input.
+        let (_dir, store) = tmp_store();
+        let mut state = PluginState::empty_at(1).unwrap();
+        state.kv.insert("keep".into(), "1".into());
+        // NOT saved before migrate.
+
+        let mut table = StateMigrationTable::new();
+        table
+            .step(1, raw_step(|_| anyhow::bail!("boom: bad data")))
+            .unwrap();
+        let err = MigrationRunner::default()
+            .migrate(&store, &table, "p1", state, 2)
+            .unwrap_err();
+        assert!(matches!(
+            &err,
+            PluginStoreError::MigrationFailed { from: 1, to: 2, .. }
+        ));
+        // The pre-migration snapshot exists on disk and carries the kv.
+        assert_eq!(store.load_version("p1", 1).unwrap().kv["keep"], "1");
+        assert!(!store.state_path("p1", 2).exists());
+    }
+
+    #[test]
+    fn future_kv_version_fails_closed_through_typed_step() {
+        // A kv document declaring a $version beyond the compiled chain must
+        // fail the step — hifumi's hidden version enum has no such variant,
+        // so deserialization errors and the runner reports MigrationFailed
+        // (never a silent guess, design §4.2).
+        #[hifumi::version("2")]
+        #[derive(Debug, Clone, PartialEq)]
+        #[migration("1" => "2" {
+            display_name => label: String
+        })]
+        struct Cfg {
+            greeting: String,
+            label: String,
+        }
+
+        let (_dir, store) = tmp_store();
+        let payload = r#"{"$version":"3","greeting":"hi","label":"demo"}"#;
+        let mut state = PluginState::empty_at(1).unwrap();
+        state.kv.insert("cfg".into(), payload.into());
+        store.save("p1", &state).unwrap();
+
+        let mut table = StateMigrationTable::new();
+        table.step(1, typed_state_step::<Cfg>("cfg")).unwrap();
+        let err = MigrationRunner::default()
+            .migrate(&store, &table, "p1", store.load("p1", 1).unwrap(), 2)
+            .unwrap_err();
+        assert!(matches!(
+            &err,
+            PluginStoreError::MigrationFailed { from: 1, to: 2, .. }
+        ));
+        assert_eq!(err.code(), "migration-failed");
+        // Disk keeps the pre-migration snapshot, payload untouched.
+        assert_eq!(store.load_version("p1", 1).unwrap().kv["cfg"], payload);
+    }
 
     #[test]
     fn failed_migration_rolls_back_to_runnable_snapshot() {

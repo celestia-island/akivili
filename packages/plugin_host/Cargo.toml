@@ -15,11 +15,11 @@ akivili-guard = { path = "../guard", version = "^0.3" }
 akivili-ptc = { path = "../ptc", version = "^0.3" }
 akivili-registry = { path = "../registry", version = "^0.3" }
 
-hifumi.workspace = true
 anyhow.workspace = true
 boa_engine.workspace = true
 boa_gc.workspace = true
 boa_runtime.workspace = true
+hifumi.workspace = true
 parking_lot.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
