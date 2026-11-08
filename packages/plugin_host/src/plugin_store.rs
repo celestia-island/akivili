@@ -696,7 +696,7 @@ mod tests {
 
         let mut table = StateMigrationTable::new();
         table.step(1, typed_state_step::<Cfg>("cfg")).unwrap();
-        let migrated = MigrationRunner::default()
+        let migrated = MigrationRunner
             .migrate(&store, &table, "p1", store.load("p1", 1).unwrap(), 2)
             .unwrap();
 
@@ -821,7 +821,7 @@ mod tests {
     #[test]
     fn zero_version_is_illegal_everywhere() {
         let (_dir, store) = tmp_store();
-        assert!(matches!(PluginState::empty_at(0), Err(_)));
+        assert!(PluginState::empty_at(0).is_err());
         assert!(matches!(
             store.load("p1", 0),
             Err(PluginStoreError::InvalidStateVersion { found: 0, .. })
@@ -837,17 +837,11 @@ mod tests {
         // Migration: zero input version and zero target both refused.
         let table = StateMigrationTable::new();
         assert!(matches!(
-            MigrationRunner::default().migrate(&store, &table, "p1", bad, 2),
+            MigrationRunner.migrate(&store, &table, "p1", bad, 2),
             Err(PluginStoreError::InvalidStateVersion { found: 0, .. })
         ));
         assert!(matches!(
-            MigrationRunner::default().migrate(
-                &store,
-                &table,
-                "p1",
-                PluginState::empty_at(1).unwrap(),
-                0
-            ),
+            MigrationRunner.migrate(&store, &table, "p1", PluginState::empty_at(1).unwrap(), 0),
             Err(PluginStoreError::InvalidStateVersion { found: 0, .. })
         ));
         // Exact-read channel and table registration reject 0 too.
@@ -909,7 +903,7 @@ mod tests {
             );
             assert!(
                 matches!(
-                    MigrationRunner::default().migrate(
+                    MigrationRunner.migrate(
                         &store,
                         &table,
                         bad,
@@ -952,7 +946,7 @@ mod tests {
             )
             .unwrap();
 
-        let err = MigrationRunner::default()
+        let err = MigrationRunner
             .migrate(&store, &table, "p1", store.load("p1", 1).unwrap(), 3)
             .unwrap_err();
         assert!(matches!(
@@ -983,7 +977,7 @@ mod tests {
         // not even step 1 runs and no v2 file appears.
         let mut table = StateMigrationTable::new();
         table.step(1, raw_step(|_| Ok(()))).unwrap();
-        let err = MigrationRunner::default()
+        let err = MigrationRunner
             .migrate(&store, &table, "p1", state, 3)
             .unwrap_err();
         assert!(matches!(
@@ -1013,7 +1007,7 @@ mod tests {
             .unwrap();
 
         let table = StateMigrationTable::new();
-        let out = MigrationRunner::default()
+        let out = MigrationRunner
             .migrate(&store, &table, "p1", state, 2)
             .unwrap();
         assert_eq!(out.state_version, 2);
@@ -1060,7 +1054,7 @@ mod tests {
 
         let mut table = StateMigrationTable::new();
         table.step(1, typed_state_step::<Cfg>("cfg")).unwrap();
-        MigrationRunner::default()
+        MigrationRunner
             .migrate(&store, &table, "p1", store.load("p1", 1).unwrap(), 2)
             .unwrap();
         let before = fs::read_to_string(store.state_path("p1", 2)).unwrap();
@@ -1070,7 +1064,7 @@ mod tests {
             .unwrap();
 
         // Replay: same (from -> to) registered, state already migrated.
-        let replayed = MigrationRunner::default()
+        let replayed = MigrationRunner
             .migrate(&store, &table, "p1", store.load("p1", 2).unwrap(), 2)
             .unwrap();
         assert_eq!(replayed.state_version, 2);
@@ -1108,7 +1102,7 @@ mod tests {
         table
             .step(1, raw_step(|_| anyhow::bail!("boom: bad data")))
             .unwrap();
-        let err = MigrationRunner::default()
+        let err = MigrationRunner
             .migrate(&store, &table, "p1", state, 2)
             .unwrap_err();
         assert!(matches!(
@@ -1133,7 +1127,7 @@ mod tests {
         let table = StateMigrationTable::new(); // no 1->2 step registered
 
         assert!(matches!(
-            MigrationRunner::default().migrate(&store, &table, "p1", state, 2),
+            MigrationRunner.migrate(&store, &table, "p1", state, 2),
             Err(PluginStoreError::MissingStep { from: 1, .. })
         ));
         // No snapshot was written: the plugin directory was never created.
@@ -1158,7 +1152,7 @@ mod tests {
 
         let mut table = StateMigrationTable::new();
         table.step(1, typed_state_step::<Cfg>("cfg")).unwrap();
-        let err = MigrationRunner::default()
+        let err = MigrationRunner
             .migrate(&store, &table, "p1", store.load("p1", 1).unwrap(), 2)
             .unwrap_err();
         assert!(matches!(
@@ -1192,7 +1186,7 @@ mod tests {
 
         let mut table = StateMigrationTable::new();
         table.step(1, typed_state_step::<Cfg>("cfg")).unwrap();
-        let err = MigrationRunner::default()
+        let err = MigrationRunner
             .migrate(&store, &table, "p1", store.load("p1", 1).unwrap(), 2)
             .unwrap_err();
         assert!(matches!(
@@ -1222,7 +1216,7 @@ mod tests {
             )
             .unwrap();
 
-        let err = MigrationRunner::default()
+        let err = MigrationRunner
             .migrate(&store, &table, "p1", state.clone(), 2)
             .unwrap_err();
         assert!(matches!(
@@ -1243,7 +1237,7 @@ mod tests {
         let state = PluginState::empty_at(2).unwrap();
         store.save("p1", &state).unwrap();
 
-        let err = MigrationRunner::default()
+        let err = MigrationRunner
             .migrate(&store, &StateMigrationTable::new(), "p1", state, 1)
             .unwrap_err();
         assert!(matches!(

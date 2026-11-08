@@ -1464,7 +1464,7 @@ mod host_tool_arm_tests {
     ) -> (bool, String) {
         let mut api = HostFunctions::new();
         let words: Vec<String> = caps.iter().map(|c| c.to_string()).collect();
-        api = api.with_grants(GrantSet::from_raw_words(words.into_iter()));
+        api = api.with_grants(GrantSet::from_raw_words(words));
         if let Some(h) = handler {
             api = api.with_host_tool_handler(h);
         }
