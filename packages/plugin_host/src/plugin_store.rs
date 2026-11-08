@@ -1,5 +1,5 @@
 //! Plugin persistent state — the P1 state contract of the plugin hot-swap
-//! project (design `_plan-archive/workspace/20261109-entelecheia-plugin-hotswap-design.md`).
+//! project (design + residual ledger: PR celestia-island/akivili#101).
 //!
 //! Scope: kv persistence per plugin (data directory separated from the
 //! package directory), an explicit [`PluginState`] contract with a monotonic
@@ -41,8 +41,10 @@ pub const MIN_STATE_VERSION: u32 = 1;
 /// `kv` is the persistent form of the in-memory plugin kv: plugin-owned
 /// string-to-string pairs. Host-managed metadata (updated_at, schema digest)
 /// stays outside the plugin-visible surface and is therefore not modeled in
-/// P1.
+/// P1. Unknown fields in a persisted state file are a contract violation,
+/// so deserialization fails closed instead of silently dropping data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginState {
     /// Data schema version, self-declared by the plugin, monotonically
     /// increasing. 0 is illegal ([`MIN_STATE_VERSION`]).
@@ -134,6 +136,13 @@ pub enum PluginStoreError {
     #[error("migration table conflict: duplicate step from {from}")]
     TableConflict { from: u32 },
 
+    /// A migration table step was registered below [`MIN_STATE_VERSION`].
+    /// Table-level error: no plugin is in scope at registration time, so
+    /// unlike [`PluginStoreError::InvalidStateVersion`] it carries no
+    /// plugin id (a synthetic empty one would render as `plugin : …`).
+    #[error("migration table: illegal step from {found} (minimum {MIN_STATE_VERSION})")]
+    IllegalStepVersion { found: u32 },
+
     /// Filesystem failure while reading or writing state.
     #[error("plugin {plugin_id}: state io at {path}: {source}")]
     Io {
@@ -154,6 +163,7 @@ impl PluginStoreError {
             Self::MigrationFailed { .. } => "migration-failed",
             Self::MissingStep { .. } => "missing-step",
             Self::TableConflict { .. } => "table-conflict",
+            Self::IllegalStepVersion { .. } => "illegal-step-version",
             Self::Io { .. } => "state-io",
         }
     }
@@ -362,8 +372,8 @@ impl PluginDataStore {
     /// accumulate: older versions stay readable as migration snapshots until
     /// an explicit uninstall policy removes them.
     ///
-    /// The tmp sibling is pid-unique, so concurrent host processes never
-    /// share one tmp file. The store otherwise assumes a single writer per
+    /// The tmp sibling is pid+thread-unique, so concurrent writers — host
+    /// processes or threads within one process — never share a tmp file. The store otherwise assumes a single writer per
     /// `(plugin_id, state_version)` (see the module docs): P2's hot-swap
     /// wiring must serialize draining/loading instances before that
     /// invariant is relaxed.
@@ -382,10 +392,14 @@ impl PluginDataStore {
                 source: e,
             })?;
         }
-        // Pid-unique tmp sibling in the same version directory (same
-        // filesystem → rename stays atomic); a crash may leave the tmp
-        // behind, which is inert for discovery.
-        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        // Pid+thread-unique tmp sibling in the same version directory (same
+        // filesystem → rename stays atomic); two threads saving the same
+        // plugin+version in one process never share a tmp name, and a crash
+        // may leave the tmp behind, which is inert for discovery. (ThreadId
+        // has no stable raw-number accessor, so the Debug form's parens are
+        // stripped — the name is opaque, uniqueness is the contract.)
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let tmp = path.with_extension(format!("json.{}.{}.tmp", std::process::id(), tid));
         let text = serde_json::to_string_pretty(state).map_err(|e| {
             let source = anyhow!(e);
             PluginStoreError::CorruptState {
@@ -460,10 +474,7 @@ impl StateMigrationTable {
         f: StateMigrationFn,
     ) -> std::result::Result<&mut Self, PluginStoreError> {
         if from < MIN_STATE_VERSION {
-            return Err(PluginStoreError::InvalidStateVersion {
-                plugin_id: String::new(),
-                found: from,
-            });
+            return Err(PluginStoreError::IllegalStepVersion { found: from });
         }
         if self.steps.contains_key(&from) {
             // Check before insert: `BTreeMap::insert` would otherwise
@@ -507,8 +518,10 @@ impl MigrationRunner {
     /// its *own* version (pre-migration snapshot, design §4.3) — even when
     /// the caller never saved it — so a failure always leaves a concrete
     /// on-disk rollback point instead of dropping the only in-memory copy.
-    /// Re-saving an already-persisted snapshot is idempotent
-    /// (byte-identical).
+    /// Re-saving an already-persisted snapshot is idempotent when both
+    /// copies agree; if the on-disk copy at the input version has
+    /// diverged, this run's input wins — the rollback point is what THIS
+    /// run started from, never the stale disk copy.
     ///
     /// Each successful step is persisted at its new version before the next
     /// step runs, so a crash mid-chain leaves the last good version loadable.
@@ -819,6 +832,48 @@ mod tests {
     }
 
     #[test]
+    fn foreign_dir_number_is_classified_by_declared_version() {
+        // A foreign writer can put a state file in the "wrong" version
+        // directory. Discovery reaches the file through its directory
+        // number, but classification must trust the DECLARED
+        // state_version (see `load`): negotiation at the declared version
+        // succeeds, and a mismatch reports the declared number — never
+        // the directory it happens to sit in.
+        let (_dir, store) = tmp_store();
+        let path = store.state_path("p1", 2);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"state_version":3,"kv":{"k":"v3"}}"#).unwrap();
+
+        let state = store.load("p1", 3).unwrap();
+        assert_eq!(state.state_version, 3);
+        assert_eq!(state.kv["k"], "v3");
+        assert!(matches!(
+            store.load("p1", 2),
+            Err(PluginStoreError::VersionMismatch {
+                found: 3,
+                expected: 2,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unknown_state_fields_fail_closed() {
+        // deny_unknown_fields: a state file carrying fields outside the
+        // PluginState contract (here: smuggled host metadata) must be
+        // refused as corrupt, never silently accepted with the extra
+        // data dropped on the floor.
+        let (_dir, store) = tmp_store();
+        let path = store.state_path("p1", 1);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"state_version":1,"kv":{},"host_meta":"x"}"#).unwrap();
+        assert!(matches!(
+            store.load_version("p1", 1),
+            Err(PluginStoreError::CorruptState { .. })
+        ));
+    }
+
+    #[test]
     fn zero_version_is_illegal_everywhere() {
         let (_dir, store) = tmp_store();
         assert!(PluginState::empty_at(0).is_err());
@@ -850,10 +905,18 @@ mod tests {
             Err(PluginStoreError::InvalidStateVersion { found: 0, .. })
         ));
         let mut table = StateMigrationTable::new();
+        let err = table.step(0, raw_step(|_| Ok(()))).unwrap_err();
         assert!(matches!(
-            table.step(0, raw_step(|_| Ok(()))),
-            Err(PluginStoreError::InvalidStateVersion { found: 0, .. })
+            err,
+            PluginStoreError::IllegalStepVersion { found: 0 }
         ));
+        // Wire code + Display are pinned like every other code() arm: the
+        // table-level error carries no plugin id, so it must never render
+        // the synthetic "plugin : …" form of the old shared variant.
+        assert_eq!(err.code(), "illegal-step-version");
+        let msg = format!("{err}");
+        assert!(msg.starts_with("migration table: illegal step from 0"));
+        assert!(!msg.contains("plugin :"));
         // A file that parses but declares state_version 0 is refused the
         // same way — no silent acceptance anywhere.
         let path = store.state_path("p1", 1);
@@ -1112,6 +1175,46 @@ mod tests {
         // The pre-migration snapshot exists on disk and carries the kv.
         assert_eq!(store.load_version("p1", 1).unwrap().kv["keep"], "1");
         assert!(!store.state_path("p1", 2).exists());
+    }
+
+    #[test]
+    fn pre_migration_snapshot_replaces_divergent_disk_copy() {
+        // Corner: disk already holds a DIFFERENT state at the input
+        // version than the in-memory input. The runner's contract: the
+        // input of THIS run is the rollback point, so its snapshot
+        // rewrite wins over the stale disk copy — the "byte-identical
+        // rewrite" note on `migrate` covers the common case where they
+        // already agree; this run deliberately makes them diverge.
+        let (_dir, store) = tmp_store();
+        let mut on_disk = PluginState::empty_at(1).unwrap();
+        on_disk.kv.insert("k".into(), "disk".into());
+        store.save("p1", &on_disk).unwrap();
+
+        let mut input = PluginState::empty_at(1).unwrap();
+        input.kv.insert("k".into(), "memory".into());
+        let mut table = StateMigrationTable::new();
+        table
+            .step(
+                1,
+                raw_step(|s| {
+                    s.kv.insert("stepped".into(), "yes".into());
+                    Ok(())
+                }),
+            )
+            .unwrap();
+
+        let out = MigrationRunner
+            .migrate(&store, &table, "p1", input, 2)
+            .unwrap();
+        assert_eq!(out.state_version, 2);
+        assert_eq!(out.kv["k"], "memory");
+        assert_eq!(out.kv["stepped"], "yes");
+        // Rollback point = exactly what THIS run started from, not the
+        // stale disk copy the snapshot overwrote (and without the step's
+        // key — the snapshot is pre-migration by construction).
+        let rolled_back = store.load_version("p1", 1).unwrap();
+        assert_eq!(rolled_back.kv["k"], "memory");
+        assert!(!rolled_back.kv.contains_key("stepped"));
     }
 
     #[test]
