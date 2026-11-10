@@ -99,6 +99,7 @@ pub mod acceptance;
 pub mod audit;
 pub mod capabilities;
 pub mod cli;
+pub mod dependencies;
 pub mod error;
 pub mod feed;
 pub mod forms;

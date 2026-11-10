@@ -129,6 +129,12 @@ pub struct PluginManifest {
     /// cosmos containers), each bound to one declared agent folder.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerEntry>,
+    /// Inter-plugin dependencies (additive; empty default). Each row
+    /// names a required plugin id and a semver constraint; the installer
+    /// enforces them (install refuses with the gap named; uninstall
+    /// refuses while a dependent is installed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<crate::dependencies::DependencyEntry>,
     /// Permission declarations (manifest `[[permissions]]`) — the RBAC
     /// catalog contract: a plugin may declare new grantable permission
     /// points, each namespaced `plugin.<id>.<verb>` so two plugins can
@@ -587,6 +593,7 @@ impl Default for PluginManifest {
             schema: SCHEMA,
             id: String::new(),
             version: String::new(),
+            dependencies: Vec::new(),
             agents: Vec::new(),
             provider: String::new(),
             description: None,
@@ -1095,6 +1102,19 @@ impl PluginManifest {
                 }
             }
         }
+        // Dependencies: shape, no self-reference, parseable constraints,
+        // and no duplicate dependency ids (a duplicate would let two rows
+        // fight over which constraint is real).
+        let mut seen_dep_ids = std::collections::BTreeSet::new();
+        for dep in &self.dependencies {
+            crate::dependencies::validate_entry(dep, &self.id)?;
+            if !seen_dep_ids.insert(dep.id.clone()) {
+                return Err(RegistryError::InvalidManifest(format!(
+                    "duplicate dependency id '{}'",
+                    dep.id
+                )));
+            }
+        }
 
         // [[permissions]] — the RBAC catalog contract. Every path is
         // namespaced `plugin.<this manifest's id>.…`: two plugins can
@@ -1512,6 +1532,7 @@ mod tests {
     /// A valid baseline manifest (the minimum that passes validation).
     fn baseline() -> PluginManifest {
         PluginManifest {
+            dependencies: Vec::new(),
             schema: SCHEMA,
             id: "acme".into(),
             version: "1.0.0".into(),
@@ -1898,6 +1919,7 @@ requires-contract = ["celestia:panel/host@0.1", "celestia:kv/host@0.2"]
     #[test]
     fn struct_update_syntax_stays_compatible() {
         let manifest = PluginManifest {
+            dependencies: Vec::new(),
             id: "acme".into(),
             version: "1.0.0".into(),
             provider: "acme".into(),
