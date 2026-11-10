@@ -358,6 +358,17 @@ mod tests {
             Version::parse("1.2.3+a..b").is_none(),
             "empty build segment rejected"
         );
+        // semver §9: digits-only prerelease identifiers carry no leading
+        // zeros — the same rule the crate's is_valid_semver enforces.
+        assert!(
+            Version::parse("1.2.3-01").is_none(),
+            "numeric prerelease leading zero"
+        );
+        assert!(
+            Version::parse("1.2.3-rc.007").is_none(),
+            "embedded numeric leading zero"
+        );
+        assert!(Version::parse("1.2.3-0").is_some(), "plain zero is legal");
     }
 
     #[test]
