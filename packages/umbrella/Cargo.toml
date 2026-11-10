@@ -14,9 +14,9 @@ publish = true
 # consumer only pays for what they use (the D9 weight discipline — the
 # default build pulls in the registry alone, not the SWC stack).
 [dependencies]
-akivili-guard = { path = "../guard", version = "^0.3", optional = true }
-akivili-ptc = { path = "../ptc", version = "^0.3", optional = true }
-akivili-registry = { path = "../registry", version = "^0.3", optional = true }
+akivili-guard = { path = "../guard", version = "^0.4", optional = true }
+akivili-ptc = { path = "../ptc", version = "^0.4", optional = true }
+akivili-registry = { path = "../registry", version = "^0.4", optional = true }
 
 [features]
 default = ["registry"]
