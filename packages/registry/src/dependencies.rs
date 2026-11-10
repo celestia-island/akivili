@@ -260,8 +260,11 @@ impl VersionConstraint {
                 if compare(&v, b) == Ordering::Less {
                     return false;
                 }
-                let same_family = match b.major {
-                    0 => v.major == 0 && v.minor == b.minor,
+                let same_family = match (b.major, b.minor) {
+                    // 0.0.x: the patch plays the major's role (npm caret).
+                    (0, 0) => v.major == 0 && v.minor == 0 && v.patch == b.patch,
+                    // 0.x (nonzero minor): the minor plays the major's role.
+                    (0, _) => v.major == 0 && v.minor == b.minor,
                     _ => v.major == b.major,
                 };
                 same_family && caret_pre_ok(&v, b)
@@ -428,6 +431,9 @@ mod tests {
         // Caret at 1.x: same major.
         assert!(c("^1.2").matches("1.9.9"));
         assert!(!c("^1.2").matches("2.0.0"));
+        // Caret at 0.0.x: the patch is pinned (0.0.3 admits only 0.0.3).
+        assert!(c("^0.0.3").matches("0.0.3"));
+        assert!(!c("^0.0.3").matches("0.0.4"));
         // Tilde: same major.minor.
         assert!(c("~0.3.2").matches("0.3.5"));
         assert!(!c("~0.3.2").matches("0.4.0"));
