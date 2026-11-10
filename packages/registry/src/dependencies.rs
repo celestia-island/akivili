@@ -23,7 +23,10 @@
 //! Comparisons follow semver precedence: numeric core fields, then
 //! prerelease (a prerelease sorts BEFORE its release; identifiers compare
 //! numerically when numeric, lexically otherwise, shorter prefix first).
-//! Build metadata is ignored, as semver mandates.
+//! Build metadata is ignored, as semver mandates. The one-sided bounds
+//! (`>=` `>` `<` `<=`) therefore admit prerelease candidates by pure
+//! precedence (e.g. `>=0.3` matches `0.4.0-rc.1`) — the family-range
+//! prerelease restriction below applies to `^` and `~` only.
 
 use crate::RegistryResult;
 use crate::error::RegistryError;
@@ -31,6 +34,7 @@ use crate::error::RegistryError;
 /// One `[[dependencies]]` row: the required plugin's registry id and a
 /// version constraint string (see the module docs for the grammar).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DependencyEntry {
     /// Required plugin id, same shape as a manifest id.
     pub id: String,
@@ -43,7 +47,9 @@ pub struct DependencyEntry {
 pub enum VersionConstraint {
     Any,
     Exact(Version),
-    Caret(Version),
+    /// The bool records whether the base named its PATCH explicitly:
+    /// npm pins the patch for `^0.0.z` but ranges the minor for `^0.0`.
+    Caret(Version, bool),
     Tilde(Version),
     Gte(Version),
     Gt(Version),
@@ -98,22 +104,28 @@ impl Version {
             if pre_ids.iter().any(|s| s.is_empty()) {
                 return None;
             }
-            // Prerelease identifiers: alphanumerics and hyphens only.
-            if !pre_ids
-                .iter()
-                .all(|s| s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
-            {
-                return None;
+            // Prerelease identifiers: alphanumerics and hyphens only,
+            // and digits-only identifiers carry no leading zeros (semver
+            // §9 — the same rule the crate's own is_valid_semver enforces
+            // for manifest versions; the two parsers must agree).
+            for seg in pre_ids {
+                if !seg.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                    return None;
+                }
+                let digits_only = !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit());
+                if digits_only && seg.len() > 1 && seg.starts_with('0') {
+                    return None;
+                }
             }
         }
-        if let Some(build) = build {
-            if build.is_empty()
-                || !build.split('.').all(|s| {
+        let build_ok = build.is_none_or(|build| {
+            !build.is_empty()
+                && build.split('.').all(|s| {
                     !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
                 })
-            {
-                return None;
-            }
+        });
+        if !build_ok {
+            return None;
         }
         Some(Version {
             major,
@@ -146,14 +158,12 @@ fn compare(a: &Version, b: &Version) -> std::cmp::Ordering {
         (Some(pa), Some(pb)) => {
             for (x, y) in pa.iter().zip(pb.iter()) {
                 let ord = match (is_numeric(x), is_numeric(y)) {
-                    (true, true) => {
-                        // Identifiers here are validated digits; compare
-                        // numerically (u64 is ample for any real segment).
-                        match (x.parse::<u64>(), y.parse::<u64>()) {
-                            (Ok(a), Ok(b)) => a.cmp(&b),
-                            _ => Ordering::Equal,
-                        }
-                    }
+                    // Digit-only identifiers compare by magnitude
+                    // WITHOUT a u64 roundtrip: (length, then lexical) is
+                    // exact for canonical digit strings of any length — a
+                    // u64 parse would collapse to Equal at 2^64 and break
+                    // exact pins in both directions.
+                    (true, true) => x.len().cmp(&y.len()).then_with(|| x.cmp(y)),
                     (true, false) => Ordering::Less,
                     (false, true) => Ordering::Greater,
                     (false, false) => x.cmp(y),
@@ -175,9 +185,10 @@ fn is_numeric(s: &str) -> bool {
 /// trailing fields default to zero (`"0.3"` → 0.3.0). Prerelease and
 /// build still follow full semver shape when present. Exact constraints
 /// do NOT use this — a bare version must be complete.
-fn parse_base(raw: &str) -> Option<Version> {
+/// Returns the base plus whether the PATCH was named explicitly.
+fn parse_base(raw: &str) -> Option<(Version, bool)> {
     if let Some(v) = Version::parse(raw) {
-        return Some(v);
+        return Some((v, true));
     }
     // Partial: exactly two numeric fields.
     let mut fields = raw.split('.');
@@ -196,12 +207,15 @@ fn parse_base(raw: &str) -> Option<Version> {
     if fields.next().is_some() {
         return None;
     }
-    Some(Version {
-        major,
-        minor,
-        patch: 0,
-        pre: None,
-    })
+    Some((
+        Version {
+            major,
+            minor,
+            patch: 0,
+            pre: None,
+        },
+        false,
+    ))
 }
 
 impl VersionConstraint {
@@ -218,22 +232,23 @@ impl VersionConstraint {
             return Some(VersionConstraint::Any);
         }
         if let Some(rest) = raw.strip_prefix('^') {
-            return parse_base(rest).map(VersionConstraint::Caret);
+            return parse_base(rest)
+                .map(|(v, patch_explicit)| VersionConstraint::Caret(v, patch_explicit));
         }
         if let Some(rest) = raw.strip_prefix('~') {
-            return parse_base(rest).map(VersionConstraint::Tilde);
+            return parse_base(rest).map(|(v, _)| VersionConstraint::Tilde(v));
         }
         if let Some(rest) = raw.strip_prefix(">=") {
-            return parse_base(rest).map(VersionConstraint::Gte);
+            return parse_base(rest).map(|(v, _)| VersionConstraint::Gte(v));
         }
         if let Some(rest) = raw.strip_prefix('>') {
-            return parse_base(rest).map(VersionConstraint::Gt);
+            return parse_base(rest).map(|(v, _)| VersionConstraint::Gt(v));
         }
         if let Some(rest) = raw.strip_prefix("<=") {
-            return parse_base(rest).map(VersionConstraint::Lte);
+            return parse_base(rest).map(|(v, _)| VersionConstraint::Lte(v));
         }
         if let Some(rest) = raw.strip_prefix('<') {
-            return parse_base(rest).map(VersionConstraint::Lt);
+            return parse_base(rest).map(|(v, _)| VersionConstraint::Lt(v));
         }
         Version::parse(raw).map(VersionConstraint::Exact)
     }
@@ -253,7 +268,7 @@ impl VersionConstraint {
             VersionConstraint::Gt(b) => compare(&v, b) == Ordering::Greater,
             VersionConstraint::Lte(b) => compare(&v, b) != Ordering::Greater,
             VersionConstraint::Lt(b) => compare(&v, b) == Ordering::Less,
-            VersionConstraint::Caret(b) => {
+            VersionConstraint::Caret(b, patch_explicit) => {
                 // Compatible: >=b and < the next incompatible boundary.
                 // Semver's compat rule: for 0.x the minor plays the major's
                 // role (0.3 and 0.4 are incompatible).
@@ -261,8 +276,12 @@ impl VersionConstraint {
                     return false;
                 }
                 let same_family = match (b.major, b.minor) {
-                    // 0.0.x: the patch plays the major's role (npm caret).
-                    (0, 0) => v.major == 0 && v.minor == 0 && v.patch == b.patch,
+                    // 0.0.x: the patch plays the major's role (npm caret)
+                    // — but only when the base NAMED its patch: `^0.0`
+                    // (patch defaulted) ranges the minor like npm does.
+                    (0, 0) => {
+                        v.major == 0 && v.minor == 0 && (!patch_explicit || v.patch == b.patch)
+                    }
                     // 0.x (nonzero minor): the minor plays the major's role.
                     (0, _) => v.major == 0 && v.minor == b.minor,
                     _ => v.major == b.major,
@@ -291,7 +310,6 @@ fn caret_pre_ok(v: &Version, b: &Version) -> bool {
 pub fn validate_entry(entry: &DependencyEntry, self_id: &str) -> RegistryResult<()> {
     let id = &entry.id;
     let shape_ok = !id.is_empty()
-        && id.len() <= 96
         && id
             .chars()
             .next()
@@ -302,7 +320,7 @@ pub fn validate_entry(entry: &DependencyEntry, self_id: &str) -> RegistryResult<
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
     if !shape_ok {
         return Err(RegistryError::InvalidManifest(format!(
-            "dependency id '{id}' must match ^[a-z0-9][a-z0-9-]*$ (<= 96 chars)"
+            "dependency id '{id}' must match ^[a-z0-9][a-z0-9-]*$ (same shape as a plugin id)"
         )));
     }
     if id == self_id {
@@ -367,6 +385,27 @@ mod tests {
             compare(&v("1.0.0-alpha"), &v("1.0.0-alpha.1")),
             std::cmp::Ordering::Less
         );
+        // 2^64-scale digit identifiers compare by magnitude, not by a
+        // u64 parse that would collapse to Equal (the exact-pin bypass).
+        let huge = "18446744073709551616"; // 2^64
+        assert_eq!(
+            compare(&v("1.0.0-5"), &v(&format!("1.0.0-{huge}"))),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare(&v(&format!("1.0.0-{huge}")), &v("1.0.0-5")),
+            std::cmp::Ordering::Greater
+        );
+        assert!(
+            !VersionConstraint::parse(&format!("1.0.0-{huge}"))
+                .unwrap()
+                .matches("1.0.0-5")
+        );
+        assert!(
+            !VersionConstraint::parse("1.0.0-5")
+                .unwrap()
+                .matches(&format!("1.0.0-{huge}"))
+        );
     }
 
     #[test]
@@ -374,7 +413,7 @@ mod tests {
         assert_eq!(VersionConstraint::parse("*"), Some(VersionConstraint::Any));
         assert!(matches!(
             VersionConstraint::parse("^0.3"),
-            Some(VersionConstraint::Caret(_))
+            Some(VersionConstraint::Caret(..))
         ));
         assert!(matches!(
             VersionConstraint::parse("~0.3.2"),
@@ -403,7 +442,7 @@ mod tests {
         // Operator bases may be partial (two fields), exact may not.
         assert!(matches!(
             VersionConstraint::parse("^0.3"),
-            Some(VersionConstraint::Caret(_))
+            Some(VersionConstraint::Caret(..))
         ));
         assert!(matches!(
             VersionConstraint::parse(">=0.3"),
@@ -431,9 +470,12 @@ mod tests {
         // Caret at 1.x: same major.
         assert!(c("^1.2").matches("1.9.9"));
         assert!(!c("^1.2").matches("2.0.0"));
-        // Caret at 0.0.x: the patch is pinned (0.0.3 admits only 0.0.3).
+        // Caret at 0.0.x with an EXPLICIT patch: pinned (npm).
         assert!(c("^0.0.3").matches("0.0.3"));
         assert!(!c("^0.0.3").matches("0.0.4"));
+        // Caret at 0.0 with the patch DEFAULTED: minor ranges (npm).
+        assert!(c("^0.0").matches("0.0.9"));
+        assert!(!c("^0.0").matches("0.1.0"));
         // Tilde: same major.minor.
         assert!(c("~0.3.2").matches("0.3.5"));
         assert!(!c("~0.3.2").matches("0.4.0"));
