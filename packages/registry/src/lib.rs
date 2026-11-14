@@ -122,8 +122,9 @@ pub use handle::{LocalRegistration, ResourceHandle};
 pub use kinds::ResourceKind;
 pub use manifest::{
     AttachmentEntry, ConfigSection, ContractRef, MigrationEngine, MigrationEntry, MinTrust,
-    Payload, PluginManifest, ResourceEntry, RollbackPolicy, SCHEMA, Surface, SystemSection,
-    TrustSection, UnknownVersionPolicy, UpgradeMode, UpgradeSection, UpgradeStrategy,
+    PLATFORM_END_VOCABULARY, Payload, PluginManifest, ResourceEntry, RollbackPolicy, SCHEMA,
+    Surface, SystemSection, TrustSection, UnknownVersionPolicy, UpgradeMode, UpgradeSection,
+    UpgradeStrategy, Venue,
 };
 pub use pack::{PackError, PackReport, ResolvedKey, SIGNING_KEY_ENV};
 pub use registry::{DEFAULT_MAX_PAYLOAD_BYTES, Registry, RegistryOptions};

@@ -76,9 +76,12 @@ resources at startup which they load one by one (`ResourceFeed` → `ResourceHan
   concatenation AFTER the resource bytes, in manifest order.
   **Compatibility note**: the field is additive under schema 1 — hosts
   built before attachments silently ignore the section (the schema
-  tripwire only fires on a future `schema = 2`); `platforms` (a free-form
-  target-platform hint) and `surface` (the closed attachment-host
-  vocabulary) are separate axes and are not cross-checked.
+  tripwire only fires on a future `schema = 2`); `platforms` (the closed
+  end-type vocabulary `web`/`desktop`/`mobile`, validated since the
+  venue axis — an OS/arch triple there is rejected as the wrong axis;
+  OS/arch triples belong on `[[mcp_servers]]` `platforms`) and `surface`
+  (the closed attachment-host vocabulary) are separate axes and are not
+  cross-checked.
 - **L2 execution contract (`[[agent_tools]]` / `[[installs]]` /
   `[[mcp_servers]]`)** — the on-demand L2 plugin runtime: structured tool
   declarations carry name/description/JSON-schema plus an execution

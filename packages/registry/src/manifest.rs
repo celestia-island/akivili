@@ -61,8 +61,18 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<String>,
     /// Target platforms this plugin declares (e.g. `["web", "desktop"]`).
+    /// Closed end-type vocabulary — [`PLATFORM_END_VOCABULARY`] (browser /
+    /// client shells), NOT the OS/arch triples `[[mcp_servers]]` uses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub platforms: Vec<String>,
+    /// Distribution and effect venue (the venue axis, 2026-11-14
+    /// adjudication): `"cloud"` = the server-side chest store only;
+    /// `"local"` = a device-side store fed by the client shell, never
+    /// uploaded; `"both"` (default) = cloud-distributed with a local
+    /// face allowed. Orthogonal to `platforms` (which end types
+    /// consume it) and to `form` (how a host loads it).
+    #[serde(default, skip_serializing_if = "Venue::is_default")]
+    pub venue: Venue,
     /// Localized titles keyed by locale tag (e.g. `"zh-Hans"` → `"看板"`).
     /// The un-localized `title` (if any) lives in the first
     /// `webui.page-type` resource's inline payload; this map carries the
@@ -152,6 +162,67 @@ pub struct PluginManifest {
 /// in `agent_config_service`), so a manifest cannot declare more
 /// capability stems than the widest embedded agent.
 pub const MAX_AGENT_CAPABILITY_STEMS: usize = 64;
+
+/// The closed end-type vocabulary for the manifest's top-level
+/// `platforms` — which client faces consume the plugin. Deliberately
+/// distinct from `[[mcp_servers]]` `platforms` (OS/arch triples like
+/// `linux-x64`): the two share a key name but live on different axes
+/// (end type vs node target), and [`PluginManifest::validate`] rejects
+/// an OS/arch spelling here so the near-collision cannot smuggle a
+/// wrong-axis value through (the mistake a copy-paste from an MCP
+/// entry would make).
+pub const PLATFORM_END_VOCABULARY: [&str; 3] = ["web", "desktop", "mobile"];
+
+/// Where a plugin distributes and takes effect — the venue axis.
+///
+/// Three values (wire spelling kebab-case), defaulting to [`Venue::Both`]:
+///
+/// - [`Venue::Cloud`] — the server-side chest store only. Cloud-webui
+///   resources serve as today; node-side parts run on cloud nodes.
+///   A desktop session is just a window onto the cloud instance.
+/// - [`Venue::Local`] — a device-side store fed by the client shell,
+///   never uploaded. Browser webuis cannot see it at all (they have no
+///   local channel — inherent, not enforced); a future store-side gate
+///   (the P2 lane) will make a cloud scan treat a misfiled local
+///   plugin as fail-visible.
+/// - [`Venue::Both`] — cloud-distributed with a local face allowed
+///   (e.g. a theme that lists in the cloud catalog and may also be
+///   cached/installed device-side).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Venue {
+    /// The server-side chest store only.
+    Cloud,
+    /// A device-side store fed by the client shell; never uploaded.
+    Local,
+    /// Cloud-distributed, local face allowed (the default).
+    #[default]
+    Both,
+}
+
+impl Venue {
+    /// The wire spelling of the venue.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cloud => "cloud",
+            Self::Local => "local",
+            Self::Both => "both",
+        }
+    }
+
+    /// Whether this is the default ([`Venue::Both`]) — the
+    /// skip-serializing predicate that keeps the field absent for
+    /// every existing manifest (byte-identical serialization).
+    pub fn is_default(&self) -> bool {
+        *self == Self::Both
+    }
+}
+
+impl std::fmt::Display for Venue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// One domain agent declared by a plugin (manifest `[[agents]]`).
 ///
@@ -600,6 +671,7 @@ impl Default for PluginManifest {
             form: None,
             class: None,
             platforms: Vec::new(),
+            venue: Venue::default(),
             title_i18n: BTreeMap::new(),
             description_i18n: BTreeMap::new(),
             capabilities: Vec::new(),
@@ -663,6 +735,20 @@ impl PluginManifest {
                 "class {:?} and form {:?} disagree: class = \"system\" ⇔ form = system.host",
                 self.class, form
             )));
+        }
+        // The top-level platforms field speaks END TYPES (web/desktop/
+        // mobile), a closed vocabulary. An OS/arch triple here is the
+        // copy-paste from an [[mcp_servers]] entry — wrong axis, named
+        // so the author can see exactly what happened.
+        for platform in &self.platforms {
+            if !PLATFORM_END_VOCABULARY.contains(&platform.as_str()) {
+                return Err(RegistryError::InvalidManifest(format!(
+                    "platforms entry '{platform}' is not an end type \
+                     ({}); OS/arch triples like linux-x64 belong on \
+                     [[mcp_servers]] platforms, not here",
+                    PLATFORM_END_VOCABULARY.join(" / ")
+                )));
+            }
         }
         if let Some(upgrade) = &self.upgrade {
             upgrade.validate(&form)?;
@@ -1541,6 +1627,7 @@ mod tests {
             form: Some(FormKind::WebResource),
             class: None,
             platforms: Vec::new(),
+            venue: Venue::Both,
             title_i18n: BTreeMap::new(),
             description_i18n: BTreeMap::new(),
             capabilities: Vec::new(),
@@ -1914,6 +2001,103 @@ requires-contract = ["celestia:panel/host@0.1", "celestia:kv/host@0.2"]
         assert!(default.trust.is_none());
         assert!(default.resources.is_empty());
         assert!(default.validate().is_err(), "default must not validate");
+    }
+
+    #[test]
+    fn venue_parses_serializes_and_defaults_to_both() {
+        for (wire, venue) in [
+            ("cloud", Venue::Cloud),
+            ("local", Venue::Local),
+            ("both", Venue::Both),
+        ] {
+            let parsed: Venue = serde_json::from_str(&format!("\"{wire}\"")).expect(wire);
+            assert_eq!(parsed, venue);
+            assert_eq!(parsed.as_str(), wire);
+            assert_eq!(
+                serde_json::to_string(&parsed).unwrap(),
+                format!("\"{wire}\"")
+            );
+        }
+        // Unknown spellings fail at parse time — never a silent fallback.
+        for wire in ["Cloud", "device", "onprem", "server"] {
+            assert!(
+                serde_json::from_str::<Venue>(&format!("\"{wire}\"")).is_err(),
+                "'{wire}' must not parse as a venue"
+            );
+        }
+        // Absent field = Both, and Both is skipped on serialization so
+        // every existing manifest round-trips byte-identically.
+        assert_eq!(baseline().venue, Venue::Both);
+        assert!(Venue::Both.is_default());
+        assert!(!Venue::Cloud.is_default());
+        assert!(!Venue::Local.is_default());
+        // The SERDE default path, not just the struct literal: a minimal
+        // manifest with no venue key must deserialize to Both (pins the
+        // #[default] attribute — moving it to Cloud turns this red), and
+        // the default manifest's JSON must not carry the key either
+        // (the PR's byte-identical claim covers both formats).
+        let minimal = r#"
+            id = "acme"
+            version = "1.0.0"
+            provider = "acme"
+            form = "web.resource"
+        "#;
+        let parsed: PluginManifest = toml::from_str(minimal).expect("minimal parses");
+        assert_eq!(
+            parsed.venue,
+            Venue::Both,
+            "absent venue must default through serde, not only via Default"
+        );
+        let json_value = serde_json::to_value(&parsed).expect("serializes to JSON");
+        assert!(
+            json_value.get("venue").is_none(),
+            "Both must be skipped in JSON too: {json_value}"
+        );
+    }
+
+    #[test]
+    fn venue_rides_toml_manifests_and_stays_absent_by_default() {
+        let text = toml::to_string(&baseline()).unwrap();
+        assert!(!text.contains("venue"), "Both must not serialize: {text}");
+        let mut local = baseline();
+        local.venue = Venue::Local;
+        let text = toml::to_string(&local).unwrap();
+        assert!(text.contains("venue = \"local\""), "{text}");
+        let back: PluginManifest = toml::from_str(&text).unwrap();
+        assert_eq!(back.venue, Venue::Local);
+        back.validate().expect("local venue validates");
+    }
+
+    #[test]
+    fn top_level_platforms_accept_end_types_only() {
+        let mut manifest = baseline();
+        manifest.platforms = vec!["web".into(), "desktop".into(), "mobile".into()];
+        manifest.validate().expect("end types validate");
+
+        // The near-collision trap: OS/arch triples are the [[mcp_servers]]
+        // vocabulary, wrong axis here — rejected with the confusion named.
+        manifest.platforms = vec!["linux-x64".into()];
+        let err = manifest.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("mcp_servers"),
+            "error must name where the triple belongs: {err}"
+        );
+
+        manifest.platforms = vec!["windows".into()];
+        let err = manifest.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("web / desktop / mobile"),
+            "error must list the closed vocabulary: {err}"
+        );
+    }
+
+    #[test]
+    fn local_venue_with_end_type_platforms_validates() {
+        // The canonical local-only theme: device-side only, desktop face.
+        let mut manifest = baseline();
+        manifest.venue = Venue::Local;
+        manifest.platforms = vec!["desktop".into()];
+        manifest.validate().expect("local theme validates");
     }
 
     #[test]
