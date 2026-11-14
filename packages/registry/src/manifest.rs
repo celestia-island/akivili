@@ -182,8 +182,9 @@ pub const PLATFORM_END_VOCABULARY: [&str; 3] = ["web", "desktop", "mobile"];
 ///   A desktop session is just a window onto the cloud instance.
 /// - [`Venue::Local`] — a device-side store fed by the client shell,
 ///   never uploaded. Browser webuis cannot see it at all (they have no
-///   local channel — inherent, not enforced); a cloud store scan that
-///   finds one treats it as misfiled (fail-visible).
+///   local channel — inherent, not enforced); a future store-side gate
+///   (the P2 lane) will make a cloud scan treat a misfiled local
+///   plugin as fail-visible.
 /// - [`Venue::Both`] — cloud-distributed with a local face allowed
 ///   (e.g. a theme that lists in the cloud catalog and may also be
 ///   cached/installed device-side).
@@ -2030,6 +2031,28 @@ requires-contract = ["celestia:panel/host@0.1", "celestia:kv/host@0.2"]
         assert!(Venue::Both.is_default());
         assert!(!Venue::Cloud.is_default());
         assert!(!Venue::Local.is_default());
+        // The SERDE default path, not just the struct literal: a minimal
+        // manifest with no venue key must deserialize to Both (pins the
+        // #[default] attribute — moving it to Cloud turns this red), and
+        // the default manifest's JSON must not carry the key either
+        // (the PR's byte-identical claim covers both formats).
+        let minimal = r#"
+            id = "acme"
+            version = "1.0.0"
+            provider = "acme"
+            form = "web.resource"
+        "#;
+        let parsed: PluginManifest = toml::from_str(minimal).expect("minimal parses");
+        assert_eq!(
+            parsed.venue,
+            Venue::Both,
+            "absent venue must default through serde, not only via Default"
+        );
+        let json_value = serde_json::to_value(&parsed).expect("serializes to JSON");
+        assert!(
+            json_value.get("venue").is_none(),
+            "Both must be skipped in JSON too: {json_value}"
+        );
     }
 
     #[test]
