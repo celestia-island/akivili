@@ -11,7 +11,7 @@ categories.workspace = true
 publish = true
 
 [dependencies]
-akivili-registry = { path = "../registry", version = "^0.4" }
+akivili-registry = { path = "../registry", version = "^0.5" }
 anyhow.workspace = true
 bytes.workspace = true
 serde.workspace = true
@@ -22,10 +22,10 @@ tracing.workspace = true
 
 # The F1 outlet: only consumers who opt into wasm pull the runtime stack
 # (the D9 weight discipline — the loader core itself stays tairitsu-free).
-akivili-wasm-host = { path = "../wasm_host", version = "^0.4", optional = true }
+akivili-wasm-host = { path = "../wasm_host", version = "^0.5", optional = true }
 # The F3 outlet: script plugins ride the boa PTC stack (plugin_host);
 # hosts that never run scripts stay free of the JS engine.
-akivili-plugin-host = { path = "../plugin_host", version = "^0.4", optional = true }
+akivili-plugin-host = { path = "../plugin_host", version = "^0.5", optional = true }
 
 [features]
 default = []
