@@ -18,7 +18,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 toml.workspace = true
-tracing.workspace = true
 
 # The F1 outlet: only consumers who opt into wasm pull the runtime stack
 # (the D9 weight discipline — the loader core itself stays tairitsu-free).
@@ -33,5 +32,4 @@ wasm = ["dep:akivili-wasm-host", "akivili-wasm-host/tairitsu"]
 script = ["dep:akivili-plugin-host"]
 
 [dev-dependencies]
-tempfile.workspace = true
 tokio = { version = "^1", features = ["rt", "macros"] }

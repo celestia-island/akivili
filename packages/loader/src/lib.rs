@@ -623,8 +623,6 @@ pub mod script_slot {
     /// the D8 seam (`Arc<HostFunctions>`), and dispatch rides the same
     /// engine for the slot's whole life.
     pub struct ScriptSlot {
-        #[allow(dead_code)] // diagnostics: the source-of-truth data
-        data: TsPluginData,
         engine: TsPlugin,
     }
 
@@ -646,7 +644,7 @@ pub mod script_slot {
             let data = TsPluginData::new(plugin_name, code, TsLanguage::TypeScript);
             let engine = TsPlugin::create_and_load(host_api, &data)
                 .map_err(|e| ScriptSlotError(format!("load: {e}")))?;
-            Ok(Self { data, engine })
+            Ok(Self { engine })
         }
 
         /// The plugin's name (diagnostics).
@@ -773,8 +771,6 @@ pub mod process_rpc {
     /// The error object inside a response envelope.
     #[derive(Debug, serde::Deserialize)]
     struct RpcErrorWire {
-        #[allow(dead_code)]
-        code: i64,
         message: String,
     }
 
