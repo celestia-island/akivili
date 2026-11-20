@@ -22,7 +22,12 @@ swc_core = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-criterion = "^0.5"
+# T-F track item 1 (D6, _reports/tairitsu-hikari-wasi-browser-20261121/PLAN.md):
+# default features would pull plotters -> plotters-backend/svg, dragging
+# bindgen-family edges into the target-independent lock. cargo_bench_support
+# alone keeps `cargo bench` (harness = false) working; measurement analysis
+# runs without rayon.
+criterion = { version = "^0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "ptc_bench"
