@@ -41,7 +41,7 @@ graph LR
 
 ```mermaid
 graph TD
-    PR["PluginRouter (宿主装配)"] --> A["load_ts_plugin / scan_and_load_dir(PLUGIN_DIR)　注册"]
+    PR["PluginRouter (宿主装配)"] --> A["load_ts_plugin / scan_and_load_dir(PLUGIN_DIR) 注册"]
     PR --> B["dispatch_webhook"] --> B2["HTTP POST /webhook/{name}"] --> B3["Boa handleRequest"]
     PR --> C["dispatch_bot_message"] --> C2["TriggerDispatcher"] --> C3["onMessage"]
     PR --> D["all_mcp_tools"] --> D2["cosmos McpRouter 命名空间工具（未命中回退 webhook）"]
