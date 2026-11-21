@@ -26,10 +26,11 @@ function onMessage(platform, message): string | null;         // bot 消息处�
 
 ## 3. 执行管线
 
-```
-plugin.ts ──► PtcEngine.transpile() (SWC TS→JS + AST 安全校验)
-           ──► Boa Context (RuntimeLimits: 1M loop / 256 recursion / 1024 stack)
-           ──► thread_local CURRENT_HOST_API ──► dispatch_host_fn ──► HostFunctions
+```mermaid
+graph LR
+    A["plugin.ts"] --> B["PtcEngine.transpile() (SWC TS→JS + AST 安全校验)"]
+    B --> C["Boa Context (RuntimeLimits: 1M loop / 256 recursion / 1024 stack)"]
+    C --> D["thread_local CURRENT_HOST_API"] --> E["dispatch_host_fn"] --> F["HostFunctions"]
 ```
 
 - 引擎：boa_engine ^0.21；资源上限经 `RuntimeLimits` 强制。
@@ -38,12 +39,12 @@ plugin.ts ──► PtcEngine.transpile() (SWC TS→JS + AST 安全校验)
 
 ## 4. 插件注册与分发链路
 
-```
-PluginRouter (宿主装配)
-   ├─ load_ts_plugin / scan_and_load_dir(PLUGIN_DIR)   注册
-   ├─ dispatch_webhook → HTTP POST /webhook/{name} → Boa handleRequest
-   ├─ dispatch_bot_message → TriggerDispatcher → onMessage
-   └─ all_mcp_tools → cosmos McpRouter 命名空间工具（未命中回退 webhook）
+```mermaid
+graph TD
+    PR["PluginRouter (宿主装配)"] --> A["load_ts_plugin / scan_and_load_dir(PLUGIN_DIR)　注册"]
+    PR --> B["dispatch_webhook"] --> B2["HTTP POST /webhook/{name}"] --> B3["Boa handleRequest"]
+    PR --> C["dispatch_bot_message"] --> C2["TriggerDispatcher"] --> C3["onMessage"]
+    PR --> D["all_mcp_tools"] --> D2["cosmos McpRouter 命名空间工具（未命中回退 webhook）"]
 ```
 
 agent.toml 清单与预检审计在 plana `plana_custom_agent`（git 依赖引用），
