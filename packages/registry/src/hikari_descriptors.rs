@@ -85,17 +85,30 @@ sha256 = "{}"
         ("hikari-highlight", "highlight"),
     ];
 
+    /// The artifact path a manifest declares, or a panic naming the entry.
+    fn declared_path(manifest: &str) -> std::path::PathBuf {
+        let parsed: PluginManifest =
+            toml::from_str(manifest).unwrap_or_else(|e| panic!("manifest must parse: {e}"));
+        match &parsed.resources[0].payload {
+            crate::manifest::Payload::File { path, .. } => path.clone(),
+            other => panic!("expected a File payload, got {other:?}"),
+        }
+    }
+
     /// Scans a one-plugin store and returns the outcome.
+    ///
+    /// The artifact is written at the path the MANIFEST declares — not at a
+    /// name this helper picks. That is what makes a drifted path observable:
+    /// if the fixture says `hikari_wasm_hikari-qr.wasm` and the real file is
+    /// `hikari_wasm_qr.wasm`, the scan sees a missing payload and rejects.
     fn scan_one(manifest: &str) -> ScanResult {
         let root = tempfile::tempdir().expect("tempdir");
         let dir = root.path().join("component");
-        std::fs::create_dir_all(dir.join("target/wasm32-wasip2/release")).expect("mkdir");
+        let relative = declared_path(manifest);
+        let full = dir.join(&relative);
+        std::fs::create_dir_all(full.parent().expect("payload has a parent")).expect("mkdir");
         std::fs::write(dir.join(MANIFEST_FILE), manifest).expect("manifest");
-        std::fs::write(
-            dir.join("target/wasm32-wasip2/release/hikari_wasm_qr.wasm"),
-            ARTIFACT,
-        )
-        .expect("artifact");
+        std::fs::write(&full, ARTIFACT).expect("artifact");
         let results =
             scan(root.path(), &Default::default(), DEFAULT_MAX_PAYLOAD_BYTES).expect("scan");
         results.into_iter().next().expect("one result")
@@ -139,6 +152,29 @@ sha256 = "{}"
                 parsed.capabilities.is_empty(),
                 "{id}: the four components are pure computation -- no imports, no grant"
             );
+            // The artifact PATH is a seam field, and parsing alone cannot see
+            // it: a manifest whose path names a file nobody ships still
+            // parses. Drive it through `scan` so a path that drifts from the
+            // real descriptor (`hikari_wasm_<stem>.wasm`, the crate stem, not
+            // the plugin id) reds HERE and not only in the sibling test.
+            let path = declared_path(&manifest);
+            assert_eq!(
+                path.to_string_lossy(),
+                format!(
+                    "target/wasm32-wasip2/release/hikari_wasm_{}.wasm",
+                    id.strip_prefix("hikari-").unwrap_or(id)
+                ),
+                "{id}: the artifact path must match the shipped file name"
+            );
+            match scan_one(&manifest) {
+                ScanResult::Accepted(_) => {}
+                ScanResult::Rejected(rejection) => {
+                    panic!(
+                        "{id}: must be accepted by the scanner: {}",
+                        rejection.reason
+                    )
+                }
+            }
         }
     }
 
