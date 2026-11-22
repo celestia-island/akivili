@@ -38,14 +38,22 @@ mod tests {
         digest.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// One descriptor, exactly as hikari writes it — only the digest is
-    /// recomputed over [`ARTIFACT`] instead of the shipped bytes.
+    /// One descriptor shaped like hikari's real ones — the digest is
+    /// recomputed over [`ARTIFACT`] instead of the shipped bytes, and
+    /// `description` is the generic placeholder rather than each
+    /// component's own sentence. Everything the registry reads is
+    /// byte-identical to the real file: the artifact path is
+    /// `hikari_wasm_<stem>.wasm` (the CRATE stem, not the plugin id), which
+    /// is what a fixture that interpolated the id got wrong.
     fn descriptor(id: &str, world: &str, capabilities: &[&str]) -> String {
         let caps = capabilities
             .iter()
             .map(|c| format!("\"{c}\""))
             .collect::<Vec<_>>()
             .join(", ");
+        // `hikari-qr` -> `qr`: the plugin id carries the `hikari-` prefix,
+        // the artifact filename does not.
+        let stem = id.strip_prefix("hikari-").unwrap_or(id);
         format!(
             r#"
 schema = 1
@@ -62,7 +70,7 @@ requires-contract = ["celestia:{id}/{world}@0.1"]
 kind = "wasm.component"
 
 [resources.payload.File]
-path = "target/wasm32-wasip2/release/hikari_wasm_{id}.wasm"
+path = "target/wasm32-wasip2/release/hikari_wasm_{stem}.wasm"
 sha256 = "{}"
 "#,
             sha256_hex(ARTIFACT)
@@ -84,7 +92,7 @@ sha256 = "{}"
         std::fs::create_dir_all(dir.join("target/wasm32-wasip2/release")).expect("mkdir");
         std::fs::write(dir.join(MANIFEST_FILE), manifest).expect("manifest");
         std::fs::write(
-            dir.join("target/wasm32-wasip2/release/hikari_wasm_hikari-qr.wasm"),
+            dir.join("target/wasm32-wasip2/release/hikari_wasm_qr.wasm"),
             ARTIFACT,
         )
         .expect("artifact");
@@ -145,7 +153,8 @@ sha256 = "{}"
             std::fs::write(dir.join(MANIFEST_FILE), descriptor(id, world, &[])).expect("manifest");
             std::fs::write(
                 dir.join(format!(
-                    "target/wasm32-wasip2/release/hikari_wasm_{id}.wasm"
+                    "target/wasm32-wasip2/release/hikari_wasm_{}.wasm",
+                    id.strip_prefix("hikari-").unwrap_or(id)
                 )),
                 ARTIFACT,
             )
