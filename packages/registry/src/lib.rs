@@ -104,6 +104,8 @@ pub mod error;
 pub mod feed;
 pub mod forms;
 pub mod handle;
+#[cfg(test)]
+mod hikari_descriptors;
 pub mod kinds;
 pub mod lanes;
 pub mod manifest;
