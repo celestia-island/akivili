@@ -117,6 +117,11 @@ sha256 = "{}"
             assert_eq!(parsed.form, Some(FormKind::WasmComponent), "{id}");
             assert_eq!(parsed.id, id);
             assert_eq!(parsed.version, "0.1.0");
+            // The field round-trips through the manifest. Note this only
+            // proves the VALUE survived parsing: nothing in this crate reads
+            // `requires_contract` at scan, feed, load or handle time (grep the
+            // non-test sources), so a wrong world here is a contract defect the
+            // consumer meets, not one the registry refuses.
             let contract = parsed
                 .requires_contract
                 .first()
