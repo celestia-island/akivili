@@ -1,4 +1,4 @@
-<p align="center"><img src="https://raw.githubusercontent.com/celestia-island/akivili/master/res/logo/celestia.webp" alt="akivili" width="240" /></p>
+<p align="center"><img src="https://raw.githubusercontent.com/celestia-island/celestia-island.github.io/main/res/logos/celestia.webp" alt="akivili" width="240" /></p>
 
 <h1 align="center">Akivili</h1>
 
@@ -198,7 +198,6 @@ packages/registry/      plugin registry (manifests, feed, audit, akivili-plugin 
 packages/guard/         egress network guard (URL/IP policy, DNS-rebinding-safe)
 packages/umbrella/      the `akivili` facade crate (feature-gated re-exports)
 docs/                   architecture & contract documentation
-res/logo/               brand assets (temporary celestia-island logo)
 ```
 
 Development happens on feature branches off `master`; `master` holds reviewed,
