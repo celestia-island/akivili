@@ -987,7 +987,22 @@ impl PluginManifest {
                                 server.id, server.transport
                             )));
                         };
-                        if server.url.len() == scheme_len {
+                        // The host lives in the authority, which runs from
+                        // the scheme up to the first `/`, `?` or `#`. A
+                        // bare scheme prefix is not enough: `https:///x`
+                        // and `http://?q` pass a prefix check but carry
+                        // no host at all, and the consumer is the first
+                        // to fail (EmptyHost) — long after `check` said
+                        // the manifest was fine.
+                        let authority = server.url[scheme_len..]
+                            .split(['/', '?', '#'])
+                            .next()
+                            .unwrap_or_default();
+                        if authority.is_empty()
+                            || authority
+                                .chars()
+                                .any(|c| c.is_whitespace() || c.is_control())
+                        {
                             return Err(RegistryError::InvalidManifest(format!(
                                 "mcp server '{}' ({}) url is missing its host",
                                 server.id, server.transport
@@ -3442,6 +3457,42 @@ agent = "office"
                 .to_string(),
             ),
             (
+                "mcp_servers url with an empty authority carries no host",
+                r#"
+
+[[mcp_servers]]
+id = "second-engine"
+transport = "http"
+url = "https:///x"
+agent = "office"
+"#
+                .to_string(),
+            ),
+            (
+                "mcp_servers url whose authority is only a query carries no host",
+                r#"
+
+[[mcp_servers]]
+id = "second-engine"
+transport = "sse"
+url = "http://?q"
+agent = "office"
+"#
+                .to_string(),
+            ),
+            (
+                "mcp_servers url host must not contain whitespace",
+                r#"
+
+[[mcp_servers]]
+id = "second-engine"
+transport = "http"
+url = "https:// x"
+agent = "office"
+"#
+                .to_string(),
+            ),
+            (
                 "mcp_servers transport vocabulary is closed",
                 r#"
 
@@ -3615,6 +3666,27 @@ script = "install/default.ts"
                 manifest.validate().is_err(),
                 "{label}: validation must reject"
             );
+        }
+    }
+
+    /// Every remote-transport url shape that carries a real host must be
+    /// accepted — the host check is about the authority being non-empty
+    /// and clean, not about which host spelling is used (loopback,
+    /// IPv6 literal and public DNS names are all legal).
+    #[test]
+    fn l2_contract_accepts_remote_mcp_urls_with_real_hosts() {
+        let urls = [
+            ("sse", "https://mcp.example.com/sse"),
+            ("http", "http://127.0.0.1:8080/x"),
+            ("http", "http://[::1]:8080/x"),
+        ];
+        for (transport, url) in urls {
+            let raw = format!(
+                "{}\n\n[[mcp_servers]]\nid = \"remote-engine\"\ntransport = \"{transport}\"\nurl = \"{url}\"\nagent = \"office\"\n",
+                &l2_contract_raw()[..l2_contract_raw().len() - 1]
+            );
+            let manifest = parse_validated(&raw);
+            assert_eq!(manifest.mcp_servers[1].url, url);
         }
     }
 
