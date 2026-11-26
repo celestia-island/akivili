@@ -988,14 +988,19 @@ impl PluginManifest {
                             )));
                         };
                         // The host lives in the authority, which runs from
-                        // the scheme up to the first `/`, `?` or `#`. A
-                        // bare scheme prefix is not enough: `https:///x`
-                        // and `http://?q` pass a prefix check but carry
-                        // no host at all, and the consumer is the first
-                        // to fail (EmptyHost) — long after `check` said
-                        // the manifest was fine.
+                        // the scheme up to the first `/`, `\`, `?` or `#`.
+                        // The backslash matters: WHATWG special schemes
+                        // (http/https) treat it as an authority terminator
+                        // exactly like `/`, so `http://\x` carries no host
+                        // even though a naive split sees one — the same
+                        // divergence the plugin-host grants parser warns
+                        // about. A bare scheme prefix is not enough:
+                        // `https:///x` and `http://?q` pass a prefix check
+                        // but carry no host at all, and the consumer is the
+                        // first to fail (EmptyHost) — long after `check`
+                        // said the manifest was fine.
                         let authority = server.url[scheme_len..]
-                            .split(['/', '?', '#'])
+                            .split(['/', '\\', '?', '#'])
                             .next()
                             .unwrap_or_default();
                         if authority.is_empty()
@@ -3552,6 +3557,42 @@ agent = "office"
                 .to_string(),
             ),
             (
+                "mcp_servers url whose authority ends at a backslash carries no host",
+                r#"
+
+[[mcp_servers]]
+id = "second-engine"
+transport = "http"
+url = 'http://\x'
+agent = "office"
+"#
+                .to_string(),
+            ),
+            (
+                "mcp_servers url with userinfo before a backslash carries no host",
+                r#"
+
+[[mcp_servers]]
+id = "second-engine"
+transport = "sse"
+url = 'http://user@\x'
+agent = "office"
+"#
+                .to_string(),
+            ),
+            (
+                "mcp_servers url host must not contain control characters",
+                r#"
+
+[[mcp_servers]]
+id = "second-engine"
+transport = "http"
+url = "http://a\u0001b"
+agent = "office"
+"#
+                .to_string(),
+            ),
+            (
                 "mcp_servers url host must not contain whitespace",
                 r#"
 
@@ -3750,6 +3791,7 @@ script = "install/default.ts"
             ("sse", "https://mcp.example.com/sse"),
             ("http", "http://127.0.0.1:8080/x"),
             ("http", "http://[::1]:8080/x"),
+            ("http", "http://[::1]/x"),
             ("http", "http://user:pass@example.com:8080/x"),
         ];
         for (transport, url) in urls {
